@@ -349,7 +349,48 @@ class TestQuotedNewline:
     """Check ID 23: Quoted newline + # comment hiding."""
 
     def test_quoted_newline_hash(self) -> None:
+        """Generic quoted newline + # in a non-allowlisted context still blocks."""
         result = check_bash_command('echo "hello\n# rm -rf /"')
+        assert not result.safe
+        assert result.check_id == CheckID.QUOTED_NEWLINE
+
+    def test_gh_pr_create_with_markdown_header_body(self) -> None:
+        """Bug 2238: ``gh pr create --body`` with markdown headers must not
+        be rejected. This is the exact pattern that was killing PR creation
+        despite the agent having completed all code work."""
+        result = check_bash_command(
+            'gh pr create --title "X" --body '
+            '"**Bold**\n# Header line\n- bullet"'
+        )
+        assert result.safe, (
+            f"gh pr create with markdown headers in --body should pass; "
+            f"got check_id={result.check_id} msg={result.message}"
+        )
+
+    def test_git_commit_short_flag_with_markdown_header(self) -> None:
+        """``git commit -m`` with a multi-line body including a # header."""
+        result = check_bash_command(
+            'git commit -m "fix: thing\n# Heading inside body\nmore"'
+        )
+        assert result.safe, (
+            f"git commit -m with markdown headers should pass; "
+            f"got check_id={result.check_id} msg={result.message}"
+        )
+
+    def test_gh_short_body_flag_with_markdown_header(self) -> None:
+        """``gh pr create -b`` is the short form of ``--body``."""
+        result = check_bash_command(
+            'gh issue create -b "report\n# Steps\n- do thing"'
+        )
+        assert result.safe, (
+            f"gh -b with markdown headers should pass; "
+            f"got check_id={result.check_id} msg={result.message}"
+        )
+
+    def test_bash_c_with_quoted_hash_still_blocked(self) -> None:
+        """Regression: ``bash -c "x\\n# evil"`` is still the original threat
+        model and must still be blocked."""
+        result = check_bash_command('bash -c "real\n# evil"')
         assert not result.safe
         assert result.check_id == CheckID.QUOTED_NEWLINE
 

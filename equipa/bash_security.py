@@ -1071,6 +1071,33 @@ def _is_inside_safe_interpreter_arg(command: str, quote_open_idx: int) -> bool:
     return bool(_SAFE_SCRIPT_INTERPRETER_BEFORE_QUOTE_RE.search(prefix))
 
 
+# CLI tools whose markdown-body flag (``--body``/``-b``/``--message``/``-m``)
+# legitimately carries multi-line markdown including ``# Header`` lines. The
+# body is passed as a single quoted token, so ``#`` cannot hide an argument.
+# Pattern matches the immediate token-pair before the quote: ``<tool> ...
+# <flag>``. The ``...`` allows other intervening flags like ``--title "X"``
+# but the flag must be the last token before the quote.
+_MARKDOWN_BODY_FLAG_BEFORE_QUOTE_RE = re.compile(
+    r"(?:^|[\s;&|`(])"
+    r"(?:gh|git|hub)\b"
+    r"[^|;&`(]*?"
+    r"\s(?:--body|-b|--message|-m)\s*$"
+)
+
+
+def _is_inside_markdown_body_arg(command: str, quote_open_idx: int) -> bool:
+    """Return True if the quote at ``quote_open_idx`` opens the body of a
+    markdown-accepting CLI flag (``gh pr create --body "..."``,
+    ``git commit -m "..."``, etc.). Inside such a body, ``\\n#`` is a
+    markdown header, not shell-comment smuggling — the body is one token to
+    the tool.
+    """
+    if quote_open_idx <= 0:
+        return False
+    prefix = command[:quote_open_idx]
+    return bool(_MARKDOWN_BODY_FLAG_BEFORE_QUOTE_RE.search(prefix))
+
+
 def _check_quoted_newline_comment(command: str) -> BashSecurityResult:
     """Check 23: Newline inside quotes where next line starts with #.
 
@@ -1080,12 +1107,21 @@ def _check_quoted_newline_comment(command: str) -> BashSecurityResult:
     standard Python comment syntax; agents writing Python heredocs hit this
     constantly (tasks #2075, #2077, #2096).
 
-    Loosen by allowlisting the ``-c``/``-e`` argument of script
-    interpreters whose body is NOT re-parsed by the shell: python, perl,
-    ruby, node. The check still fires for shells (``bash -c``,
-    ``sh -c``, ``zsh -c``) where ``#`` is the comment-smuggling primitive
-    this check was designed to catch, and for any other context where a
-    quoted ``\\n# ...`` could hide arguments.
+    Loosen by allowlisting:
+    - The ``-c``/``-e`` argument of script interpreters whose body is NOT
+      re-parsed by the shell: python, perl, ruby, node.
+    - The markdown-body argument of CLI tools that accept multi-line
+      markdown payloads (``gh``/``git``/``hub`` with ``--body``/``-b``/
+      ``--message``/``-m``). Markdown headers (``# Heading``) on a fresh
+      line inside the body would otherwise trip this check and kill PR
+      creation despite the agent having completed all code work — see
+      TheForge bug 2238. The body is a single quoted token to the tool, so
+      ``#`` cannot smuggle an argument.
+
+    The check still fires for shells (``bash -c``, ``sh -c``, ``zsh -c``)
+    where ``#`` is the comment-smuggling primitive this check was designed
+    to catch, and for any other context where a quoted ``\\n# ...`` could
+    hide arguments.
     """
     if "\n" not in command or "#" not in command:
         return _SAFE
@@ -1118,6 +1154,8 @@ def _check_quoted_newline_comment(command: str) -> BashSecurityResult:
             rest = command[i + 1:]
             if rest.lstrip().startswith("#"):
                 if _is_inside_safe_interpreter_arg(command, quote_open_idx):
+                    continue
+                if _is_inside_markdown_body_arg(command, quote_open_idx):
                     continue
                 return BashSecurityResult(
                     safe=False, check_id=CheckID.QUOTED_NEWLINE,
