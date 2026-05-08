@@ -796,6 +796,46 @@ async def _resolve_head_sha(
     return "HEAD"
 
 
+# Roles whose deliverable is a markdown report (audit/review), not code.
+# When these roles run and produce no code diff, the Tester phase has nothing
+# to test and would either spin in analysis paralysis or return tester_blocked.
+_AUDIT_ROLES = frozenset({"security-reviewer", "code-reviewer"})
+# Task types whose deliverable is documentation/analysis, not code.
+_AUDIT_TASK_TYPES = frozenset({"audit", "review"})
+
+
+def _is_audit_type_task(task: dict[str, Any] | None, task_role: str) -> bool:
+    """Return True if this task's deliverable is a markdown report, not code.
+
+    Triggers on either an audit-style ``task_type`` or one of the reviewer
+    roles. Matches the criteria spelled out in TheForge bug 2237.
+    """
+    if task_role in _AUDIT_ROLES:
+        return True
+    if not isinstance(task, dict):
+        return False
+    return (task.get("task_type") or "") in _AUDIT_TASK_TYPES
+
+
+async def _git_diff_is_empty(project_dir: str, base_ref: str = "HEAD") -> bool:
+    """Return True if there are no uncommitted code changes vs ``base_ref``.
+
+    Used to decide whether to skip the Tester phase on audit/review tasks.
+    On any failure (timeout, missing git), conservatively returns False so
+    the tester still runs — better a wasted tester cycle than a missed
+    real-code-change task.
+    """
+    try:
+        result = await git_run_async(
+            ["diff", base_ref], project_dir, timeout=10,
+        )
+        if result.returncode == 0:
+            return not result.stdout.strip()
+    except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
+        pass
+    return False
+
+
 async def _capture_git_diff_context(
     project_dir: str,
     cycle: int,
@@ -1390,6 +1430,37 @@ async def run_dev_test_loop(
                     f"Loop warning: agent repeated same pattern "
                     f"{state.loop_detector.consecutive_same} times (cycle {cycle})"
                 )
+
+            # --- Audit/review short-circuit ---
+            # If this task's deliverable is a markdown report (audit, review,
+            # security-reviewer, code-reviewer) and there are no code changes,
+            # there is nothing for the tester to test. Running it anyway either
+            # wastes turns in analysis paralysis or returns tester_blocked when
+            # the diff is empty. See TheForge bug 2237.
+            if _is_audit_type_task(task, task_role):
+                diff_empty = await _git_diff_is_empty(project_dir, base_ref=prev_cycle_sha)
+                if diff_empty:
+                    md_files = [
+                        f for f in state.accumulated_files
+                        if f.lower().endswith(".md")
+                    ]
+                    if md_files:
+                        log(
+                            f"  [Cycle {cycle}] Tester skipped (audit-type task, "
+                            f"no code changes — developer wrote markdown deliverable: "
+                            f"{', '.join(md_files[:3])}).",
+                            output,
+                        )
+                        clear_checkpoints(task_id)
+                        _apply_cost_totals(dev_result, state.total_cost, state.total_duration)
+                        return dev_result, cycle, "tests_passed"
+                    log(
+                        f"  [Cycle {cycle}] Tester skipped (audit-type task, "
+                        f"no code changes and no markdown deliverable produced).",
+                        output,
+                    )
+                    _apply_cost_totals(dev_result, state.total_cost, state.total_duration)
+                    return dev_result, cycle, "failed"
 
             # --- Tester Phase ---
             log(f"\n  [Cycle {cycle}] Running Tester agent "
