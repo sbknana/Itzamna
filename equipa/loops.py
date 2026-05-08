@@ -1444,6 +1444,30 @@ async def run_dev_test_loop(
                         f for f in state.accumulated_files
                         if f.lower().endswith(".md")
                     ]
+                    if not md_files:
+                        # Fallback: scan the working tree for markdown files the
+                        # agent wrote without emitting a FILES_CHANGED marker.
+                        # accumulated_files is only populated from those markers,
+                        # so one-shot review tasks that just write the file and
+                        # stop would otherwise be misreported as failed even
+                        # though the deliverable is on disk. See bug 2263.
+                        try:
+                            status_result = await git_run_async(
+                                ["status", "--porcelain"], project_dir, timeout=5,
+                            )
+                            if status_result.returncode == 0:
+                                md_files = [
+                                    line[3:].strip()
+                                    for line in status_result.stdout.splitlines()
+                                    if len(line) > 3
+                                    and line[3:].strip().lower().endswith(".md")
+                                ]
+                        except (subprocess.TimeoutExpired, OSError) as exc:
+                            log(
+                                f"  [Cycle {cycle}] git status fallback failed "
+                                f"while probing for markdown deliverable: {exc}",
+                                output,
+                            )
                     if md_files:
                         log(
                             f"  [Cycle {cycle}] Tester skipped (audit-type task, "
