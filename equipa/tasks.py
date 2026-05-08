@@ -19,7 +19,7 @@ from equipa.constants import (
     PROJECT_DIRS,
     THEFORGE_DB,
 )
-from equipa.db import db_conn
+from equipa.db import db_conn, get_db_connection
 
 # Ordered weakest -> strongest so we can compare/escalate complexities.
 _COMPLEXITY_RANK = {"simple": 0, "medium": 1, "complex": 2, "epic": 3}
