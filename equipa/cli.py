@@ -928,30 +928,35 @@ async def run_mode_task(args: argparse.Namespace) -> None:
                                                   dispatch_config=getattr(args, "dispatch_config", None))
         dry_model = get_role_model("developer", args, task=task)
         dry_turns = get_role_turns("developer", args, task=task)
-        cmd = build_cli_command(system_prompt, project_dir, dry_turns, dry_model, role="developer")
 
-        print("\n--- DRY RUN ---")
-        print(f"System prompt: {len(system_prompt)} chars, ~{estimate_tokens(system_prompt)} tokens")
-        print(f"Command ({len(cmd)} args):")
-        for i, part in enumerate(cmd):
-            if i > 0 and cmd[i - 1] == "--append-system-prompt":
-                print(f"  [system prompt: {len(part)} chars]")
-            elif i > 0 and cmd[i - 1] == "--append-system-prompt-file":
-                try:
-                    sz = os.path.getsize(part)
-                except OSError:
-                    sz = -1
-                print(f"  [system prompt file: {part} ({sz} bytes)]")
-            elif len(part) > 100:
-                print(f"  {part[:100]}...")
-            else:
-                print(f"  {part}")
+        # Use the contextmanager so the dry-run does NOT litter /tmp with
+        # leftover prompt files — the scanner reads the size while still
+        # inside the with-block, then the file is removed on exit.
+        with build_cli_command(
+            system_prompt, project_dir, dry_turns, dry_model, role="developer",
+        ) as cmd:
+            print("\n--- DRY RUN ---")
+            print(f"System prompt: {len(system_prompt)} chars, ~{estimate_tokens(system_prompt)} tokens")
+            print(f"Command ({len(cmd)} args):")
+            for i, part in enumerate(cmd):
+                if i > 0 and cmd[i - 1] == "--append-system-prompt":
+                    print(f"  [system prompt: {len(part)} chars]")
+                elif i > 0 and cmd[i - 1] == "--append-system-prompt-file":
+                    try:
+                        sz = os.path.getsize(part)
+                    except OSError:
+                        sz = -1
+                    print(f"  [system prompt file: {part} ({sz} bytes)]")
+                elif len(part) > 100:
+                    print(f"  {part[:100]}...")
+                else:
+                    print(f"  {part}")
 
-        if args.dev_test:
-            print(f"\nDev-Test loop would run up to {MAX_DEV_TEST_CYCLES} cycles.")
-            print("Each cycle: Developer agent -> Tester agent -> feedback loop.")
+            if args.dev_test:
+                print(f"\nDev-Test loop would run up to {MAX_DEV_TEST_CYCLES} cycles.")
+                print("Each cycle: Developer agent -> Tester agent -> feedback loop.")
 
-        print("\n--- END DRY RUN ---")
+            print("\n--- END DRY RUN ---")
         return
 
     # Confirm before running
@@ -1049,19 +1054,19 @@ async def run_mode_task(args: argparse.Namespace) -> None:
             max_turns=role_turns_allocated,
         )
         print(f"Dynamic budget: {role_turns_allocated}/{role_turns_max} turns")
-        cmd = build_cli_command(
+        with build_cli_command(
             system_prompt, project_dir, role_turns_allocated, role_model, role=args.role,
             streaming=use_streaming,
-        )
-        print(f"System prompt: {len(system_prompt)} chars, ~{estimate_tokens(system_prompt)} tokens")
+        ) as cmd:
+            print(f"System prompt: {len(system_prompt)} chars, ~{estimate_tokens(system_prompt)} tokens")
 
-        print(f"\nStarting {args.role} agent...")
-        if use_streaming:
-            # Streaming mode with early termination — no retries (kill is intentional)
-            result = await run_agent_streaming(cmd, role=args.role)
-            attempts = 1
-        else:
-            result, attempts = await run_agent_with_retries(cmd, task, args.retries)
+            print(f"\nStarting {args.role} agent...")
+            if use_streaming:
+                # Streaming mode with early termination — no retries (kill is intentional)
+                result = await run_agent_streaming(cmd, role=args.role)
+                attempts = 1
+            else:
+                result, attempts = await run_agent_with_retries(cmd, task, args.retries)
 
         # Tag result with dynamic budget info for telemetry
         result["turns_allocated"] = role_turns_allocated
