@@ -281,6 +281,48 @@ class TestNewlines:
         assert not result.safe
         assert result.check_id == CheckID.NEWLINES
 
+    def test_python_dash_c_with_embedded_newline_is_safe(self) -> None:
+        """python3 -c with newlines inside the quoted body is the legitimate
+        multi-statement script primitive — the shell sees the whole quoted
+        argument as one token. Bug 2307 regression."""
+        cmd = 'python3 -c "import struct\nimport sys\nprint(sys.version)"'
+        result = check_bash_command(cmd)
+        assert result.safe, f"False positive on python3 -c body: {result.message}"
+
+    def test_bash_dash_c_with_embedded_newline_is_safe(self) -> None:
+        """bash -c with newlines inside quotes is one shell token to the
+        outer shell. Comment-smuggling (\\n#) is still caught by check 23."""
+        cmd = 'bash -c "set -e\necho a\necho b"'
+        result = check_bash_command(cmd)
+        assert result.safe, f"False positive on bash -c body: {result.message}"
+
+    def test_psql_dash_c_with_embedded_newline_is_safe(self) -> None:
+        """psql -c with multi-statement SQL body must pass — SQL ; is not
+        a shell separator inside quotes."""
+        cmd = 'psql -c "BEGIN;\nSELECT 1;\nCOMMIT;"'
+        result = check_bash_command(cmd)
+        assert result.safe, f"False positive on psql -c body: {result.message}"
+
+    def test_perl_dash_e_with_embedded_newline_is_safe(self) -> None:
+        cmd = 'perl -e "use strict;\nprint 1;\n"'
+        result = check_bash_command(cmd)
+        assert result.safe, f"False positive on perl -e body: {result.message}"
+
+    def test_unquoted_newline_then_command_still_blocks(self) -> None:
+        """Defense-in-depth: a literal newline followed by another command
+        OUTSIDE any quotes must STILL be blocked."""
+        result = check_bash_command("echo hello\nrm -rf /")
+        assert not result.safe
+        assert result.check_id == CheckID.NEWLINES
+
+    def test_newline_after_closing_quote_still_blocks(self) -> None:
+        """Newline OUTSIDE the closing quote (after the -c body ends) is a
+        true shell-token boundary and must still block."""
+        cmd = 'python3 -c "print(1)"\nrm -rf /'
+        result = check_bash_command(cmd)
+        assert not result.safe
+        assert result.check_id == CheckID.NEWLINES
+
 
 class TestIFSInjection:
     """Check ID 11: $IFS / ${IFS} injection."""

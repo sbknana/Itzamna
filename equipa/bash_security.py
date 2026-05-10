@@ -835,38 +835,93 @@ def _check_dangerous_variables(unquoted: str) -> BashSecurityResult:
 
 
 def _check_newlines(command: str, unquoted: str) -> BashSecurityResult:
-    """Check 7: Newlines that could separate multiple commands."""
-    if not re.search(r"[\n\r]", unquoted):
+    """Check 7: Newlines that could separate multiple commands.
+
+    Only fires when the newline is at a true shell-token boundary —
+    i.e., OUTSIDE all quoted regions. Newlines embedded inside a quoted
+    argument to a script interpreter (``python3 -c "import x\\nimport y"``,
+    ``bash -c "set -e\\necho hi"``, ``psql -c "BEGIN;\\nSELECT 1;\\nCOMMIT;"``)
+    are consumed by the interpreter, not the shell, so they are NOT command
+    separators and must not trigger this check (the false-positive that
+    blocked agents writing multi-line script bodies through ``-c``/``-e``).
+
+    Walks the command character-by-character tracking quote state, so the
+    decision is made on real shell semantics rather than on the
+    ``_extract_unquoted`` helper's stripped output (which can desync when
+    quote nesting interacts with backslash escapes).
+
+    Carriage-return handling is preserved: ``\\r`` outside double quotes
+    is blocked because it can cause parser differentials between
+    shell-quote and bash.
+    """
+    if "\n" not in command and "\r" not in command:
         return _SAFE
-    # Newline/CR followed by non-whitespace (except \<newline> continuations)
-    if re.search(r"(?<![\s]\\)[\n\r]\s*\S", unquoted):
-        return BashSecurityResult(
-            safe=False, check_id=CheckID.NEWLINES,
-            message="Command contains newlines that could separate multiple commands",
-        )
-    # Carriage return outside double quotes
-    if "\r" in command:
-        in_single = False
-        in_double = False
-        esc = False
-        for ch in command:
-            if esc:
-                esc = False
+
+    in_single = False
+    in_double = False
+    escaped = False
+    quote_open_idx = -1
+
+    for i, ch in enumerate(command):
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\" and not in_single:
+            escaped = True
+            continue
+        if ch == "'" and not in_double:
+            if not in_single:
+                quote_open_idx = i
+            in_single = not in_single
+            continue
+        if ch == '"' and not in_single:
+            if not in_double:
+                quote_open_idx = i
+            in_double = not in_double
+            continue
+
+        if ch == "\n":
+            if in_single or in_double:
+                # Inside a quoted token — by shell semantics, NOT a
+                # command separator. Defense-in-depth: explicitly recognize
+                # the script-interpreter -c/-e case so the intent is
+                # documented and any future tightening here cannot
+                # accidentally re-introduce the false-positive.
+                if _is_inside_quoted_arg_value(command, quote_open_idx):
+                    continue
+                # Other quoted contexts: still part of the quoted token
+                # at the shell level, so the newline is not a separator.
+                # (Comment-smuggling via ``\n#`` is handled separately by
+                # check 23 / ``_check_quoted_newline_comment``.)
                 continue
-            if ch == "\\" and not in_single:
-                esc = True
+
+            # Unquoted newline — true shell-token boundary. Block only when
+            # followed by non-whitespace (i.e., a subsequent command on the
+            # next line), allowing ``\<NL>`` POSIX line continuations.
+            rest = command[i + 1:]
+            if not rest.lstrip():
                 continue
-            if ch == "'" and not in_double:
-                in_single = not in_single
+            j = i - 1
+            while j >= 0 and command[j] in " \t":
+                j -= 1
+            is_continuation = (
+                j >= 0
+                and command[j] == "\\"
+                and (j == 0 or command[j - 1] in (" ", "\t"))
+            )
+            if is_continuation:
                 continue
-            if ch == '"' and not in_single:
-                in_double = not in_double
-                continue
-            if ch == "\r" and not in_double:
-                return BashSecurityResult(
-                    safe=False, check_id=CheckID.NEWLINES,
-                    message="Command contains carriage return which can cause parser differentials",
-                )
+            return BashSecurityResult(
+                safe=False, check_id=CheckID.NEWLINES,
+                message="Command contains newlines that could separate multiple commands",
+            )
+
+        if ch == "\r" and not in_double:
+            return BashSecurityResult(
+                safe=False, check_id=CheckID.NEWLINES,
+                message="Command contains carriage return which can cause parser differentials",
+            )
+
     return _SAFE
 
 
@@ -1069,6 +1124,50 @@ _SAFE_SCRIPT_INTERPRETER_BEFORE_QUOTE_RE = re.compile(
     r"(?:python|python2|python3|py|perl|ruby|node|nodejs)"
     r"\s+-(?:c|e)\s*$"
 )
+
+
+# Broader allowlist used by check 7 (newlines): any interpreter or DB CLI
+# whose ``-c``/``-e``/``-x``/``--command`` argument is a multi-statement
+# script body where embedded newlines are legitimate (consumed by the
+# interpreter, not the shell). This includes shell interpreters
+# (``bash``/``sh``/``zsh``) — unlike the comment-smuggling check, a bare
+# newline inside ``bash -c "..."`` is NOT a shell-token boundary at the
+# outer shell level (the whole quoted body is ONE token to ``bash``).
+# The ``\n#`` smuggling primitive is still caught for shells by check 23
+# via ``_is_inside_safe_interpreter_arg`` (which intentionally excludes
+# the shells), so this looser list does not weaken that defense.
+_QUOTED_ARG_INTERPRETER_BEFORE_QUOTE_RE = re.compile(
+    r"(?:^|[\s;&|`(])"
+    r"(?:python|python2|python3|py|perl|ruby|node|nodejs|"
+    r"bash|sh|zsh|ksh|dash|fish|"
+    r"psql|mysql|mariadb|sqlite|sqlite3|"
+    r"awk|gawk|sed|"
+    r"php|lua|tclsh|R|Rscript)"
+    r"\s+-(?:c|e|x|-command)\s*$"
+)
+
+
+def _is_inside_quoted_arg_value(command: str, quote_open_idx: int) -> bool:
+    """Return True if the quote at ``quote_open_idx`` opens the body of a
+    script-interpreter or DB-CLI ``-c``/``-e`` argument where embedded
+    newlines are legitimate (``python3 -c``, ``bash -c``, ``psql -c``,
+    ``perl -e``, ``awk -e``, etc.).
+
+    Used by check 7 (``_check_newlines``) to ensure it only fires when the
+    newline is at a true shell-token boundary, not when it is inside a
+    quoted-string argument value being passed to a known interpreter. The
+    shell sees the whole quoted argument as one token, so newlines inside
+    are consumed by the interpreter — they cannot separate shell commands.
+
+    Mirrors ``_is_inside_safe_interpreter_arg`` (used by check 23) but
+    includes shell and DB CLIs because a newline alone is not the
+    comment-smuggling primitive — that primitive (``\\n#``) is what
+    check 23 catches with the narrower allowlist.
+    """
+    if quote_open_idx <= 0:
+        return False
+    prefix = command[:quote_open_idx]
+    return bool(_QUOTED_ARG_INTERPRETER_BEFORE_QUOTE_RE.search(prefix))
 
 
 def _is_inside_safe_interpreter_arg(command: str, quote_open_idx: int) -> bool:
