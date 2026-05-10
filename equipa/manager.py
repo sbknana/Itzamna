@@ -107,17 +107,16 @@ async def run_planner_agent(
     log("\n  [Planner] Building prompt...", output)
     system_prompt = build_planner_prompt(goal, project_id, project_dir, project_context)
 
-    cmd = build_cli_command(
+    with build_cli_command(
         system_prompt,
         project_dir,
         get_role_turns("planner", args),
         args.model,
         role="planner",
         prompt_message=f"Break this goal into tasks. Project dir: {project_dir}",
-    )
-
-    log(f"  [Planner] Spawning agent (prompt: {len(system_prompt)} chars)...", output)
-    result = await run_agent(cmd)
+    ) as cmd:
+        log(f"  [Planner] Spawning agent (prompt: {len(system_prompt)} chars)...", output)
+        result = await run_agent(cmd)
 
     if not result["success"]:
         log(f"  [Planner] Agent failed: {result.get('errors', [])}", output)
@@ -158,7 +157,7 @@ async def run_evaluator_agent(
         completed_tasks, blocked_tasks,
     )
 
-    cmd = build_cli_command(
+    with build_cli_command(
         system_prompt,
         project_dir,
         get_role_turns("evaluator", args),
@@ -167,10 +166,9 @@ async def run_evaluator_agent(
         prompt_message=(
             f"Evaluate whether this goal is complete. Project dir: {project_dir}"
         ),
-    )
-
-    log(f"  [Evaluator] Spawning agent (prompt: {len(system_prompt)} chars)...", output)
-    result = await run_agent(cmd)
+    ) as cmd:
+        log(f"  [Evaluator] Spawning agent (prompt: {len(system_prompt)} chars)...", output)
+        result = await run_agent(cmd)
 
     if not result["success"]:
         log(f"  [Evaluator] Agent failed: {result.get('errors', [])}", output)

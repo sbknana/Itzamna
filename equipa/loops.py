@@ -186,14 +186,13 @@ async def run_security_review(
         max_turns=sec_turns,
     )
     sec_model = get_role_model("security-reviewer", args, task=task)
-    sec_cmd = build_cli_command(
-        sec_prompt, project_dir, sec_turns, sec_model, role="security-reviewer",
-    )
-
     # Use security_review_timeout from dispatch config (default 15 min)
     dc = load_dispatch_config(None)
     sec_timeout = dc.get("security_review_timeout", 900)
-    sec_result = await run_agent(sec_cmd, timeout=sec_timeout)
+    with build_cli_command(
+        sec_prompt, project_dir, sec_turns, sec_model, role="security-reviewer",
+    ) as sec_cmd:
+        sec_result = await run_agent(sec_cmd, timeout=sec_timeout)
 
     if sec_result["success"]:
         log(f"  Security review completed in {sec_result.get('duration', 0):.1f}s", output)
@@ -335,16 +334,15 @@ async def run_code_review(
         max_turns=cr_turns,
     )
     cr_model = get_role_model("code-reviewer", args, task=task)
-    cr_cmd = build_cli_command(
-        cr_prompt, project_dir, cr_turns, cr_model, role="code-reviewer",
-    )
-
     # Reuse code_review_timeout from dispatch config (default 10 min — shorter
     # than security review since code review typically does not run multiple
     # tool scans).
     dc = load_dispatch_config(None)
     cr_timeout = dc.get("code_review_timeout", 600)
-    cr_result = await run_agent(cr_cmd, timeout=cr_timeout)
+    with build_cli_command(
+        cr_prompt, project_dir, cr_turns, cr_model, role="code-reviewer",
+    ) as cr_cmd:
+        cr_result = await run_agent(cr_cmd, timeout=cr_timeout)
 
     if cr_result["success"]:
         log(f"  Code review completed in {cr_result.get('duration', 0):.1f}s", output)
@@ -1272,11 +1270,6 @@ async def run_dev_test_loop(
                 max_turns=dev_turns_allocated,
             )
             use_streaming = task_role not in EARLY_TERM_EXEMPT_ROLES
-            dev_cmd = build_cli_command(
-                dev_prompt, project_dir, dev_turns_allocated, dev_model, role=task_role,
-                streaming=use_streaming,
-            )
-
             # --- Lifecycle hooks: pre_agent_start ---
             await fire_hook(
                 "pre_agent_start",
@@ -1289,11 +1282,15 @@ async def run_dev_test_loop(
             # have no teeth — the agent still gets the full kill budget.
             paralysis_retries = state.dev_run_config.get("_paralysis_retry_count", 0)
 
-            dev_result: AgentResult = await dispatch_agent(
-                dev_cmd, role=task_role, output=output, max_turns=dev_turns_allocated,
-                task_id=task_id, cycle=cycle, system_prompt=dev_prompt,
-                project_dir=project_dir, args=args,
-                paralysis_retry_count=paralysis_retries)
+            with build_cli_command(
+                dev_prompt, project_dir, dev_turns_allocated, dev_model, role=task_role,
+                streaming=use_streaming,
+            ) as dev_cmd:
+                dev_result: AgentResult = await dispatch_agent(
+                    dev_cmd, role=task_role, output=output, max_turns=dev_turns_allocated,
+                    task_id=task_id, cycle=cycle, system_prompt=dev_prompt,
+                    project_dir=project_dir, args=args,
+                    paralysis_retry_count=paralysis_retries)
             dev_result["turns_allocated"] = dev_turns_allocated
             dev_result["turns_max"] = dev_turns_max
             state.total_duration += dev_result.get("duration", 0)
@@ -1502,11 +1499,6 @@ async def run_dev_test_loop(
                 max_turns=tester_turns_allocated,
                 extra_context=tester_extra_context,
             )
-            tester_cmd = build_cli_command(
-                tester_prompt, project_dir, tester_turns_allocated, tester_model, role="tester",
-                streaming=True,
-            )
-
             # --- Lifecycle hooks: pre_agent_start (tester) ---
             await fire_hook(
                 "pre_agent_start",
@@ -1514,10 +1506,14 @@ async def run_dev_test_loop(
                 project_dir=project_dir, model=tester_model,
             )
 
-            tester_result: AgentResult = await dispatch_agent(
-                tester_cmd, role="tester", output=output, max_turns=tester_turns_allocated,
-                task_id=task_id, cycle=cycle, system_prompt=tester_prompt,
-                project_dir=project_dir, args=args)
+            with build_cli_command(
+                tester_prompt, project_dir, tester_turns_allocated, tester_model, role="tester",
+                streaming=True,
+            ) as tester_cmd:
+                tester_result: AgentResult = await dispatch_agent(
+                    tester_cmd, role="tester", output=output, max_turns=tester_turns_allocated,
+                    task_id=task_id, cycle=cycle, system_prompt=tester_prompt,
+                    project_dir=project_dir, args=args)
             tester_result["turns_allocated"] = tester_turns_allocated
             tester_result["turns_max"] = tester_turns_max
             state.total_duration += tester_result.get("duration", 0)

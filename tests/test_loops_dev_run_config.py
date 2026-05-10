@@ -37,6 +37,7 @@ Copyright 2026 Forgeborn
 
 from __future__ import annotations
 
+import contextlib
 import inspect
 import re
 from types import SimpleNamespace
@@ -155,7 +156,12 @@ async def test_run_dev_test_loop_completes_without_name_error(monkeypatch):
     monkeypatch.setattr(loops, "fire_hook", _async_none)
     monkeypatch.setattr(loops, "read_agent_messages", lambda *a, **kw: [])
     monkeypatch.setattr(loops, "build_system_prompt", lambda *a, **kw: "prompt")
-    monkeypatch.setattr(loops, "build_cli_command", lambda *a, **kw: ["cmd"])
+    # build_cli_command is now a contextmanager; the mock must yield the cmd
+    # so the `with build_cli_command(...) as cmd:` callsites still work.
+    @contextlib.contextmanager
+    def _fake_build_cli_command(*_a, **_kw):
+        yield ["cmd"]
+    monkeypatch.setattr(loops, "build_cli_command", _fake_build_cli_command)
     monkeypatch.setattr(loops, "_accumulate_cost", lambda *a, **kw: 0.0)
     monkeypatch.setattr(loops, "_check_cost_limit", lambda *a, **kw: None)
     monkeypatch.setattr(loops, "dispatch_agent", _fake_dispatch)

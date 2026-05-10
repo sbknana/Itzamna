@@ -196,11 +196,13 @@ async def _dispatch_autofix_agent(
         task_dict, project_context, project_dir,
         role=role, max_turns=budget, dispatch_config=dispatch_config,
     )
-    cmd = build_cli_command(prompt, project_dir, budget, model, role=role, streaming=streaming)
-    result: AgentResult = await dispatch_agent(
-        cmd, role=role, output=output, max_turns=budget, task_id=task_id,
-        cycle=cycle, system_prompt=prompt, project_dir=project_dir, args=args,
-    )
+    with build_cli_command(
+        prompt, project_dir, budget, model, role=role, streaming=streaming,
+    ) as cmd:
+        result: AgentResult = await dispatch_agent(
+            cmd, role=role, output=output, max_turns=budget, task_id=task_id,
+            cycle=cycle, system_prompt=prompt, project_dir=project_dir, args=args,
+        )
     cost = result.get("cost") or (result.get("num_turns", 0) * COST_ESTIMATE_PER_TURN)
     return result, cost
 
