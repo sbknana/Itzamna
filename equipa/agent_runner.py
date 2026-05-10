@@ -9,6 +9,7 @@ Copyright 2026 Forgeborn
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
@@ -19,6 +20,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any, TypedDict
 
 logger = logging.getLogger(__name__)
@@ -36,22 +38,6 @@ if TYPE_CHECKING:
 # local. PLAN-1067 §2.B2.
 _RECENT_TOOL_CALLS: dict[tuple[int, str], list[dict[str, Any]]] = {}
 _RECENT_TOOL_CALLS_MAX: int = 50
-
-# Track temp files created for system prompts so they can be cleaned up.
-# Windows command-line length is capped at ~8191 chars (WinError 206), so the
-# full system prompt is written to a temp file and passed via
-# --append-system-prompt-file instead of --append-system-prompt.
-_prompt_tempfiles: list[str] = []
-
-
-def cleanup_prompt_tempfiles() -> None:
-    """Remove temp files created by build_cli_command."""
-    for path in _prompt_tempfiles:
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
-    _prompt_tempfiles.clear()
 
 
 def _record_tool_call(
@@ -284,6 +270,7 @@ def is_retryable_error(stderr: str, stdout: str) -> bool:
     return any(marker in combined for marker in retryable_markers)
 
 
+@contextlib.contextmanager
 def build_cli_command(
     system_prompt: str | PromptResult,
     project_dir: str,
@@ -292,8 +279,15 @@ def build_cli_command(
     role: str = "developer",
     streaming: bool = False,
     prompt_message: str | None = None,
-) -> list[str]:
-    """Build the claude CLI command as a list of arguments.
+) -> Iterator[list[str]]:
+    """Build the claude CLI command as a context manager that owns its tempfile.
+
+    Yields the command list. On exit (normal or exceptional), the temp file
+    holding the system prompt is removed. Callers MUST consume the cmd while
+    inside the ``with`` block::
+
+        with build_cli_command(prompt, dir, 50, "opus") as cmd:
+            result = await run_agent(cmd)
 
     Args:
         system_prompt: Full system prompt string, or PromptResult from
@@ -303,6 +297,12 @@ def build_cli_command(
         prompt_message: Optional override for the user-facing -p message. Defaults
             to a generic "Execute the task..." instruction. Manager-mode dispatch
             (planner/evaluator) supplies role-specific text here.
+
+    Yields:
+        The argv list to pass to ``asyncio.create_subprocess_exec`` /
+        ``subprocess.run``. The list contains a path to a tempfile that is
+        deleted when the context exits — do NOT retain ``cmd`` past the
+        ``with`` block.
     """
     # Explicit str() ensures PromptResult.__str__() is called, producing
     # the full prompt with SYSTEM_PROMPT_DYNAMIC_BOUNDARY marker.
@@ -314,51 +314,63 @@ def build_cli_command(
     claude_bin = shutil.which("claude") or "claude"
 
     # Write system prompt to a temp file to avoid Windows command-line length
-    # limits (WinError 206, ~8191 chars). Not auto-deleted so the async
-    # subprocess can read it; cleanup_prompt_tempfiles() drains the list.
+    # limits (WinError 206, ~8191 chars). delete=False so the async subprocess
+    # can reopen it; the finally-block below removes it on context exit.
     prompt_file = tempfile.NamedTemporaryFile(
         mode="w", suffix=".md", prefix="equipa_prompt_",
         delete=False, encoding="utf-8",
     )
-    prompt_file.write(prompt_str)
-    prompt_file.close()
-    _prompt_tempfiles.append(prompt_file.name)
-
-    cmd = [
-        claude_bin,
-        "-p",
-        user_prompt,
-        "--output-format", output_format,
-        "--model", model,
-        "--max-turns", str(max_turns),
-        "--no-session-persistence",
-        "--append-system-prompt-file", prompt_file.name,
-        "--mcp-config", str(MCP_CONFIG),
-        "--add-dir", str(project_dir),
-        "--permission-mode", "bypassPermissions",
-    ]
-
-    # Load effort flag from dispatch_config — production-only config-driven setting.
-    # When dispatch_config.json has 'effort' set (e.g. "high"/"xhigh"/"max"), pass
-    # it to the Claude CLI for extended thinking. No-op when unset (CLI uses default).
     try:
-        _dc = load_dispatch_config(None)
-        _effort = _dc.get('effort')
-        if _effort:
-            cmd.extend(["--effort", _effort])
-    except (ImportError, FileNotFoundError, OSError, KeyError, ValueError):
-        pass  # config missing/unloadable → CLI default effort
+        prompt_file.write(prompt_str)
+        prompt_file.close()
 
-    # stream-json requires --verbose
-    if streaming:
-        cmd.append("--verbose")
+        cmd = [
+            claude_bin,
+            "-p",
+            user_prompt,
+            "--output-format", output_format,
+            "--model", model,
+            "--max-turns", str(max_turns),
+            "--no-session-persistence",
+            "--append-system-prompt-file", prompt_file.name,
+            "--mcp-config", str(MCP_CONFIG),
+            "--add-dir", str(project_dir),
+            "--permission-mode", "bypassPermissions",
+        ]
 
-    # Load role-specific skills directory if it exists
-    skills_dir = ROLE_SKILLS.get(role)
-    if skills_dir and skills_dir.exists():
-        cmd.extend(["--add-dir", str(skills_dir)])
+        # Load effort flag from dispatch_config — production-only config-driven setting.
+        # When dispatch_config.json has 'effort' set (e.g. "high"/"xhigh"/"max"), pass
+        # it to the Claude CLI for extended thinking. No-op when unset (CLI uses default).
+        try:
+            _dc = load_dispatch_config(None)
+            _effort = _dc.get('effort')
+            if _effort:
+                cmd.extend(["--effort", _effort])
+        except (ImportError, FileNotFoundError, OSError, KeyError, ValueError):
+            pass  # config missing/unloadable → CLI default effort
 
-    return cmd
+        # stream-json requires --verbose
+        if streaming:
+            cmd.append("--verbose")
+
+        # Load role-specific skills directory if it exists
+        skills_dir = ROLE_SKILLS.get(role)
+        if skills_dir and skills_dir.exists():
+            cmd.extend(["--add-dir", str(skills_dir)])
+
+        yield cmd
+    finally:
+        # Idempotent: missing_ok=True means a second cleanup (or one after a
+        # partial setup failure) does not raise.
+        try:
+            os.unlink(prompt_file.name)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logger.warning(
+                "Failed to remove agent prompt tempfile: %s", prompt_file.name,
+                exc_info=True,
+            )
 
 
 def _evaluate_paralysis_retry_read_gate(
