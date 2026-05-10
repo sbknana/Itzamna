@@ -189,6 +189,70 @@ class TestRedirection:
         assert not result.safe
         assert result.check_id == CheckID.OUTPUT_REDIRECTION
 
+    def test_heredoc_unquoted_delim_not_input_redirect(self) -> None:
+        """Bug #2285 (task #2309): ``<<EOF`` is a heredoc opener, not file
+        input redirection. The bare ``<`` of ``<<`` must not trigger check 9.
+
+        This standalone form (no ``$()`` wrapper) reaches check 9 because
+        the heredoc body is unquoted. Must be allowed through this check —
+        if anything blocks it, it must be a different check (e.g. 19).
+        """
+        result = check_bash_command("cat <<EOF\nhello\nEOF\n")
+        assert result.check_id != CheckID.INPUT_REDIRECTION, (
+            f"<<EOF heredoc opener must not be flagged as input "
+            f"redirection; got check_id={result.check_id} "
+            f"msg={result.message}"
+        )
+
+    def test_heredoc_quoted_delim_not_input_redirect(self) -> None:
+        """``<<'EOF'`` (single-quoted delimiter) heredoc must not fire
+        check 9. (Other checks like newline-detection may still fire on
+        a standalone multi-line command — this test only guards check 9.)"""
+        result = check_bash_command("cat <<'EOF'\nhello\nEOF\n")
+        assert result.check_id != CheckID.INPUT_REDIRECTION, (
+            f"<<'EOF' heredoc must not be flagged as input redirection; "
+            f"got check_id={result.check_id} msg={result.message}"
+        )
+
+    def test_heredoc_dash_delim_not_input_redirect(self) -> None:
+        """``<<-EOF`` (tab-stripping heredoc) must not fire check 9."""
+        result = check_bash_command("cat <<-EOF\n\thello\n\tEOF\n")
+        assert result.check_id != CheckID.INPUT_REDIRECTION
+
+    def test_heredoc_backslash_delim_not_input_redirect(self) -> None:
+        """``<<\\EOF`` (backslash-escaped delimiter) must not fire check 9."""
+        result = check_bash_command("cat <<\\EOF\nhello\nEOF\n")
+        assert result.check_id != CheckID.INPUT_REDIRECTION
+
+    def test_herestring_quoted_var(self) -> None:
+        """Bug #2285 (task #2309): ``<<<"$VAR"`` here-string must not be
+        flagged as input redirection."""
+        result = check_bash_command('cat <<<"$VAR"')
+        assert result.check_id != CheckID.INPUT_REDIRECTION, (
+            f"<<<\"$VAR\" here-string must not be flagged as input "
+            f"redirection; got check_id={result.check_id} "
+            f"msg={result.message}"
+        )
+
+    def test_herestring_literal_word(self) -> None:
+        """``cat <<<word`` here-string with literal word must not fire
+        check 9."""
+        result = check_bash_command("cat <<<word")
+        assert result.check_id != CheckID.INPUT_REDIRECTION
+
+    def test_input_redirect_still_blocks_after_heredoc_fix(self) -> None:
+        """Regression guard: the heredoc/here-string allowlist must NOT
+        let a true bare-``<`` file input redirection through."""
+        result = check_bash_command("cat < /etc/passwd")
+        assert not result.safe
+        assert result.check_id == CheckID.INPUT_REDIRECTION
+
+    def test_input_redirect_to_relative_file_still_blocks(self) -> None:
+        """``tee < input.txt`` is still file input redirection — blocks."""
+        result = check_bash_command("tee < input.txt")
+        assert not result.safe
+        assert result.check_id == CheckID.INPUT_REDIRECTION
+
 
 class TestDangerousVariables:
     """Check ID 6: Variables in redirect/pipe context."""
