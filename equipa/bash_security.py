@@ -1204,10 +1204,19 @@ _LOCALE_QUOTING_SAFE_BASES: frozenset[str] = frozenset([
 
 # Read-only commands safe to appear inside $() command substitution.
 # Used by Check 8. Anything not in this list keeps $() blocked.
+#
+# Both the assignment-side ``var=$(cmd)`` and the argument-side
+# ``other_cmd $(cmd)`` forms route through the same allowlist
+# (task #2308 — argument-side false-positives blocked common dev
+# patterns like ``ls $(go env GOMODCACHE)`` and ``gh pr create
+# --body-file $(mktemp -d)/body.md``).
 _SAFE_SUBSTITUTION_COMMANDS: frozenset[str] = frozenset([
     "git",          # rev-parse, log, diff, branch, etc. (all read-only forms)
+    "gh",           # GitHub CLI read-only subcommands (pr view, repo view, etc.)
+    "go",           # `go env GOMODCACHE`, `go env GOPATH`, etc.
     "date",
     "basename", "dirname", "realpath", "readlink",
+    "mktemp",       # path emitter; output is a fresh tmp path/dir
     "pwd",
     "echo", "printf",
     "cat",          # of project-relative files only — see check
