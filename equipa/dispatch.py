@@ -42,6 +42,7 @@ from equipa.constants import (
     PROJECT_DIRS,
 )
 from equipa.db import (
+    db_conn,
     get_db_connection,
     record_agent_run,
     update_task_status,

@@ -47,6 +47,7 @@ from equipa.constants import (
 )
 from equipa.db import (
     _get_latest_agent_run_id,
+    db_conn,
     get_db_connection,
     update_task_status,
 )
