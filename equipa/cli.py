@@ -936,6 +936,12 @@ async def run_mode_task(args: argparse.Namespace) -> None:
         for i, part in enumerate(cmd):
             if i > 0 and cmd[i - 1] == "--append-system-prompt":
                 print(f"  [system prompt: {len(part)} chars]")
+            elif i > 0 and cmd[i - 1] == "--append-system-prompt-file":
+                try:
+                    sz = os.path.getsize(part)
+                except OSError:
+                    sz = -1
+                print(f"  [system prompt file: {part} ({sz} bytes)]")
             elif len(part) > 100:
                 print(f"  {part[:100]}...")
             else:

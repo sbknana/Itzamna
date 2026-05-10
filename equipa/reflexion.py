@@ -8,6 +8,7 @@ Copyright 2026 Forgeborn
 from __future__ import annotations
 
 import json
+import shutil
 from typing import Any
 
 from equipa.db import db_conn
@@ -69,8 +70,9 @@ async def run_reflexion_agent(
             f"No preamble, no formatting, no markdown."
         )
 
+        claude_bin = shutil.which("claude") or "claude"
         cmd = [
-            "claude",
+            claude_bin,
             "-p", reflection_prompt,
             "--output-format", "json",
             "--model", "sonnet",

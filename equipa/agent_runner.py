@@ -13,8 +13,11 @@ import hashlib
 import json
 import logging
 import math
+import os
 import random
+import shutil
 import subprocess
+import tempfile
 import time
 from typing import TYPE_CHECKING, Any, TypedDict
 
@@ -33,6 +36,22 @@ if TYPE_CHECKING:
 # local. PLAN-1067 §2.B2.
 _RECENT_TOOL_CALLS: dict[tuple[int, str], list[dict[str, Any]]] = {}
 _RECENT_TOOL_CALLS_MAX: int = 50
+
+# Track temp files created for system prompts so they can be cleaned up.
+# Windows command-line length is capped at ~8191 chars (WinError 206), so the
+# full system prompt is written to a temp file and passed via
+# --append-system-prompt-file instead of --append-system-prompt.
+_prompt_tempfiles: list[str] = []
+
+
+def cleanup_prompt_tempfiles() -> None:
+    """Remove temp files created by build_cli_command."""
+    for path in _prompt_tempfiles:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    _prompt_tempfiles.clear()
 
 
 def _record_tool_call(
@@ -292,15 +311,28 @@ def build_cli_command(
     user_prompt = prompt_message or (
         f"Execute the task described in your system prompt. Work in: {project_dir}"
     )
+    claude_bin = shutil.which("claude") or "claude"
+
+    # Write system prompt to a temp file to avoid Windows command-line length
+    # limits (WinError 206, ~8191 chars). Not auto-deleted so the async
+    # subprocess can read it; cleanup_prompt_tempfiles() drains the list.
+    prompt_file = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".md", prefix="equipa_prompt_",
+        delete=False, encoding="utf-8",
+    )
+    prompt_file.write(prompt_str)
+    prompt_file.close()
+    _prompt_tempfiles.append(prompt_file.name)
+
     cmd = [
-        "claude",
+        claude_bin,
         "-p",
         user_prompt,
         "--output-format", output_format,
         "--model", model,
         "--max-turns", str(max_turns),
         "--no-session-persistence",
-        "--append-system-prompt", prompt_str,
+        "--append-system-prompt-file", prompt_file.name,
         "--mcp-config", str(MCP_CONFIG),
         "--add-dir", str(project_dir),
         "--permission-mode", "bypassPermissions",
