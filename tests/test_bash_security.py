@@ -956,6 +956,36 @@ class TestDeveloperLoosens:
         result = check_bash_command(cmd)
         assert not result.safe
 
+    # ---- Bug 2310: VCS / PR commands carry $"..." as DATA, not exec ---- #
+
+    def test_git_commit_with_locale_quoting_data_passes(self) -> None:
+        """`git commit -m "...$\"x\"..."` commits the bytes as a message;
+        the locale-quote sequence never reaches an exec context."""
+        cmd = 'git commit -m "fix: $\\"x\\" syntax"'
+        result = check_bash_command(cmd)
+        assert result.safe, f"expected safe: {cmd} -> {result.message}"
+
+    def test_gh_pr_create_with_locale_quoting_data_passes(self) -> None:
+        """`gh pr create` body containing $"..." is PR body text, not exec."""
+        cmd = 'gh pr create -t T -b "doc: $\\"y\\""'
+        result = check_bash_command(cmd)
+        assert result.safe, f"expected safe: {cmd} -> {result.message}"
+
+    def test_python_with_locale_quoting_still_blocks(self) -> None:
+        """`python -c $"..."` is an exec primitive — must remain blocked."""
+        result = check_bash_command(r'python -c $"echo"')
+        assert not result.safe
+
+    def test_eval_with_locale_quoting_still_blocks(self) -> None:
+        """`eval $"x"` evaluates locale-quoted content — must stay blocked."""
+        result = check_bash_command(r'eval $"x"')
+        assert not result.safe
+
+    def test_bash_c_with_locale_quoting_still_blocks(self) -> None:
+        """`bash -c $"x"` executes locale-quoted content — must stay blocked."""
+        result = check_bash_command(r'bash -c $"x"')
+        assert not result.safe
+
     # ---- Check 6: variables in pipes/redirects (loop counters) ---- #
 
     @pytest.mark.parametrize("cmd", [

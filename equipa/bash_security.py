@@ -1308,11 +1308,18 @@ _ZSH_PRECOMMAND_MODIFIERS: frozenset[str] = frozenset([
 
 # Read-only text tools where locale quoting ($"...") is a legitimate i18n
 # pattern, not an attack vector. Allowlist used by Check 4.
+#
+# Also includes version-control / PR-creation commands (git/gh/hg/jj/svn)
+# where $"..." inside arguments is committed AS DATA into a commit message,
+# PR body, or changelog — it never reaches an exec context. The check-4
+# threat model (locale quoting as a vector to hide characters from exec)
+# does not apply here. See bug 2310.
 _LOCALE_QUOTING_SAFE_BASES: frozenset[str] = frozenset([
     "grep", "egrep", "fgrep", "rg", "ag", "ack",
     "sed", "awk", "gawk",
     "find", "fd",
     "echo", "printf",
+    "git", "gh", "hg", "jj", "svn",
 ])
 
 # Read-only commands safe to appear inside $() command substitution.
