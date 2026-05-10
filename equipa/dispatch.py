@@ -286,6 +286,93 @@ async def cleanup_failed_attempt(
 
 # --- DB Scanning & Scoring ---
 
+
+
+async def run_dev_test_loop_with_autoresearch(
+    task: dict,
+    project_dir: str,
+    project_context: dict,
+    args,
+    config: dict,
+    output: list[str] | None = None,
+):
+    """Run run_dev_test_loop with autoresearch retry on failure.
+
+    Bug 2282: extracted from the inline pattern that lived only in
+    run_dispatch (single-task path). run_parallel_tasks did not have this
+    wrapper, so any failure in --tasks N,M,O dispatch was final. This
+    helper is the canonical retry entry point - both call sites use it.
+
+    Returns:
+        (result, cycles, outcome, loop_total_cost, loop_total_duration, task)
+
+    The caller adds loop_total_cost / loop_total_duration to its own
+    running totals (caller may track preflight + loop costs separately).
+    The task dict is returned because autoresearch may re-fetch it
+    between attempts to pick up reflection-injected context.
+    """
+    task_id = task["id"]
+    autoresearch_on = is_feature_enabled(config, "autoresearch")
+    max_retries = config.get("autoresearch_max_retries", 3) if autoresearch_on else 0
+    retry_count = 0
+    attempt_reflections: list[str] = []
+    loop_total_cost = 0.0
+    loop_total_duration = 0.0
+
+    while True:
+        result, cycles, outcome = await run_dev_test_loop(
+            task, project_dir, project_context, args, output=output,
+        )
+        loop_total_duration += result.get("duration", 0)
+        if result.get("cost"):
+            loop_total_cost += result["cost"]
+
+        # Success - break out of retry loop
+        if outcome in ("tests_passed", "no_tests", "early_completed_no_changes"):
+            break
+
+        # Capture reflection on failed attempt for cross-attempt memory
+        attempt_reflection = _build_dispatch_attempt_reflection(
+            retry_count + 1, outcome, cycles, result,
+        )
+        attempt_reflections.append(attempt_reflection)
+
+        # Not retriable or retries exhausted
+        if not autoresearch_on or retry_count >= max_retries:
+            if retry_count > 0:
+                log(
+                    f"  [Autoresearch] Exhausted {retry_count}/{max_retries} retries "
+                    f"for task #{task_id}. Final outcome: {outcome}",
+                    output,
+                )
+            break
+
+        retry_count += 1
+        log(
+            f"  [Autoresearch] Task #{task_id} failed ({outcome}). "
+            f"Retry {retry_count}/{max_retries}...",
+            output,
+        )
+
+        # Clean up failed git branch and reset task for next attempt.
+        await cleanup_failed_attempt(
+            task_id, project_dir, attempt_reflections, output,
+        )
+
+        # Re-fetch task to get clean state (with injected reflections)
+        refreshed = fetch_task(task_id)
+        if not refreshed:
+            log(
+                f"  [Autoresearch] Task #{task_id} disappeared from DB. "
+                f"Aborting retries.",
+                output,
+            )
+            break
+        task = refreshed
+
+    return result, cycles, outcome, loop_total_cost, loop_total_duration, task
+
+
 def scan_pending_work() -> list[dict]:
     """Query DB for all projects with todo tasks, grouped by priority.
 
@@ -524,53 +611,16 @@ async def run_project_tasks(
         )
 
         # --- Autoresearch retry loop with cross-attempt memory ---
-        autoresearch_on = is_feature_enabled(config, "autoresearch")
-        max_retries = config.get("autoresearch_max_retries", 3) if autoresearch_on else 0
-        retry_count = 0
-        attempt_reflections: list[str] = []
-
-        while True:
-            result, cycles, outcome = await run_dev_test_loop(
-                task, project_dir, project_context, task_args, output=output,
+        # Bug 2282: extracted into module-level helper so run_parallel_tasks
+        # can reuse the same retry semantics. Both code paths now share one
+        # canonical autoresearch wrapper.
+        result, cycles, outcome, _loop_cost, _loop_duration, task = (
+            await run_dev_test_loop_with_autoresearch(
+                task, project_dir, project_context, task_args, config, output=output,
             )
-            total_duration += result.get("duration", 0)
-            if result.get("cost"):
-                total_cost += result["cost"]
-
-            # Success - break out of retry loop
-            if outcome in ("tests_passed", "no_tests", "early_completed_no_changes"):
-                break
-
-            # Extract reflection from failed attempt for cross-attempt memory
-            attempt_reflection = _build_dispatch_attempt_reflection(
-                retry_count + 1, outcome, cycles, result,
-            )
-            attempt_reflections.append(attempt_reflection)
-
-            # Not retriable or retries exhausted
-            if not autoresearch_on or retry_count >= max_retries:
-                if retry_count > 0:
-                    log(f"  [Autoresearch] Exhausted {retry_count}/{max_retries} retries "
-                        f"for task #{task_id}. Final outcome: {outcome}", output)
-                break
-
-            retry_count += 1
-            log(f"  [Autoresearch] Task #{task_id} failed ({outcome}). "
-                f"Retry {retry_count}/{max_retries}...", output)
-
-            # Clean up failed git branch and reset task for next attempt.
-            # cleanup_failed_attempt is now natively async (uses
-            # git_run_async under the hood), so it will not block the
-            # event loop while other parallel tasks are running.
-            await cleanup_failed_attempt(
-                task_id, project_dir, attempt_reflections, output,
-            )
-
-            # Re-fetch task to get clean state (with injected reflections)
-            task = fetch_task(task_id)
-            if not task:
-                log(f"  [Autoresearch] Task #{task_id} disappeared from DB. Aborting retries.", output)
-                break
+        )
+        total_cost += _loop_cost
+        total_duration += _loop_duration
 
         # Orchestrator-side DB update (don't rely on agent)
         update_task_status(task_id, outcome, output=output)
@@ -1416,8 +1466,16 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
                     logger.exception("[flows] child running update failed")
 
             log(f"\n[Task #{task['id']}] Starting: {task['title']}", output)
-            result, cycles, outcome = await run_dev_test_loop(
-                task, task_dir, project_context, args, output=output,
+            # Bug 2282 fix: parallel mode now gets the same autoresearch
+            # retry wrapper as single-task mode. Without this, BashSecurity
+            # false positives or analysis-paralysis early-terms in any of
+            # the N parallel tasks would be final with no reflection-
+            # injected retry. The helper is module-level above.
+            _config_for_loop = getattr(args, "dispatch_config", None) or {}
+            result, cycles, outcome, _, _, task = (
+                await run_dev_test_loop_with_autoresearch(
+                    task, task_dir, project_context, args, _config_for_loop, output=output,
+                )
             )
             update_task_status(task["id"], outcome, output=output)
             log(f"[Task #{task['id']}] Done: {outcome} ({cycles} cycles)", output)
