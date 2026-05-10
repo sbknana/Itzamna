@@ -2,12 +2,18 @@
 the claude CLI argument list. Guards against regressions where planner or
 evaluator dispatch drifts from the central command builder.
 
+Updated for task 2311: build_cli_command is now a context manager that owns
+its prompt-file lifetime. Tests must consume the cmd while inside the
+``with`` block (the prompt file is deleted on exit).
+
 Copyright 2026 Forgeborn
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import os
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -21,11 +27,23 @@ def _make_args(model: str = "sonnet", max_turns: int = 20) -> SimpleNamespace:
     return SimpleNamespace(model=model, max_turns=max_turns)
 
 
-def _capture_cmd(prompt_value: str = "SYSTEM_PROMPT_BODY"):
+def _capture_cmd():
+    """Build a fake run_agent that captures the cmd AND the prompt-file body.
+
+    The prompt file is deleted when the build_cli_command context exits, so
+    we read it eagerly inside the fake (which runs while the context is open).
+    """
     captured: dict = {}
 
     async def fake_run_agent(cmd, **_kwargs):
-        captured["cmd"] = cmd
+        captured["cmd"] = list(cmd)
+        # Eagerly read the tempfile body — it's gone after the with-block exits.
+        if "--append-system-prompt-file" in cmd:
+            idx = cmd.index("--append-system-prompt-file")
+            path = cmd[idx + 1]
+            captured["prompt_file_path"] = path
+            with open(path, encoding="utf-8") as f:
+                captured["prompt_body"] = f.read()
         return {
             "success": True,
             "result_text": "TASKS_CREATED: 42\nGOAL_STATUS: complete",
@@ -38,7 +56,7 @@ def _capture_cmd(prompt_value: str = "SYSTEM_PROMPT_BODY"):
 
 def _assert_common_cli_shape(cmd: list[str], project_dir: str, model: str) -> None:
     """Assert the CLI command has the expected build_cli_command structure."""
-    assert cmd[0] == "claude"
+    assert cmd[0] == "claude" or cmd[0].endswith("/claude") or cmd[0].endswith("\\claude")
     assert cmd[1] == "-p"
 
     # Required flag/value pairs
@@ -46,7 +64,6 @@ def _assert_common_cli_shape(cmd: list[str], project_dir: str, model: str) -> No
         "--output-format": "json",
         "--model": model,
         "--mcp-config": None,  # value not pinned (path varies)
-        "--add-dir": project_dir,
         "--permission-mode": "bypassPermissions",
     }
     for flag, expected_val in expected_pairs.items():
@@ -57,9 +74,16 @@ def _assert_common_cli_shape(cmd: list[str], project_dir: str, model: str) -> No
                 f"{flag} expected {expected_val!r}, got {cmd[idx + 1]!r}"
             )
 
+    # --add-dir occurs at least once with project_dir.
+    add_dir_indices = [i for i, a in enumerate(cmd) if a == "--add-dir"]
+    assert add_dir_indices, "missing --add-dir"
+    assert any(cmd[i + 1] == project_dir for i in add_dir_indices), (
+        f"--add-dir does not include project_dir={project_dir!r}"
+    )
+
     # Other required single flags
     assert "--no-session-persistence" in cmd
-    assert "--append-system-prompt" in cmd
+    assert "--append-system-prompt-file" in cmd
     assert "--max-turns" in cmd
 
 
@@ -87,9 +111,13 @@ def test_planner_uses_build_cli_command():
     assert "tasks" in cmd[p_idx + 1].lower()
     assert "/tmp/proj" in cmd[p_idx + 1]
 
-    # System prompt body propagated through
-    sp_idx = cmd.index("--append-system-prompt")
-    assert cmd[sp_idx + 1] == "PLANNER_SYS_PROMPT"
+    # System prompt body propagated through the tempfile
+    assert captured["prompt_body"] == "PLANNER_SYS_PROMPT"
+
+    # Tempfile must be cleaned up after the context exits
+    assert not os.path.exists(captured["prompt_file_path"]), (
+        "prompt tempfile leaked past context-manager exit"
+    )
 
 
 def test_evaluator_uses_build_cli_command():
@@ -118,8 +146,8 @@ def test_evaluator_uses_build_cli_command():
     assert "evaluate" in cmd[p_idx + 1].lower()
     assert "/tmp/proj" in cmd[p_idx + 1]
 
-    sp_idx = cmd.index("--append-system-prompt")
-    assert cmd[sp_idx + 1] == "EVAL_SYS_PROMPT"
+    assert captured["prompt_body"] == "EVAL_SYS_PROMPT"
+    assert not os.path.exists(captured["prompt_file_path"])
 
 
 def test_planner_and_evaluator_share_command_builder():
@@ -168,36 +196,38 @@ def test_planner_and_evaluator_roles_passed_to_builder():
 
     # build_cli_command must not crash when role has no entry in ROLE_SKILLS
     for role in ("planner", "evaluator"):
-        cmd = build_cli_command(
+        with build_cli_command(
             "SYS_PROMPT",
             "/tmp/proj",
             max_turns=10,
             model="sonnet",
             role=role,
             prompt_message=f"role={role}",
-        )
-        # No skills directory for these roles → no extra --add-dir beyond project_dir
-        add_dir_count = sum(1 for arg in cmd if arg == "--add-dir")
-        skill_dir = ROLE_SKILLS.get(role)
-        if skill_dir is None or not skill_dir.exists():
-            assert add_dir_count == 1, (
-                f"role={role}: expected single --add-dir (no skills), "
-                f"got {add_dir_count}"
-            )
+        ) as cmd:
+            # No skills directory for these roles → no extra --add-dir beyond project_dir
+            add_dir_count = sum(1 for arg in cmd if arg == "--add-dir")
+            skill_dir = ROLE_SKILLS.get(role)
+            if skill_dir is None or not skill_dir.exists():
+                assert add_dir_count == 1, (
+                    f"role={role}: expected single --add-dir (no skills), "
+                    f"got {add_dir_count}"
+                )
 
     # Verify role kwarg propagates from manager to build_cli_command
     captured_role: dict = {}
     real_build = build_cli_command
 
+    @contextlib.contextmanager
     def spy_build(*args, **kwargs):
         captured_role.setdefault("planner_calls", []).append(kwargs.get("role"))
-        return real_build(*args, **kwargs)
+        with real_build(*args, **kwargs) as cmd:
+            yield cmd
 
     _, fake_run = _capture_cmd()
 
     async def go():
         with patch.object(manager, "build_planner_prompt", return_value="X"), \
-             patch.object(manager, "build_cli_command", side_effect=spy_build), \
+             patch.object(manager, "build_cli_command", spy_build), \
              patch.object(manager, "run_agent", fake_run):
             await manager.run_planner_agent(
                 "g", 1, "/tmp/p", {}, _make_args(model="sonnet"),
