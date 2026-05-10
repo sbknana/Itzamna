@@ -730,11 +730,20 @@ def _check_redirections(unquoted: str) -> BashSecurityResult:
       - 2>&1, 2>/dev/null, >/dev/null, 2>>*.log (existing)
       - > and >> targeting /tmp/, ./, or any relative path (no leading /)
       - >> appending to *.log anywhere
+      - ``<<DELIM`` / ``<<-DELIM`` / ``<<'DELIM'`` / ``<<\\DELIM`` heredoc
+        opener (delimiter introduces literal text, not a file path)
+      - ``<<<word`` here-string operator (literal data, not a file path)
 
     Explicit denylist (always blocks regardless of above):
       - /etc/, /usr/, /bin/, /sbin/, /boot/, /root/, /sys/, /dev/sd*,
         /dev/disk*, /var/log/ (system logs), ~/.* (dotfile in home),
         /home/*/.* (dotfile in any user home)
+
+    Bug #2285 (task #2309): a bare ``<`` inside ``<<`` or ``<<<`` was being
+    treated as input redirection, blocking canonical heredoc and here-string
+    patterns (``cat <<EOF`` / ``cat <<<"$VAR"``). Strip the ``<<`` and ``<<<``
+    operators *before* the literal-char check so only a true bare ``<``
+    (file redirection) trips the block.
     """
     # Hard denylist applied to the ORIGINAL unquoted string before any
     # stripping — these targets are never safe even if they textually match
@@ -755,6 +764,11 @@ def _check_redirections(unquoted: str) -> BashSecurityResult:
 
     # Strip safe stderr/stdout redirection patterns before the literal-char check
     safe_patterns = [
+        # Heredoc / here-string operators MUST be stripped BEFORE bare-< check.
+        # Order matters: <<< (here-string) must be matched before << (heredoc)
+        # so the third < is not misread as a heredoc body word boundary.
+        r"<<<",                            # <<<word here-string operator
+        r"<<-?\s*\\?['\"]?[\w-]+['\"]?",   # <<EOF, <<-EOF, <<'EOF', <<\EOF
         r"2\s*>\s*&\s*1",                  # 2>&1
         r"2\s*>\s*/dev/null",              # 2>/dev/null
         r">\s*/dev/null",                  # >/dev/null
