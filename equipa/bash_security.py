@@ -492,6 +492,64 @@ def _is_benign_cat_heredoc_substitution(message: str) -> bool:
     return _is_benign_cat_heredoc_inner(inner)
 
 
+# Whitelist of post-commit output filters allowed in the unquoted remainder
+# after a `git commit -m "..."` argument. Keeps the surface area minimal —
+# any pipe to a command outside this list still trips check 12.
+_BENIGN_COMMIT_PIPE_CMDS = ("tail", "head", "cat", "wc", "grep")
+_BENIGN_COMMIT_PIPE_RE = re.compile(
+    r"\|\s*(?:" + "|".join(_BENIGN_COMMIT_PIPE_CMDS) + r")(?:\s+[\w./-]+)*\s*$"
+)
+_BENIGN_STDERR_REDIRECT_RE = re.compile(r"2\s*>\s*&\s*1")
+
+
+def _strip_benign_commit_remainder(remainder: str) -> str:
+    """Strip allowlisted output-capture patterns from a git-commit remainder.
+
+    Permits ``2>&1`` (numeric stderr-to-stdout redirect) and a single trailing
+    ``| <cmd> [args]`` where ``<cmd>`` is in ``_BENIGN_COMMIT_PIPE_CMDS``.
+    Anything left over is fed back into the normal metacharacter check, so
+    additional pipes / operators / non-whitelisted commands still block.
+
+    Regression context: bug 2214 — check 12 was killing GutenForge dispatches
+    on benign `git commit -m "msg" 2>&1 | tail -10` invocations because the
+    `|` and `&` in the remainder tripped the metacharacter gate. The 2158
+    benign-cat-heredoc allowlist is the design model for this whitelist.
+    """
+    cleaned = _BENIGN_STDERR_REDIRECT_RE.sub(" ", remainder)
+    cleaned = _BENIGN_COMMIT_PIPE_RE.sub(" ", cleaned)
+    return cleaned
+
+
+_GIT_COMMIT_M_ARG_RE = re.compile(r'-m\s+(?:"([^"]*)"|\'([^\']*)\')')
+
+
+def _is_git_commit_multi_paragraph(command: str) -> bool:
+    """True if *command* is ``git commit ... -m "" ...`` with a non-empty
+    ``-m`` on EACH side of the empty one.
+
+    Git's documented multi-paragraph syntax is
+    ``git commit -m "subject" -m "" -m "body"`` — the empty ``-m`` inserts
+    a blank paragraph separator. Check 4's "empty quotes before dash"
+    heuristic was false-positiving on this benign pattern (bug 2214,
+    GutenForge BR-D #2209 killed at turn 18).
+
+    The check only fires for ``git commit`` invocations and requires an
+    empty ``-m`` *between* two non-empty ``-m``s for the same invocation —
+    a single trailing/leading empty ``-m`` (e.g. ``git commit -m ""``) is
+    still considered suspicious and continues to trip check 4 / check 12.
+    """
+    if not re.match(r"^\s*git\s+commit\b", command):
+        return False
+    matches = _GIT_COMMIT_M_ARG_RE.findall(command)
+    if len(matches) < 3:
+        return False
+    values = [dq or sq for dq, sq in matches]
+    for i in range(1, len(values) - 1):
+        if values[i] == "" and values[i - 1] != "" and values[i + 1] != "":
+            return True
+    return False
+
+
 def _check_git_commit_substitution(
     command: str, base_cmd: str,
 ) -> BashSecurityResult:
@@ -534,9 +592,12 @@ def _check_git_commit_substitution(
 
     # Remainder after the closing quote: ignore plain whitespace, additional
     # git flags, and trailing newlines. Only flag genuine shell operators
-    # in unquoted regions of the remainder.
+    # in unquoted regions of the remainder. Strip allowlisted output-capture
+    # patterns (`2>&1`, trailing `| tail/head/cat/wc/grep ...`) first — bug
+    # 2214: these are legitimate shell composition for capturing git output.
     if remainder.strip():
         unquoted_rem = _extract_unquoted(remainder)
+        unquoted_rem = _strip_benign_commit_remainder(unquoted_rem)
         if re.search(r"[;|&()`]|\$\(|\$\{", unquoted_rem):
             return BashSecurityResult(
                 safe=False,
@@ -567,6 +628,13 @@ def _check_obfuscated_flags(command: str, base_cmd: str) -> BashSecurityResult:
     if base_cmd == "echo" and not re.search(r"[|&;]", command):
         return _SAFE
 
+    # Git's documented multi-paragraph commit syntax uses an empty `-m ""`
+    # between two non-empty `-m "..."` args to insert a blank paragraph.
+    # The empty-quote heuristics below would false-positive on it (bug 2214,
+    # GutenForge BR-D #2209). Detect and skip the empty-quote heuristics
+    # for this exact pattern; ANSI-C / locale-quoting checks still apply.
+    skip_empty_quote_checks = _is_git_commit_multi_paragraph(command)
+
     # ANSI-C quoting: $'...'
     if re.search(r"\$'[^']*'", command):
         return BashSecurityResult(
@@ -590,14 +658,16 @@ def _check_obfuscated_flags(command: str, base_cmd: str) -> BashSecurityResult:
             )
 
     # Empty ANSI-C or locale quotes before dash: $''-exec or $""-exec
-    if re.search(r"""\$['\"]{2}\s*-""", command):
+    if not skip_empty_quote_checks and re.search(r"""\$['\"]{2}\s*-""", command):
         return BashSecurityResult(
             safe=False, check_id=CheckID.OBFUSCATED_FLAGS,
             message="Command contains empty special quotes before dash",
         )
 
     # Empty quote pairs before dash: ''-exec, ""-exec
-    if re.search(r"""(?:^|\s)(?:''|""){1,}\s*-""", command):
+    if not skip_empty_quote_checks and re.search(
+        r"""(?:^|\s)(?:''|""){1,}\s*-""", command,
+    ):
         return BashSecurityResult(
             safe=False, check_id=CheckID.OBFUSCATED_FLAGS,
             message="Command contains empty quotes before dash (potential bypass)",
