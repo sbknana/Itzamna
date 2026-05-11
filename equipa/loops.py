@@ -197,12 +197,28 @@ async def run_security_review(
 
     if sec_result["success"]:
         log(f"  Security review completed in {sec_result.get('duration', 0):.1f}s", output)
-        # Parse for critical findings
         result_text = sec_result.get("result_text", "")
-        critical_count = result_text.lower().count("critical")
-        high_count = result_text.lower().count("high")
-        if critical_count > 0 or high_count > 0:
-            log(f"  WARNING: Found {critical_count} CRITICAL and {high_count} HIGH severity findings", output)
+
+        # Extract finding counts from the SECURITY-REVIEW-NNNN.md artifact, NOT
+        # from raw agent stdout. The stdout contains the agent's intermediate
+        # reasoning ("[S1] LOW — this is NOT a CRITICAL because…") so substring
+        # counts on CRITICAL / HIGH double-count rejected findings, severity
+        # mentions in prose, and so on (see task 2315 root-cause analysis).
+        task_id = task.get("id")
+        review_path = Path(project_dir) / f"SECURITY-REVIEW-{task_id}.md"
+        counts = _count_findings_in_review_file(review_path)
+        if counts is None:
+            log(
+                f"  WARNING: security-review artifact missing — expected "
+                f"{review_path.name} in project root (agent did not save it)",
+                output,
+            )
+        elif counts["CRITICAL"] > 0 or counts["HIGH"] > 0:
+            log(
+                f"  WARNING: Found {counts['CRITICAL']} CRITICAL and "
+                f"{counts['HIGH']} HIGH severity findings",
+                output,
+            )
         else:
             log(f"  No critical or high severity findings", output)
 
@@ -219,6 +235,44 @@ async def run_security_review(
             log(f"    Error: {err[:200]}", output)
 
     return sec_result
+
+
+# Matches finding section headers in SECURITY-REVIEW-NNNN.md files. The
+# convention enforced by the security-reviewer skill is:
+#     ### [TAG-NN] SEVERITY — description
+# (em-dash, en-dash, or hyphen separator). Severity is one of
+# CRITICAL/HIGH/MEDIUM/LOW/INFO. Anchoring on the bracketed tag is what makes
+# this robust against prose mentions of CRITICAL/HIGH in the surrounding text.
+_REVIEW_FINDING_HEADER_RE = re.compile(
+    r"^###\s+\[[^\]]+\]\s+(CRITICAL|HIGH|MEDIUM|LOW|INFO)\b",
+    re.MULTILINE,
+)
+
+
+def _count_findings_in_review_file(review_path: Path) -> dict[str, int] | None:
+    """Count findings per severity in a SECURITY-REVIEW-NNNN.md artifact.
+
+    Returns a dict with keys CRITICAL/HIGH/MEDIUM/LOW/INFO, or None if the
+    artifact does not exist (caller should emit a "missing artifact" warning
+    rather than a counterfeit count — see task 2315).
+
+    Counts are derived from finding section headers like:
+        ### [S1] HIGH — Prompt Injection via Database Content
+    This avoids the false-positive class where the orchestrator previously
+    counted substring occurrences of "critical"/"high" in raw agent stdout —
+    e.g. counting "[S1] LOW — this is NOT a CRITICAL because…" as a CRITICAL.
+    """
+    try:
+        text = review_path.read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return None
+
+    counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
+    for match in _REVIEW_FINDING_HEADER_RE.finditer(text):
+        counts[match.group(1)] += 1
+    return counts
 
 
 def _extract_findings(
