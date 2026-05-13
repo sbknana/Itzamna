@@ -29,6 +29,7 @@ from equipa.config import (
     DEFAULT_DISPATCH_CONFIG,
     DEFAULT_FEATURE_FLAGS,
     is_feature_enabled,
+    is_security_review_enabled,
     load_dispatch_config,
 )
 from equipa.constants import (
@@ -1328,24 +1329,6 @@ async def _cleanup_worktrees(
         pass
 
 
-def _is_security_review_enabled(args) -> bool:
-    """Return True iff security review should run for this dispatch.
-
-    Mirrors the precedence logic in cli.py:run_dispatch (CLI flag wins;
-    falls back to dispatch_config top-level key; features.security_review
-    can disable even when the top-level key is True). Extracted so the
-    single-task and parallel-mode code paths apply the same rule
-    (bug 2321: parallel-mode previously skipped security review entirely).
-    """
-    dc = getattr(args, "dispatch_config", None) or {}
-    enabled = getattr(args, "security_review", None)
-    if enabled is None:
-        enabled = dc.get("security_review", False)
-    if not is_feature_enabled(dc, "security_review"):
-        enabled = False
-    return bool(enabled)
-
-
 def _security_review_blocks_merge(
     project_dir: str,
     task_id: int,
@@ -1554,7 +1537,7 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
             review_blocks_merge = False
             review_counts: dict | None = None
             if (
-                _is_security_review_enabled(args)
+                is_security_review_enabled(args)
                 and outcome in ("tests_passed", "no_tests")
             ):
                 # Task 2341 S2: if run_security_review raises, the artifact
