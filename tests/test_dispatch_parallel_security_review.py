@@ -139,9 +139,24 @@ def test_does_not_block_when_only_medium_low_info(tmp_path):
     assert counts["INFO"] == 2
 
 
-def test_missing_artifact_does_not_block(tmp_path):
-    """No artifact => (False, None). A missing review is logged elsewhere."""
+def test_missing_artifact_blocks_by_default(tmp_path):
+    """Task 2341 S1: missing artifact is fail-closed by default.
+
+    The pre-2341 contract returned (False, None) — a crashed reviewer
+    that never wrote the artifact would silently authorise the merge.
+    The default is now (True, None): operators must opt out via
+    features.security_review_block_on_missing_artifact=False.
+    """
     blocks, counts = _security_review_blocks_merge(str(tmp_path), 99)
+    assert blocks is True
+    assert counts is None
+
+
+def test_missing_artifact_does_not_block_when_flag_disabled(tmp_path):
+    """Operator opt-out via block_on_missing=False restores fail-open."""
+    blocks, counts = _security_review_blocks_merge(
+        str(tmp_path), 99, block_on_missing=False,
+    )
     assert blocks is False
     assert counts is None
 
@@ -456,3 +471,187 @@ async def test_parallel_mode_skips_review_when_disabled(tmp_path):
     mock_review.assert_not_called()
     merged_ids = {tid for _, tid, _ in merge_calls}
     assert merged_ids == {500, 501}
+
+
+# ---------------------------------------------------------------------------
+# Task 2341 — fail-closed regressions for missing artifact + reviewer crash
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_missing_artifact_blocks_merge_by_default(tmp_path):
+    """S1 regression: review agent that does not write the artifact
+    must NOT silently authorise the merge (pre-2341 vulnerability).
+    """
+    args = _make_args(
+        security_review=True,
+        dispatch_config={"security_review": True},
+    )
+
+    def writer(task_dir: Path, task_id: int):
+        # Reviewer runs but produces no artifact (e.g. crashed silently,
+        # was steered off-task by description content, or wrote to the
+        # wrong path).
+        return None
+
+    patches, merge_calls = _patch_parallel_mode(tmp_path, review_writer=writer)
+    patches[0] = patch(
+        "equipa.dispatch.fetch_tasks_by_ids",
+        return_value=[
+            {"id": 600, "project_id": 1, "title": "t1",
+             "description": "d", "role": "developer"},
+            {"id": 601, "project_id": 1, "title": "t2",
+             "description": "d", "role": "developer"},
+        ],
+    )
+
+    with patches[0], patches[1], patches[2], patches[3], patches[4], \
+         patches[5], patches[6], patches[7], patches[8], \
+         patches[9] as mock_status, patches[10], patches[11], patches[12]:
+        await run_parallel_tasks([600, 601], args)
+
+    assert merge_calls == [], "missing artifact must block merge by default"
+    assert len(mock_status.call_args_list) == 2
+    for c in mock_status.call_args_list:
+        assert c[0][1] == "security_review_blocked", c
+
+
+@pytest.mark.asyncio
+async def test_review_crash_blocks_merge(tmp_path):
+    """S2 regression: run_security_review raising must gate the merge
+    even if a stale SECURITY-REVIEW-NNNN.md from a prior run exists.
+    """
+    args = _make_args(
+        security_review=True,
+        dispatch_config={"security_review": True},
+    )
+
+    def writer(task_dir: Path, task_id: int):
+        # Simulate a stale clean review on disk from a previous run.
+        # If the gate trusted the artifact alone, the crash would be
+        # invisible and the merge would proceed.
+        _write_review(task_dir / f"SECURITY-REVIEW-{task_id}.md")
+
+    async def crashing_review(task, project_dir, project_context, args,
+                              output=None):
+        writer(Path(project_dir), task["id"])
+        raise RuntimeError("network outage during review")
+
+    patches, merge_calls = _patch_parallel_mode(tmp_path, review_writer=writer)
+    patches[0] = patch(
+        "equipa.dispatch.fetch_tasks_by_ids",
+        return_value=[
+            {"id": 700, "project_id": 1, "title": "t1",
+             "description": "d", "role": "developer"},
+            {"id": 701, "project_id": 1, "title": "t2",
+             "description": "d", "role": "developer"},
+        ],
+    )
+    patches[5] = patch(
+        "equipa.dispatch.run_security_review", side_effect=crashing_review,
+    )
+
+    with patches[0], patches[1], patches[2], patches[3], patches[4], \
+         patches[5], patches[6], patches[7], patches[8], \
+         patches[9] as mock_status, patches[10], patches[11], patches[12]:
+        await run_parallel_tasks([700, 701], args)
+
+    assert merge_calls == [], (
+        "reviewer crash must block merge regardless of stale artifact"
+    )
+    for c in mock_status.call_args_list:
+        assert c[0][1] == "security_review_blocked", c
+
+
+@pytest.mark.asyncio
+async def test_missing_artifact_unblocks_with_flag(tmp_path):
+    """Operator opt-out: setting features."
+    "security_review_block_on_missing_artifact=False restores the
+    pre-2341 fail-open behaviour for shops whose workflow needs it.
+    """
+    args = _make_args(
+        security_review=True,
+        dispatch_config={
+            "security_review": True,
+            "features": {
+                "security_review": True,
+                "security_review_block_on_missing_artifact": False,
+            },
+        },
+    )
+
+    def writer(task_dir: Path, task_id: int):
+        return None  # no artifact
+
+    patches, merge_calls = _patch_parallel_mode(tmp_path, review_writer=writer)
+    patches[0] = patch(
+        "equipa.dispatch.fetch_tasks_by_ids",
+        return_value=[
+            {"id": 800, "project_id": 1, "title": "t1",
+             "description": "d", "role": "developer"},
+            {"id": 801, "project_id": 1, "title": "t2",
+             "description": "d", "role": "developer"},
+        ],
+    )
+
+    with patches[0], patches[1], patches[2], patches[3], patches[4], \
+         patches[5], patches[6], patches[7], patches[8], patches[9], \
+         patches[10], patches[11], patches[12]:
+        await run_parallel_tasks([800, 801], args)
+
+    merged_ids = {tid for _, tid, _ in merge_calls}
+    assert merged_ids == {800, 801}, (
+        "fail-open opt-out must allow merges with missing artifact"
+    )
+
+
+@pytest.mark.asyncio
+async def test_review_crash_logs_traceback(tmp_path, caplog):
+    """The exception handler still records logger.exception() output so
+    operators can diagnose reviewer failures even though the gate now
+    blocks rather than falling through.
+    """
+    import logging
+
+    args = _make_args(
+        security_review=True,
+        dispatch_config={"security_review": True},
+    )
+
+    def writer(task_dir: Path, task_id: int):
+        return None
+
+    async def crashing_review(task, project_dir, project_context, args,
+                              output=None):
+        raise RuntimeError("boom")
+
+    patches, merge_calls = _patch_parallel_mode(tmp_path, review_writer=writer)
+    patches[0] = patch(
+        "equipa.dispatch.fetch_tasks_by_ids",
+        return_value=[
+            {"id": 900, "project_id": 1, "title": "t1",
+             "description": "d", "role": "developer"},
+        ],
+    )
+    patches[5] = patch(
+        "equipa.dispatch.run_security_review", side_effect=crashing_review,
+    )
+
+    with caplog.at_level(logging.ERROR, logger="equipa.dispatch"):
+        with patches[0], patches[1], patches[2], patches[3], patches[4], \
+             patches[5], patches[6], patches[7], patches[8], patches[9], \
+             patches[10], patches[11], patches[12]:
+            await run_parallel_tasks([900], args)
+
+    # logger.exception() records at ERROR level with the traceback;
+    # capture confirms the diagnostic survived the new gating path.
+    crash_records = [
+        r for r in caplog.records
+        if "security review crashed" in r.getMessage()
+    ]
+    assert crash_records, (
+        "logger.exception must still fire so operators see the traceback"
+    )
+    assert crash_records[0].exc_info is not None
+    # And the gate still blocked the merge.
+    assert merge_calls == []
