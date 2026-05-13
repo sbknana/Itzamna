@@ -51,8 +51,10 @@ from equipa.hooks import fire_async as fire_hook
 from equipa.git_ops import _is_git_repo, git_run_async
 from equipa.lessons import update_injected_episode_q_values_for_task
 from equipa.loops import (
+    _count_findings_in_review_file,
     run_dev_test_loop,
     run_quality_scoring,
+    run_security_review,
 )
 from equipa.manager import run_manager_loop
 from equipa.parsing import _extract_section
@@ -1326,6 +1328,41 @@ async def _cleanup_worktrees(
         pass
 
 
+def _is_security_review_enabled(args) -> bool:
+    """Return True iff security review should run for this dispatch.
+
+    Mirrors the precedence logic in cli.py:run_dispatch (CLI flag wins;
+    falls back to dispatch_config top-level key; features.security_review
+    can disable even when the top-level key is True). Extracted so the
+    single-task and parallel-mode code paths apply the same rule
+    (bug 2321: parallel-mode previously skipped security review entirely).
+    """
+    dc = getattr(args, "dispatch_config", None) or {}
+    enabled = getattr(args, "security_review", None)
+    if enabled is None:
+        enabled = dc.get("security_review", False)
+    if not is_feature_enabled(dc, "security_review"):
+        enabled = False
+    return bool(enabled)
+
+
+def _security_review_blocks_merge(project_dir: str, task_id: int) -> tuple[bool, dict | None]:
+    """Return (blocks_merge, counts) by reading SECURITY-REVIEW-{task_id}.md.
+
+    blocks_merge is True iff the artifact exists AND reports at least one
+    CRITICAL or HIGH finding. If the artifact is missing, returns
+    (False, None) — a missing artifact is logged elsewhere and does NOT
+    block merge on its own (the agent may have produced no findings file
+    on a clean review; future hardening can tighten this).
+    """
+    review_path = Path(project_dir) / f"SECURITY-REVIEW-{task_id}.md"
+    counts = _count_findings_in_review_file(review_path)
+    if counts is None:
+        return False, None
+    blocks = counts.get("CRITICAL", 0) > 0 or counts.get("HIGH", 0) > 0
+    return blocks, counts
+
+
 async def run_parallel_tasks(task_ids: list[int], args) -> None:
     """Run multiple tasks concurrently with dev-test loops.
 
@@ -1478,6 +1515,42 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
                     task, task_dir, project_context, args, _config_for_loop, output=output,
                 )
             )
+
+            # Bug 2321: run security review in parallel-mode BEFORE marking
+            # the task done. Single-task mode runs review after dev-test
+            # success (cli.py:run_dispatch); parallel mode used to skip
+            # this step, so multi-task dispatches landed un-reviewed code
+            # on master. CRITICAL/HIGH findings demote the recorded outcome
+            # so update_task_status leaves the task as blocked (not done)
+            # and the post-gather merge skips this branch.
+            review_blocks_merge = False
+            review_counts: dict | None = None
+            if (
+                _is_security_review_enabled(args)
+                and outcome in ("tests_passed", "no_tests")
+            ):
+                try:
+                    await run_security_review(
+                        task, task_dir, project_context, args, output=output,
+                    )
+                except Exception:  # pragma: no cover - defensive
+                    logger.exception(
+                        "[Task #%s] security review crashed", task["id"],
+                    )
+                review_blocks_merge, review_counts = (
+                    _security_review_blocks_merge(task_dir, task["id"])
+                )
+                if review_blocks_merge:
+                    log(
+                        f"[Task #{task['id']}] SECURITY GATE: blocking merge — "
+                        f"{review_counts.get('CRITICAL', 0)} CRITICAL, "
+                        f"{review_counts.get('HIGH', 0)} HIGH finding(s). "
+                        f"Branch forge-task-{task['id']} left unmerged for "
+                        f"operator review.",
+                        output,
+                    )
+                    outcome = "security_review_blocked"
+
             update_task_status(task["id"], outcome, output=output)
             log(f"[Task #{task['id']}] Done: {outcome} ({cycles} cycles)", output)
             if flow_id is not None:
@@ -1508,7 +1581,11 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
 
             # Mark for post-gather sequential merge (avoid parallel merge conflicts)
             merge_ok = False
-            needs_merge = task["id"] in worktree_dirs and outcome in ("tests_passed", "no_tests")
+            needs_merge = (
+                task["id"] in worktree_dirs
+                and outcome in ("tests_passed", "no_tests")
+                and not review_blocks_merge
+            )
 
             return {
                 "task": task,
@@ -1518,6 +1595,8 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
                 "output": output,
                 "merge_ok": merge_ok,
                 "needs_merge": needs_merge,
+                "review_blocks_merge": review_blocks_merge,
+                "review_counts": review_counts,
             }
 
     results = await asyncio.gather(
@@ -1580,6 +1659,11 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
         merge_candidates = []
         for r in results:
             if isinstance(r, Exception):
+                continue
+            # Bug 2321: skip merge candidates that the security review gated.
+            # needs_merge already encodes review_blocks_merge, but the fallback
+            # outcome check below would otherwise reinstate a blocked task.
+            if r.get("review_blocks_merge", False):
                 continue
             if r.get("needs_merge", False) or (
                 r["task"]["id"] in worktree_dirs
