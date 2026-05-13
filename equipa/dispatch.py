@@ -1515,6 +1515,42 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
                     task, task_dir, project_context, args, _config_for_loop, output=output,
                 )
             )
+
+            # Bug 2321: run security review in parallel-mode BEFORE marking
+            # the task done. Single-task mode runs review after dev-test
+            # success (cli.py:run_dispatch); parallel mode used to skip
+            # this step, so multi-task dispatches landed un-reviewed code
+            # on master. CRITICAL/HIGH findings demote the recorded outcome
+            # so update_task_status leaves the task as blocked (not done)
+            # and the post-gather merge skips this branch.
+            review_blocks_merge = False
+            review_counts: dict | None = None
+            if (
+                _is_security_review_enabled(args)
+                and outcome in ("tests_passed", "no_tests")
+            ):
+                try:
+                    await run_security_review(
+                        task, task_dir, project_context, args, output=output,
+                    )
+                except Exception:  # pragma: no cover - defensive
+                    logger.exception(
+                        "[Task #%s] security review crashed", task["id"],
+                    )
+                review_blocks_merge, review_counts = (
+                    _security_review_blocks_merge(task_dir, task["id"])
+                )
+                if review_blocks_merge:
+                    log(
+                        f"[Task #{task['id']}] SECURITY GATE: blocking merge — "
+                        f"{review_counts.get('CRITICAL', 0)} CRITICAL, "
+                        f"{review_counts.get('HIGH', 0)} HIGH finding(s). "
+                        f"Branch forge-task-{task['id']} left unmerged for "
+                        f"operator review.",
+                        output,
+                    )
+                    outcome = "security_review_blocked"
+
             update_task_status(task["id"], outcome, output=output)
             log(f"[Task #{task['id']}] Done: {outcome} ({cycles} cycles)", output)
             if flow_id is not None:
@@ -1542,39 +1578,6 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
                 max_turns=get_role_turns(task_role, args, task=task),
                 cycle_number=cycles, output=output,
             )
-
-            # Bug 2321: run security review in parallel-mode BEFORE marking
-            # the task for merge. Single-task mode runs review after a
-            # successful dev-test (cli.py:run_dispatch); parallel mode used
-            # to skip this step entirely, so multi-task dispatches landed
-            # un-reviewed code on master. Review runs inside the worktree
-            # so the artifact is committed and travels with the merge.
-            review_blocks_merge = False
-            review_counts: dict | None = None
-            if (
-                _is_security_review_enabled(args)
-                and outcome in ("tests_passed", "no_tests")
-            ):
-                try:
-                    await run_security_review(
-                        task, task_dir, project_context, args, output=output,
-                    )
-                except Exception:  # pragma: no cover - defensive
-                    logger.exception(
-                        "[Task #%s] security review crashed", task["id"],
-                    )
-                review_blocks_merge, review_counts = (
-                    _security_review_blocks_merge(task_dir, task["id"])
-                )
-                if review_blocks_merge:
-                    log(
-                        f"[Task #{task['id']}] SECURITY GATE: blocking merge — "
-                        f"{review_counts.get('CRITICAL', 0)} CRITICAL, "
-                        f"{review_counts.get('HIGH', 0)} HIGH finding(s). "
-                        f"Branch forge-task-{task['id']} left unmerged for "
-                        f"operator review.",
-                        output,
-                    )
 
             # Mark for post-gather sequential merge (avoid parallel merge conflicts)
             merge_ok = False
