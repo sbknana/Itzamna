@@ -179,6 +179,10 @@ prompts/qiao-*.md
 skills/qiao-*/
 **/qiao/
 qiao*.py
+# Belt-and-braces (Phase 0.2): catch qiao-named artifacts anywhere in the tree
+**/qiao_*.md
+**/*_qiao_*
+**/qiao-*.md
 
 # Task outputs (agent working dirs)
 task-outputs/
