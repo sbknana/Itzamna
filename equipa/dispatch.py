@@ -1346,18 +1346,46 @@ def _is_security_review_enabled(args) -> bool:
     return bool(enabled)
 
 
-def _security_review_blocks_merge(project_dir: str, task_id: int) -> tuple[bool, dict | None]:
+def _security_review_blocks_merge(
+    project_dir: str,
+    task_id: int,
+    *,
+    block_on_missing: bool = True,
+) -> tuple[bool, dict | None]:
     """Return (blocks_merge, counts) by reading SECURITY-REVIEW-{task_id}.md.
 
-    blocks_merge is True iff the artifact exists AND reports at least one
-    CRITICAL or HIGH finding. If the artifact is missing, returns
-    (False, None) — a missing artifact is logged elsewhere and does NOT
-    block merge on its own (the agent may have produced no findings file
-    on a clean review; future hardening can tighten this).
+    blocks_merge is True when:
+      * the artifact exists AND reports at least one CRITICAL or HIGH
+        finding, OR
+      * the artifact is MISSING and ``block_on_missing`` is True
+        (fail-closed; default).
+
+    The fail-closed default is task 2341's S1 hardening over the original
+    bug-2321 fix: a reviewer agent that crashes, times out, or is steered
+    off-task by content in the task description can satisfy the
+    pre-2341 (False, None) contract simply by not writing the artifact —
+    same shape as the original 2321 vulnerability, narrower scope.
+    Operators who need the legacy fail-open behaviour can disable the
+    ``security_review_block_on_missing_artifact`` feature flag.
     """
     review_path = Path(project_dir) / f"SECURITY-REVIEW-{task_id}.md"
     counts = _count_findings_in_review_file(review_path)
     if counts is None:
+        if block_on_missing:
+            logger.warning(
+                "[security-review] missing artifact %s — gating merge "
+                "(fail-closed). Disable features."
+                "security_review_block_on_missing_artifact to allow "
+                "legacy fail-open behaviour.",
+                review_path,
+            )
+            return True, None
+        logger.warning(
+            "[security-review] missing artifact %s — fail-open mode "
+            "(features.security_review_block_on_missing_artifact=False); "
+            "merge will proceed without findings data.",
+            review_path,
+        )
         return False, None
     blocks = counts.get("CRITICAL", 0) > 0 or counts.get("HIGH", 0) > 0
     return blocks, counts
@@ -1529,26 +1557,65 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
                 _is_security_review_enabled(args)
                 and outcome in ("tests_passed", "no_tests")
             ):
+                # Task 2341 S2: if run_security_review raises, the artifact
+                # check on its own is not enough to gate the merge — a
+                # stale SECURITY-REVIEW-NNNN.md from a prior run could
+                # exist in the worktree and silently re-authorise. The
+                # explicit flag here ensures a crashed reviewer always
+                # blocks, independently of artifact state.
+                review_crashed = False
                 try:
                     await run_security_review(
                         task, task_dir, project_context, args, output=output,
                     )
                 except Exception:  # pragma: no cover - defensive
+                    review_crashed = True
                     logger.exception(
                         "[Task #%s] security review crashed", task["id"],
                     )
-                review_blocks_merge, review_counts = (
-                    _security_review_blocks_merge(task_dir, task["id"])
+                _config_for_flag = getattr(args, "dispatch_config", None) or {}
+                _block_on_missing = is_feature_enabled(
+                    _config_for_flag,
+                    "security_review_block_on_missing_artifact",
                 )
-                if review_blocks_merge:
+                review_blocks_merge, review_counts = (
+                    _security_review_blocks_merge(
+                        task_dir, task["id"],
+                        block_on_missing=_block_on_missing,
+                    )
+                )
+                if review_crashed:
+                    # Fail-closed: the review pipeline crashed, do not
+                    # trust the artifact check. Override any (False, ...)
+                    # result the artifact reader returned.
+                    review_blocks_merge = True
                     log(
                         f"[Task #{task['id']}] SECURITY GATE: blocking merge — "
-                        f"{review_counts.get('CRITICAL', 0)} CRITICAL, "
-                        f"{review_counts.get('HIGH', 0)} HIGH finding(s). "
-                        f"Branch forge-task-{task['id']} left unmerged for "
-                        f"operator review.",
+                        f"security review crashed; branch forge-task-"
+                        f"{task['id']} left unmerged for operator review.",
                         output,
                     )
+                    outcome = "security_review_blocked"
+                elif review_blocks_merge:
+                    if review_counts is None:
+                        log(
+                            f"[Task #{task['id']}] SECURITY GATE: blocking "
+                            f"merge — SECURITY-REVIEW-{task['id']}.md "
+                            f"artifact is missing (fail-closed). Branch "
+                            f"forge-task-{task['id']} left unmerged for "
+                            f"operator review.",
+                            output,
+                        )
+                    else:
+                        log(
+                            f"[Task #{task['id']}] SECURITY GATE: blocking "
+                            f"merge — {review_counts.get('CRITICAL', 0)} "
+                            f"CRITICAL, {review_counts.get('HIGH', 0)} "
+                            f"HIGH finding(s). Branch forge-task-"
+                            f"{task['id']} left unmerged for operator "
+                            f"review.",
+                            output,
+                        )
                     outcome = "security_review_blocked"
 
             update_task_status(task["id"], outcome, output=output)

@@ -34,6 +34,12 @@ DEFAULT_FEATURE_FLAGS: dict[str, bool] = {
     "forgesmith_episodes": True,
     "gepa_ab_testing": False,
     "security_review": True,
+    # When True (default), a missing SECURITY-REVIEW-NNNN.md artifact after
+    # the security-review agent runs is treated as a gate-blocking failure
+    # (fail-closed). Set to False only if your workflow accepts the
+    # pre-2341 trade-off: a crashed/silenced reviewer silently downgrades
+    # to "no findings" and the branch is allowed to merge. See task 2341.
+    "security_review_block_on_missing_artifact": True,
     "quality_scoring": True,
     "anti_compaction_state": True,
     "vector_memory": False,
