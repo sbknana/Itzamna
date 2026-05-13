@@ -32,6 +32,7 @@ from equipa.constants import (
 from equipa.agent_runner import build_cli_command, run_agent_streaming, run_agent_with_retries
 from equipa.checkpoints import load_checkpoint
 from equipa.db import record_agent_run, update_task_status
+from equipa.config import is_security_review_enabled
 from equipa.dispatch import (
     _build_dispatch_attempt_reflection,
     apply_dispatch_filters,
@@ -1021,18 +1022,14 @@ async def run_mode_task(args: argparse.Namespace) -> None:
             cycle_number=cycles,
             dispatch_config=getattr(args, "dispatch_config", None))
 
-        # Optional security review after successful dev-test
-        # CLI --security-review flag takes precedence, then dispatch config top-level key,
-        # then features.security_review flag (all must agree for review to run)
-        dc = getattr(args, "dispatch_config", None) or {}
-        security_review_enabled = args.security_review
-        if security_review_enabled is None:
-            security_review_enabled = dc.get("security_review", False)
-        # Feature flag can disable even if top-level key is True
-        if not is_feature_enabled(dc, "security_review"):
-            security_review_enabled = False
-
-        if security_review_enabled and outcome in ("tests_passed", "no_tests"):
+        # Optional security review after successful dev-test. Enablement
+        # precedence (CLI flag > dispatch_config top-level > features kill-switch)
+        # lives in equipa.config.is_security_review_enabled — shared with
+        # the parallel-mode path in equipa.dispatch (bug 2321 S3 follow-up).
+        if (
+            is_security_review_enabled(args)
+            and outcome in ("tests_passed", "no_tests")
+        ):
             await run_security_review(task, project_dir, project_context, args)
 
         # Verify the task status in TheForge

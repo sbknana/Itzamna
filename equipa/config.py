@@ -80,6 +80,41 @@ def is_feature_enabled(dispatch_config: dict | None, feature_name: str) -> bool:
     return features.get(feature_name, DEFAULT_FEATURE_FLAGS.get(feature_name, False))
 
 
+def is_security_review_enabled(args, dispatch_config: dict | None = None) -> bool:
+    """Return True iff security review should run for this dispatch.
+
+    Single source of truth for the security-review enablement precedence:
+      1. CLI flag ``args.security_review`` wins when not None.
+      2. Otherwise, fall back to ``dispatch_config["security_review"]`` (top-level).
+      3. The ``features.security_review`` feature flag can disable even when
+         the higher-precedence sources enable it (kill-switch semantics).
+
+    This helper was extracted from the duplicate precedence chains that
+    previously lived inline in ``equipa.cli:run_dispatch`` and
+    ``equipa.dispatch:_is_security_review_enabled``. Bug 2321 was caused
+    by exactly this kind of silent divergence between two code paths
+    implementing the same policy; centralising the rule here prevents
+    a recurrence.
+
+    Args:
+        args: argparse Namespace (or any object) with a ``security_review``
+            attribute. Missing attribute is treated as None.
+        dispatch_config: parsed dispatch config dict. If None, falls back
+            to ``getattr(args, "dispatch_config", None)`` for callers
+            (such as the dispatch.py call site) that thread the config
+            through args instead of passing it explicitly.
+    """
+    dc = dispatch_config
+    if dc is None:
+        dc = getattr(args, "dispatch_config", None) or {}
+    enabled = getattr(args, "security_review", None)
+    if enabled is None:
+        enabled = dc.get("security_review", False)
+    if not is_feature_enabled(dc, "security_review"):
+        enabled = False
+    return bool(enabled)
+
+
 def load_dispatch_config(filepath: str | Path | None) -> dict:
     """Load dispatch_config.json preferences.
 

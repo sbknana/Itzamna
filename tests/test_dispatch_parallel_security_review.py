@@ -9,8 +9,9 @@ operator caught the divergence.
 These tests cover the helpers that gate the merge and the integrated
 parallel-mode dispatch path:
 
-* ``_is_security_review_enabled`` reads the same precedence chain as
-  single-task mode (CLI flag, then dispatch_config top-level, then
+* ``is_security_review_enabled`` (extracted to ``equipa.config`` in the
+  bug 2321 S3 follow-up) reads the same precedence chain as single-task
+  mode (CLI flag, then dispatch_config top-level, then
   features.security_review).
 * ``_security_review_blocks_merge`` reads the SECURITY-REVIEW-NNNN.md
   artifact (NOT raw agent stdout) so the gate uses the same plumbing as
@@ -28,15 +29,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from equipa.config import is_security_review_enabled as _is_security_review_enabled
 from equipa.dispatch import (
-    _is_security_review_enabled,
     _security_review_blocks_merge,
     run_parallel_tasks,
 )
 
 
 # ---------------------------------------------------------------------------
-# _is_security_review_enabled — enablement precedence
+# is_security_review_enabled — enablement precedence
 # ---------------------------------------------------------------------------
 
 
