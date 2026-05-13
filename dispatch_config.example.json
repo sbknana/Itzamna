@@ -51,6 +51,7 @@
         "forgesmith_episodes": true,
         "gepa_ab_testing": false,
         "security_review": true,
+        "security_review_block_on_missing_artifact": true,
         "quality_scoring": true,
         "anti_compaction_state": true,
         "vector_memory": false,
