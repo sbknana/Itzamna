@@ -69,6 +69,12 @@ from equipa.output import (
 from equipa.prompts import build_planner_prompt
 from equipa.reflexion import maybe_run_reflexion
 from equipa.roles import get_role_model, get_role_turns
+from equipa.single_agent_guard import (
+    SingleAgentOutcome,
+    TasksCreatedValidation,
+    evaluate_single_agent_outcome,
+    validate_tasks_created_claim,
+)
 from equipa.tasks import (
     fetch_project_context,
     fetch_project_info,

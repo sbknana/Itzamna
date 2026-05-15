@@ -232,6 +232,33 @@ def _handle_add_project(name: str, project_dir: str) -> None:
     print(f"  Dir: {project_dir}")
 
 
+# --- TASKS_CREATED validator DB adapter (task #2371) ---
+
+class _TasksCreatedDb:
+    """Adapter exposing ``fetch_tasks_by_ids`` over a sqlite3 connection.
+
+    Used by ``validate_tasks_created_claim`` so the guard module does
+    not need to know about EQUIPA's specific db helpers.
+    """
+
+    def __init__(self, conn) -> None:
+        self._conn = conn
+
+    def fetch_tasks_by_ids(self, ids):
+        ids = [int(i) for i in ids if i is not None]
+        if not ids:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        cur = self._conn.execute(
+            f"SELECT id, project_id, created_at FROM tasks WHERE id IN ({placeholders})",
+            ids,
+        )
+        return [
+            {"id": r[0], "project_id": r[1], "created_at": r[2]}
+            for r in cur.fetchall()
+        ]
+
+
 # --- Post-Task Telemetry ---
 
 async def _post_task_telemetry(
@@ -1076,6 +1103,60 @@ async def run_mode_task(args: argparse.Namespace) -> None:
             single_outcome = "tests_passed"
         else:
             single_outcome = "developer_failed"
+
+        # Vacuous-pass / no-output guard (task #2371).
+        #
+        # Single-agent runs (NOT --dev-test) bypassed the Dev+Test loop
+        # vacuous-pass hook entirely, so a planner / code-reviewer run
+        # that wrote zero files was happily marked SUCCESS and the task
+        # row set to DONE (task #2361 on 2026-05-14 was the concrete
+        # repro). We now require role-specific on-disk evidence before
+        # accepting a single-agent run as ``tests_passed``.
+        if single_outcome == "tests_passed":
+            from equipa.single_agent_guard import (
+                evaluate_single_agent_outcome,
+                validate_tasks_created_claim,
+            )
+            outcome_check = evaluate_single_agent_outcome(
+                role=args.role,
+                task_id=task["id"],
+                run_result=result,
+                repo_path=Path(project_dir),
+            )
+            if outcome_check.is_blocked:
+                print(
+                    f"  [no-output guard] Single-agent run produced no on-disk "
+                    f"evidence — downgrading to BLOCKED.\n"
+                    f"    role={args.role!r}, task=#{task['id']}\n"
+                    f"    reason: {outcome_check.reason}"
+                )
+                single_outcome = "no_output"
+                result["no_output_reason"] = outcome_check.reason
+
+            # Reject hallucinated TASKS_CREATED lines even when files
+            # WERE written — the agent may still be lying about side-
+            # effects (e.g. task #2361's "TASKS_CREATED: 78,79,80,81,82"
+            # referenced unrelated pre-existing ForgeBridge tickets).
+            if single_outcome == "tests_passed":
+                try:
+                    from equipa.db import get_db_connection
+                    db_handle = _TasksCreatedDb(get_db_connection())
+                except Exception:  # pragma: no cover — defensive
+                    db_handle = None
+                if db_handle is not None:
+                    tc_check = validate_tasks_created_claim(
+                        stdout=result.get("stdout", "") or "",
+                        run_started_at=result.get("started_at"),
+                        expected_project_id=task.get("project_id"),
+                        db=db_handle,
+                    )
+                    if not tc_check.is_valid:
+                        print(
+                            f"  [no-output guard] Rejected hallucinated "
+                            f"TASKS_CREATED claim: {tc_check.reason}"
+                        )
+                        single_outcome = "no_output"
+                        result["tasks_created_rejection"] = tc_check.reason
 
         # Post-task telemetry
         await _post_task_telemetry(
