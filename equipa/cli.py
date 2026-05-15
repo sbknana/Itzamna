@@ -258,6 +258,19 @@ class _TasksCreatedDb:
             for r in cur.fetchall()
         ]
 
+    def close(self) -> None:
+        # QS-01 leak family: the wrapped sqlite3 connection must be closed.
+        try:
+            self._conn.close()
+        except Exception:  # pragma: no cover — defensive
+            pass
+
+    def __enter__(self) -> "_TasksCreatedDb":
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self.close()
+
 
 # --- Post-Task Telemetry ---
 
@@ -1144,12 +1157,13 @@ async def run_mode_task(args: argparse.Namespace) -> None:
                 except Exception:  # pragma: no cover — defensive
                     db_handle = None
                 if db_handle is not None:
-                    tc_check = validate_tasks_created_claim(
-                        stdout=result.get("stdout", "") or "",
-                        run_started_at=result.get("started_at"),
-                        expected_project_id=task.get("project_id"),
-                        db=db_handle,
-                    )
+                    with db_handle:
+                        tc_check = validate_tasks_created_claim(
+                            stdout=result.get("stdout", "") or "",
+                            run_started_at=result.get("started_at"),
+                            expected_project_id=task.get("project_id"),
+                            db=db_handle,
+                        )
                     if not tc_check.is_valid:
                         print(
                             f"  [no-output guard] Rejected hallucinated "
