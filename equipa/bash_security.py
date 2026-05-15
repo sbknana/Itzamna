@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import re
+import shlex
 from dataclasses import dataclass
 
 log = logging.getLogger(__name__)
@@ -1399,17 +1400,101 @@ _MARKDOWN_BODY_FLAG_BEFORE_QUOTE_RE = re.compile(
 )
 
 
+_MARKDOWN_BODY_TOOLS: frozenset[str] = frozenset({"gh", "git", "hub"})
+_MARKDOWN_BODY_FLAGS: frozenset[str] = frozenset(
+    {"--body", "-b", "--message", "-m"}
+)
+
+
+def _last_segment_start(prefix: str) -> int:
+    """Return the index in ``prefix`` where the current shell command segment
+    begins. Splits on ``;``, ``&&``, ``||``, ``|``, ``&``, ``(``, and
+    backticks at unquoted positions only — quoted arguments containing
+    these characters do NOT split the segment.
+    """
+    in_single = False
+    in_double = False
+    escaped = False
+    last_break = 0
+    i = 0
+    n = len(prefix)
+    while i < n:
+        ch = prefix[i]
+        if escaped:
+            escaped = False
+            i += 1
+            continue
+        if ch == "\\" and not in_single:
+            escaped = True
+            i += 1
+            continue
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            i += 1
+            continue
+        if not in_single and not in_double:
+            if ch in (";", "(", "`"):
+                last_break = i + 1
+            elif ch == "|":
+                if i + 1 < n and prefix[i + 1] == "|":
+                    last_break = i + 2
+                    i += 2
+                    continue
+                last_break = i + 1
+            elif ch == "&":
+                if i + 1 < n and prefix[i + 1] == "&":
+                    last_break = i + 2
+                    i += 2
+                    continue
+                last_break = i + 1
+        i += 1
+    return last_break
+
+
 def _is_inside_markdown_body_arg(command: str, quote_open_idx: int) -> bool:
     """Return True if the quote at ``quote_open_idx`` opens the body of a
     markdown-accepting CLI flag (``gh pr create --body "..."``,
     ``git commit -m "..."``, etc.). Inside such a body, ``\\n#`` is a
     markdown header, not shell-comment smuggling — the body is one token to
     the tool.
+
+    Two-stage check:
+
+    1. Fast regex (``_MARKDOWN_BODY_FLAG_BEFORE_QUOTE_RE``) for the common
+       case where the prefix has no quoted arguments containing parens.
+    2. Token-aware fallback (``shlex``) for prefixes whose quoted arguments
+       contain ``(`` / ``)`` — e.g. PR titles like ``feat(drivers): X (DR-01)``
+       which the regex's ``[^|;&`(]*?`` body cannot span. This was the
+       second false-positive observed (TheForge bug 2320) after the
+       original gh/git allowlist (bug 2238).
     """
     if quote_open_idx <= 0:
         return False
     prefix = command[:quote_open_idx]
-    return bool(_MARKDOWN_BODY_FLAG_BEFORE_QUOTE_RE.search(prefix))
+    if _MARKDOWN_BODY_FLAG_BEFORE_QUOTE_RE.search(prefix):
+        return True
+
+    # Token-aware fallback. Restrict to the current command segment so
+    # ``rm -rf / && gh ... --body "..."`` is still caught upstream by the
+    # rm check, and a leading non-gh command does not mask the gh head.
+    seg_start = _last_segment_start(prefix)
+    segment = prefix[seg_start:].strip()
+    if not segment:
+        return False
+    try:
+        tokens = shlex.split(segment, posix=True)
+    except ValueError:
+        # Unbalanced quoting — cannot reason about token boundaries safely.
+        return False
+    if len(tokens) < 2:
+        return False
+    if tokens[-1] not in _MARKDOWN_BODY_FLAGS:
+        return False
+    return tokens[0] in _MARKDOWN_BODY_TOOLS
 
 
 def _check_quoted_newline_comment(command: str) -> BashSecurityResult:

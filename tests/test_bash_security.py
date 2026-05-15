@@ -500,6 +500,92 @@ class TestQuotedNewline:
         assert not result.safe
         assert result.check_id == CheckID.QUOTED_NEWLINE
 
+    # --- Bug 2320: ``gh pr create --body "$(cat <<EOF ... ## ... EOF\n)"`` ---
+    # The previous regex used ``[^|;&`(]*?`` to bound the prefix, which the
+    # `(` chars in conventional PR titles like ``feat(drivers): X (DR-01)``
+    # broke. The token-aware fallback in _is_inside_markdown_body_arg fixes
+    # this without weakening the threat model.
+
+    def test_gh_pr_create_heredoc_body_with_markdown_header(self) -> None:
+        """Bug 2320 baseline: ``gh pr create --body "$(cat <<'EOF' ... ## H ...
+        EOF\\n)"`` must pass — the heredoc carries markdown body content.
+
+        Uses the quoted-delimiter form ``<<'EOF'`` which is the canonical
+        Claude Code pattern (and the form that bypasses check 19's
+        heredoc-in-substitution block).
+        """
+        cmd = (
+            "gh pr create --title \"X\" --body \"$(cat <<'EOF'\n"
+            "## Summary\nbody text\nEOF\n)\""
+        )
+        result = check_bash_command(cmd)
+        assert result.safe, (
+            f"gh pr create heredoc body with ## header should pass; "
+            f"got check_id={result.check_id} msg={result.message}"
+        )
+
+    def test_gh_pr_create_heredoc_body_with_paren_title(self) -> None:
+        """Bug 2320 main case: PR title with ``(scope)`` parens (the real
+        observed false-positive on task 2318) must pass. The previous
+        regex bounded prefix matching with ``[^|;&`(]*?`` which the
+        ``(`` chars in conventional PR titles broke."""
+        cmd = (
+            "gh pr create --base master --head feature "
+            "--title \"feat(drivers): SSRF guard on printer Connect (DR-01)\" "
+            "--body \"$(cat <<'EOF'\n"
+            "## Summary\nbody text\nEOF\n)\""
+        )
+        result = check_bash_command(cmd)
+        assert result.safe, (
+            f"gh pr create with paren-containing title should pass; "
+            f"got check_id={result.check_id} msg={result.message}"
+        )
+
+    def test_gh_pr_create_heredoc_body_with_repo_and_paren_title(self) -> None:
+        """Variant with --repo, --base, --head and paren title — must pass."""
+        cmd = (
+            "gh pr create --repo owner/repo --base master --head feature "
+            "--title \"fix(api): handle null (edge case)\" "
+            "--body \"$(cat <<'EOF'\n"
+            "## Notes\n- one\n- two\nEOF\n)\""
+        )
+        result = check_bash_command(cmd)
+        assert result.safe, (
+            f"gh pr create with --repo and paren title should pass; "
+            f"got check_id={result.check_id} msg={result.message}"
+        )
+
+    def test_bare_echo_heredoc_with_hash_still_blocked(self) -> None:
+        """Bug 2320 negative: bare ``echo`` (no gh context) must STILL block —
+        the original threat model is preserved. Either check 19
+        (heredoc-in-substitution) OR check 23 may catch it; both are valid
+        blocking outcomes."""
+        cmd = "echo \"$(cat <<'EOF'\n## comment\nEOF\n)\""
+        result = check_bash_command(cmd)
+        assert not result.safe
+        assert result.check_id == CheckID.QUOTED_NEWLINE
+
+    def test_gh_heredoc_in_title_arg_still_blocked(self) -> None:
+        """Bug 2320 negative: heredoc fed into ``--title`` (not a body flag)
+        must STILL block — title fields should not span newlines."""
+        cmd = "gh pr create --title \"$(cat <<'EOF'\n## comment\nEOF\n)\""
+        result = check_bash_command(cmd)
+        assert not result.safe
+        assert result.check_id == CheckID.QUOTED_NEWLINE
+
+    def test_chained_non_gh_quoted_hash_still_blocked(self) -> None:
+        """Bug 2320 negative: the markdown-body allowlist must apply ONLY to
+        the gh/git/hub command segment. A second segment that does the
+        original ``\\n#`` smuggling pattern in a non-allowlisted base must
+        still be caught by check 23."""
+        cmd = (
+            "gh pr create --title \"X\" --body \"safe body\" && "
+            "bash -c \"real\n# evil\""
+        )
+        result = check_bash_command(cmd)
+        assert not result.safe
+        assert result.check_id == CheckID.QUOTED_NEWLINE
+
 
 class TestResultDataclass:
     """Verify BashSecurityResult has correct fields."""
