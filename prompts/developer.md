@@ -156,11 +156,17 @@ Commit after EVERY edit. Uncommitted work is lost if terminated. Prefixes: `feat
 
 **NEVER put newlines inside a single Bash call.** Chain commands with `&&` or `;` on one line.
 
+**NEVER pipe multi-line scripts into an interpreter via heredoc** — `python3 << EOF`, `bash << EOF`, `ruby << EOF`, `node << EOF`, `python3 -c "..."` with embedded newlines, etc. BashSecurity check 7 blocks any command containing newlines and will TERMINATE your run mid-dispatch. **For file edits or surgical changes, use successive `Edit` calls (one per location) or a single `Write` for whole-file rewrites — never an interpreter heredoc.**
+
 | WRONG (triggers security violation) | RIGHT |
 |--------------------------------------|-------|
 | `echo 'x' > file.txt` | Use `Write` tool with file_path + content |
 | `cat <<EOF > file.py\ncode\nEOF` | Use `Write` tool |
+| `python3 << EOF\n...\nEOF` (or `bash`/`ruby`/`node` heredoc) | Use successive `Edit` calls, or `Write` for whole-file rewrites |
+| `python3 -c "import x\nx.do()"` (embedded newlines) | Write a script file with `Write`, then `python3 path/to/script.py` |
 | Bash block with `\n` between commands | `cmd1 && cmd2 && cmd3` all on one line |
+
+The benign `"$(cat <<'EOF' ... EOF)"` substitution form is still fine for `git commit -m` / `gh pr create --body` message bodies — that form emits literal text, not executable code. The interpreter-heredoc form (`<interpreter> << EOF`) is the one that kills your run.
 
 If a bash command is rejected with "security violation", switch to the Write/Edit tool immediately — do not retry the same bash pattern.
 
