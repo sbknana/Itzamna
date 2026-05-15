@@ -1049,16 +1049,30 @@ class TestDeveloperLoosens:
         assert not result.safe, (
             "expected block on chained python segment carrying locale quoting"
         )
+        assert result.check_id == CheckID.OBFUSCATED_FLAGS, (
+            f"expected check 4 to fire on locale-quoting; got {result.check_id}"
+        )
 
     def test_chained_eval_after_safe_base_blocks(self) -> None:
         """`git status && eval $"x"` must block — eval segment is exec."""
         result = check_bash_command(r'git status && eval $"x"')
         assert not result.safe
+        assert result.check_id == CheckID.OBFUSCATED_FLAGS
 
     def test_piped_exec_after_safe_base_blocks(self) -> None:
         """`git status | python -c $"x"` must block — python segment is exec."""
         result = check_bash_command(r'git status | python -c $"x"')
         assert not result.safe
+        assert result.check_id == CheckID.OBFUSCATED_FLAGS
+
+    def test_backgrounded_exec_after_safe_base_blocks(self) -> None:
+        """Bug 2316 S1: `git status & python -c $"x"` must block — `&` is
+        bash's background-process separator and attack-equivalent to `;`."""
+        result = check_bash_command(r'git status & python -c $"x"')
+        assert not result.safe, (
+            "expected block on backgrounded python segment carrying locale quoting"
+        )
+        assert result.check_id == CheckID.OBFUSCATED_FLAGS
 
     def test_chained_safe_after_safe_passes(self) -> None:
         """`git status; grep -r $"foo" .` passes — both segments use safe bases."""

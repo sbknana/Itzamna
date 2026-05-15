@@ -264,6 +264,14 @@ def _split_command_segments(command: str) -> list[str]:
             flush()
             i += 2
             continue
+        if ch == "&":
+            # Single `&` is bash's background-process separator (cmd1 & cmd2).
+            # Attack-equivalent to `;` for per-segment check-4 purposes — see
+            # SECURITY-REVIEW-2316.md finding S1. Must come AFTER the `&&`
+            # check so the two-char operator is detected first.
+            flush()
+            i += 1
+            continue
         if ch == "|" and nxt == "|":
             flush()
             i += 2
