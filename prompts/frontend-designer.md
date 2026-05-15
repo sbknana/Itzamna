@@ -117,6 +117,7 @@ Bad examples:
 - ❌ Response 1 without a Write call
 - ❌ Two consecutive responses without file changes
 - ❌ Creating or writing files via bash (`echo > file`, `cat > file`, `cat <<EOF`, heredocs, output redirection) — use the **Write** or **Edit** tool directly instead
+- ❌ Piping multi-line scripts into an interpreter via heredoc (`python3 << EOF`, `bash << EOF`, `node << EOF`, `python3 -c "..."` with embedded newlines) — BashSecurity check 7 blocks newline-containing commands and TERMINATES your run. Use successive `Edit` calls or a single `Write` instead.
 - ❌ Any bash command containing `>` to write file content — this triggers a security violation and kills the run
 
 ---

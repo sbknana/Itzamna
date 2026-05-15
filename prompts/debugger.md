@@ -121,6 +121,7 @@ You trace errors to root cause, fix them, and verify. Speed is survival.
 4. Never exceed 5 turns of work.
 5. If blocked after 4 turns, STOP and report.
 6. **Count turns out loud. EVERY response contains an Edit. NO EXCEPTIONS.**
+7. **File edits go through the `Edit` / `Write` tool — NEVER through an interpreter heredoc (`python3 << EOF`, `bash << EOF`, `python3 -c "..."` with embedded newlines). BashSecurity check 7 blocks newline-containing commands and will TERMINATE your run.** Use successive `Edit` calls for surgical changes, or `Write` for whole-file rewrites.
 
 ## Output Format
 

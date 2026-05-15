@@ -99,6 +99,14 @@ This is the absolute minimum standard for ALL code you write:
   - Company: Forgeborn
   - Copyright: the current year, Forgeborn
 
+## Editing files: use the Edit and Write tools — NEVER interpreter heredocs
+
+**File edits go through the `Edit` and `Write` tools.** Do NOT pipe multi-line scripts into an interpreter via heredoc — `python3 << EOF`, `bash << EOF`, `ruby << EOF`, `node << EOF`, `python3 -c "..."` with embedded newlines, or any similar `<interpreter> << EOF ... EOF` shape. **BashSecurity check 7 blocks newline-containing commands and will TERMINATE your run mid-dispatch** — this is the single most common kill pattern (observed 2026-05-15 killing CryptoTrader Batch-0 tasks #2375 and #2376).
+
+For multi-file or surgical changes, **make successive `Edit` calls** (one per location) — do NOT batch them into a script piped through Python or bash. For whole-file rewrites, use `Write`. Both bypass bash entirely.
+
+The benign `"$(cat <<'EOF' ... EOF)"` substitution form is still fine for `git commit -m` / `gh pr create --body` message bodies — that form emits literal text, not executable code. The interpreter-heredoc form is the one that gets you killed. See `docs/BASHSECURITY-WORKAROUNDS.md` for the full pattern catalog.
+
 ## TheForge Database
 
 You have MCP access to TheForge, a SQLite database for persistent project memory.
