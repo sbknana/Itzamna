@@ -29,6 +29,37 @@ Even with fixes deployed, **prod runs a snapshotted bash_security.py** — any f
 
 ## Workaround patterns
 
+### Editing files: use the Edit and Write tools — NEVER interpreter heredocs
+
+> **The single most common kill pattern.** Observed 2026-05-15 terminating CryptoTrader Batch-0 tasks #2375 (T1) and #2376 (T2): `BashSecurity BLOCKED check=7: cmd=python3 << 'EOF'`.
+
+```bash
+# DON'T — trips check 7 (newlines / "could separate multiple commands")
+# and KILLS your run. The agent executes arbitrary multi-line code, which
+# is exactly what check 7 is designed to block.
+python3 << 'EOF'
+import pathlib
+p = pathlib.Path("equipa/foo.py")
+text = p.read_text()
+text = text.replace("old", "new")
+p.write_text(text)
+EOF
+
+# Same shape, same kill: bash << EOF, ruby << EOF, node << EOF, perl << EOF
+# Also kills: python3 -c "..." with embedded newlines
+```
+
+```bash
+# DO — make the change with the Edit tool (exact string replacement)
+# or the Write tool (whole-file rewrite). Both bypass bash entirely.
+```
+
+**For multi-file or surgical changes, make successive `Edit` calls** — one per location. Do NOT batch them into a script piped through an interpreter. The `Edit` tool is cheap; emitting a `python3 << EOF` heredoc costs you the entire dispatch.
+
+**check 7 is working as intended** — it cannot distinguish "I am editing a file with Python" from "I am running arbitrary code." There is no allowlist that would make this safe without weakening the check. The fix is to use the right tool for the job: `Edit` / `Write`, not bash.
+
+The benign `$(cat <<'EOF' ... EOF)` substitution form is still fine for `git commit -m` / `gh pr create --body` bodies (see the dedicated sections below) — that form emits literal text, not executable code. The interpreter-heredoc form (`<interpreter> << EOF`) is the one that gets you killed.
+
 ### `gh pr create` with multi-line body — use `--body-file`
 
 ```bash
