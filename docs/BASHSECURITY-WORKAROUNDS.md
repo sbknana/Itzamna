@@ -23,7 +23,7 @@ When you're working on `equipa/bash_security.py` itself, **the checks you're mod
 | 2310 | check 4: locale-quoting `$"..."` on data | ✅ FIXED in source + prod |
 | 2214 | check 12 + check 4 on benign post-commit composition | ✅ FIXED in source + prod |
 | 2316 | check 4 per-segment evaluation (composed commands) | ✅ FIXED in source + prod |
-| 2320 | check 23: markdown body header in `gh pr create` heredoc | 🟡 **Open — workaround required** |
+| 2320 | check 23: markdown body header in `gh pr create` heredoc | ✅ FIXED in source (commit f008911) — pending Equipa-prod pull |
 
 Even with fixes deployed, **prod runs a snapshotted bash_security.py** — any false positive that hasn't been backported + deployed will still trip you. Always assume the production checker is stricter than the one you're editing in source.
 
@@ -144,6 +144,8 @@ The operator will intervene with a hand-fix.
 
 ## When this doc becomes obsolete
 
-Once bug 2320 is merged (and `_strip_benign_commit_remainder` is taught about `gh pr create --body "$(cat <<EOF ... )"` form), check-19 will no longer fire on this idiom. The doc will be updated to mark it FIXED.
+Bug 2320 is now FIXED in source (commit `f008911`, 2026-05-15) — the `_MARKDOWN_BODY_TOOLS` + `_MARKDOWN_BODY_FLAGS` allowlist plus the token-aware `_last_segment_start` fallback recognize the `gh pr create --body "$(cat <<EOF ... )"` form and let it through. Once Equipa-prod pulls master, the heredoc-in-substitution workaround for `gh pr create` becomes unnecessary.
 
-Until then, follow the patterns above. The orchestrator IS the security checker — there is no shortcut around it.
+That said, the **agent-side guidance still holds**: prefer Write-tool + `--body-file` for multi-line PR bodies and `git commit -F` for multi-line commit messages. The fix recognized the legitimate pattern; the cleaner pattern remains a better choice for readability and audit.
+
+The orchestrator IS the security checker — there is no shortcut around it.
