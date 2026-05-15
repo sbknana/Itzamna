@@ -171,6 +171,115 @@ def _get_base_command(command: str) -> str:
     return parts[0] if parts else ""
 
 
+def _split_command_segments(command: str) -> list[str]:
+    """Split *command* on top-level ``;``, ``&&``, ``||``, ``|``.
+
+    Splits are made only at the top quoting/substitution level — operators
+    inside single or double quotes, ``$(...)`` substitutions, or backtick
+    substitutions are treated as literal characters. Empty segments are
+    dropped; surrounding whitespace is stripped from each returned segment.
+
+    Used by Check 4 (locale quoting) to evaluate the safe-base allowlist
+    per chained segment rather than only on the head command. See bug 2316.
+    """
+    segments: list[str] = []
+    buf: list[str] = []
+    in_single = False
+    in_double = False
+    paren_depth = 0  # $(...) depth, tracked outside single quotes
+    in_backtick = False
+    i = 0
+    n = len(command)
+
+    def flush() -> None:
+        seg = "".join(buf).strip()
+        if seg:
+            segments.append(seg)
+        buf.clear()
+
+    while i < n:
+        ch = command[i]
+        nxt = command[i + 1] if i + 1 < n else ""
+
+        if in_single:
+            buf.append(ch)
+            if ch == "'":
+                in_single = False
+            i += 1
+            continue
+
+        if in_backtick:
+            buf.append(ch)
+            if ch == "`":
+                in_backtick = False
+            i += 1
+            continue
+
+        # `$(` opens a substitution in both unquoted and double-quoted contexts.
+        if ch == "$" and nxt == "(":
+            paren_depth += 1
+            buf.append(ch)
+            buf.append(nxt)
+            i += 2
+            continue
+        if paren_depth > 0:
+            if ch == "(":
+                paren_depth += 1
+            elif ch == ")":
+                paren_depth -= 1
+            buf.append(ch)
+            i += 1
+            continue
+
+        if in_double:
+            if ch == '"':
+                in_double = False
+            buf.append(ch)
+            i += 1
+            continue
+
+        # Outside quotes / substitutions.
+        if ch == "'":
+            in_single = True
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == '"':
+            in_double = True
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == "`":
+            in_backtick = True
+            buf.append(ch)
+            i += 1
+            continue
+
+        # Top-level operators end the current segment.
+        if ch == ";":
+            flush()
+            i += 1
+            continue
+        if ch == "&" and nxt == "&":
+            flush()
+            i += 2
+            continue
+        if ch == "|" and nxt == "|":
+            flush()
+            i += 2
+            continue
+        if ch == "|":
+            flush()
+            i += 1
+            continue
+
+        buf.append(ch)
+        i += 1
+
+    flush()
+    return segments
+
+
 def _has_backslash_escaped_whitespace(command: str) -> bool:
     """Detect backslash-space or backslash-tab outside quotes."""
     in_single = False
@@ -650,12 +759,26 @@ def _check_obfuscated_flags(command: str, base_cmd: str) -> BashSecurityResult:
     # the pattern is the legitimate use case (passing localized search terms).
     # Loosen for task #2096-class false positives while keeping the block
     # active for cmd/eval/sh/bash/python/node/etc.
+    #
+    # Per-segment evaluation (bug 2316): split on top-level `;`/`&&`/`||`/`|`
+    # and evaluate the allowlist against EACH chained segment's own first
+    # word. Without this, a safe head (`git status; python -c $"x"`) would
+    # whitewash an exec primitive in a later segment.
     if re.search(r'\$"[^"]*"', command):
-        if base_cmd not in _LOCALE_QUOTING_SAFE_BASES:
-            return BashSecurityResult(
-                safe=False, check_id=CheckID.OBFUSCATED_FLAGS,
-                message="Command contains locale quoting ($\"...\") which can hide characters",
-            )
+        segments = _split_command_segments(command)
+        # Fall back to whole-command behavior when the splitter produced no
+        # segments (defensive — empty/whitespace-only input).
+        if not segments:
+            segments = [command]
+        for segment in segments:
+            if not re.search(r'\$"[^"]*"', segment):
+                continue
+            seg_base = _get_base_command(segment)
+            if seg_base not in _LOCALE_QUOTING_SAFE_BASES:
+                return BashSecurityResult(
+                    safe=False, check_id=CheckID.OBFUSCATED_FLAGS,
+                    message="Command contains locale quoting ($\"...\") which can hide characters",
+                )
 
     # Empty ANSI-C or locale quotes before dash: $''-exec or $""-exec
     if not skip_empty_quote_checks and re.search(r"""\$['\"]{2}\s*-""", command):
