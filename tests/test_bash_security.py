@@ -1040,6 +1040,44 @@ class TestDeveloperLoosens:
         result = check_bash_command(r'bash -c $"x"')
         assert not result.safe
 
+    # ---- Bug 2316: check-4 must evaluate the safe-base allowlist
+    #               per chained command segment, not gate on head base_cmd.
+
+    def test_chained_exec_after_safe_base_blocks(self) -> None:
+        """`git status; python -c $"x"` must block — python segment is exec."""
+        result = check_bash_command(r'git status; python -c $"x"')
+        assert not result.safe, (
+            "expected block on chained python segment carrying locale quoting"
+        )
+
+    def test_chained_eval_after_safe_base_blocks(self) -> None:
+        """`git status && eval $"x"` must block — eval segment is exec."""
+        result = check_bash_command(r'git status && eval $"x"')
+        assert not result.safe
+
+    def test_piped_exec_after_safe_base_blocks(self) -> None:
+        """`git status | python -c $"x"` must block — python segment is exec."""
+        result = check_bash_command(r'git status | python -c $"x"')
+        assert not result.safe
+
+    def test_chained_safe_after_safe_passes(self) -> None:
+        """`git status; grep -r $"foo" .` passes — both segments use safe bases."""
+        cmd = r'git status; grep -r $"foo" .'
+        result = check_bash_command(cmd)
+        assert result.safe, f"expected safe: {cmd} -> {result.message}"
+
+    def test_single_segment_safe_still_passes(self) -> None:
+        """Single-segment safe-base case (bug 2310) still passes."""
+        cmd = 'git commit -m "fix: $\\"x\\""'
+        result = check_bash_command(cmd)
+        assert result.safe, f"expected safe: {cmd} -> {result.message}"
+
+    def test_quoted_pipe_inside_string_not_split(self) -> None:
+        """A `|` inside a double-quoted argument must NOT split into segments."""
+        cmd = 'git commit -m "this has | in message"'
+        result = check_bash_command(cmd)
+        assert result.safe, f"expected safe: {cmd} -> {result.message}"
+
     # ---- Check 6: variables in pipes/redirects (loop counters) ---- #
 
     @pytest.mark.parametrize("cmd", [
