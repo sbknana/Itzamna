@@ -164,8 +164,16 @@ async def run_security_review(
     log(f"{'=' * 50}", output)
     log(f"\n  Running security reviewer agent...", output)
 
-    # Build security review prompt with explicit instructions to use all tools
+    # Build security review prompt with explicit instructions to use all tools.
+    # The filename instruction MUST be exact and task-scoped so the artifact the
+    # agent writes matches the path the orchestrator reads at review_path below
+    # (and the path the merge gate checks via _security_review_blocks_merge).
+    # Historical bug 2412: instruction said "SECURITY-REVIEW.md" but the
+    # orchestrator looked for "SECURITY-REVIEW-{task_id}.md", so findings were
+    # frequently logged as "artifact missing" and discarded.
     security_task = dict(task)  # copy
+    task_id = task.get("id")
+    review_filename = f"SECURITY-REVIEW-{task_id}.md"
     security_task["description"] = (
         f"Security review of code written for: {task['title']}. "
         f"Review ALL files changed in the project directory. "
@@ -174,7 +182,10 @@ async def run_security_review(
         f"fix-review, semgrep-rule-creator, and sharp-edges. "
         f"Check for OWASP Top 10 vulnerabilities, zero-day risks in dependencies, "
         f"and any security anti-patterns. "
-        f"Write findings to a SECURITY-REVIEW.md file in the project directory. "
+        f"Write your findings to a file named {review_filename} in the "
+        f"project root directory (this EXACT filename — not SECURITY-REVIEW.md, "
+        f"not a generic name). The orchestrator reads counts from this exact "
+        f"path; if you write a different filename the findings will be lost. "
         f"Rate each finding: CRITICAL, HIGH, MEDIUM, LOW, INFO. "
         f"Original task description: {task['description']}"
     )
@@ -204,7 +215,6 @@ async def run_security_review(
         # reasoning ("[S1] LOW — this is NOT a CRITICAL because…") so substring
         # counts on CRITICAL / HIGH double-count rejected findings, severity
         # mentions in prose, and so on (see task 2315 root-cause analysis).
-        task_id = task.get("id")
         review_path = Path(project_dir) / f"SECURITY-REVIEW-{task_id}.md"
         counts = _count_findings_in_review_file(review_path)
         if counts is None:
@@ -212,6 +222,16 @@ async def run_security_review(
                 f"  WARNING: security-review artifact missing — expected "
                 f"{review_path.name} in project root (agent did not save it)",
                 output,
+            )
+            # Robustness fallback (task 2412): preserve the agent's raw output
+            # on disk so operators can recover findings even when the reviewer
+            # failed to write the structured artifact. The file is clearly
+            # marked as a fallback dump and is NOT treated as a structured
+            # artifact by _count_findings_in_review_file — so the
+            # fail-closed security_review_block_on_missing_artifact gate in
+            # dispatch._security_review_blocks_merge still fires.
+            _write_security_review_fallback(
+                review_path, task_id, result_text, output=output,
             )
         elif counts["CRITICAL"] > 0 or counts["HIGH"] > 0:
             log(
@@ -248,13 +268,22 @@ _REVIEW_FINDING_HEADER_RE = re.compile(
     re.MULTILINE,
 )
 
+# Sentinel marker written into orchestrator-saved fallback dumps when the
+# reviewer agent failed to write a structured SECURITY-REVIEW artifact.
+# _count_findings_in_review_file returns None when this marker is present so
+# the fail-closed merge gate
+# (dispatch._security_review_blocks_merge / features.security_review_block_on_missing_artifact)
+# still fires — a fallback dump must NOT be treated as a structured artifact.
+SECURITY_REVIEW_FALLBACK_MARKER = "<!-- EQUIPA-SECURITY-REVIEW-FALLBACK -->"
+
 
 def _count_findings_in_review_file(review_path: Path) -> dict[str, int] | None:
     """Count findings per severity in a SECURITY-REVIEW-NNNN.md artifact.
 
     Returns a dict with keys CRITICAL/HIGH/MEDIUM/LOW/INFO, or None if the
-    artifact does not exist (caller should emit a "missing artifact" warning
-    rather than a counterfeit count — see task 2315).
+    artifact does not exist OR is an orchestrator-saved fallback dump (caller
+    should emit a "missing artifact" warning rather than a counterfeit count —
+    see task 2315 and task 2412).
 
     Counts are derived from finding section headers like:
         ### [S1] HIGH — Prompt Injection via Database Content
@@ -269,10 +298,65 @@ def _count_findings_in_review_file(review_path: Path) -> dict[str, int] | None:
     except OSError:
         return None
 
+    # Fallback dumps preserve raw agent output for operator review but are NOT
+    # structured artifacts — the merge gate must still fail-closed on them.
+    if SECURITY_REVIEW_FALLBACK_MARKER in text:
+        return None
+
     counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
     for match in _REVIEW_FINDING_HEADER_RE.finditer(text):
         counts[match.group(1)] += 1
     return counts
+
+
+def _write_security_review_fallback(
+    review_path: Path,
+    task_id: int | None,
+    result_text: str,
+    *,
+    output: Any = None,
+) -> None:
+    """Write the agent's raw output to ``review_path`` as a fallback dump.
+
+    Used when the security-reviewer agent failed to save the structured
+    SECURITY-REVIEW-{task_id}.md artifact. The dump is clearly marked with
+    ``SECURITY_REVIEW_FALLBACK_MARKER`` so _count_findings_in_review_file
+    returns None for it — keeping the fail-closed merge gate intact while
+    preserving the agent's findings text on disk for operator recovery.
+
+    Refuses to overwrite a pre-existing file (the agent may have written a
+    real artifact between our check and this call).
+    """
+    if review_path.exists():
+        return
+    body = (
+        f"# SECURITY-REVIEW fallback (orchestrator-saved, task {task_id})\n"
+        f"{SECURITY_REVIEW_FALLBACK_MARKER}\n\n"
+        "The security-reviewer agent did not write a structured "
+        f"`SECURITY-REVIEW-{task_id}.md` artifact. The orchestrator saved the "
+        "raw agent output below so findings are preserved on disk for "
+        "operator review.\n\n"
+        "**This file is NOT a structured artifact.** The fail-closed "
+        "`security_review_block_on_missing_artifact` merge gate still fires "
+        "because `_count_findings_in_review_file` ignores files containing "
+        "the fallback marker above.\n\n"
+        "---\n\n"
+        "## Raw agent result_text\n\n"
+        f"{result_text}\n"
+    )
+    try:
+        review_path.write_text(body, encoding="utf-8")
+        log(
+            f"  Saved security-review fallback dump to {review_path.name} "
+            f"({len(result_text)} chars of raw agent output preserved)",
+            output,
+        )
+    except OSError as exc:
+        log(
+            f"  WARNING: failed to write security-review fallback to "
+            f"{review_path}: {exc}",
+            output,
+        )
 
 
 def _extract_findings(
