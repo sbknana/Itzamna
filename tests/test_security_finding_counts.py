@@ -266,6 +266,127 @@ def test_missing_review_file_emits_warning(tmp_path: Path) -> None:
     assert not any("WARNING: Found" in ln for ln in lines)
 
 
+def test_missing_review_file_writes_fallback_dump(tmp_path: Path) -> None:
+    """Task 2412: when the agent fails to write the structured artifact, the
+    orchestrator preserves the raw result_text on disk so findings are NOT
+    lost (the historical bug 2412 dropped them silently)."""
+    from equipa.loops import SECURITY_REVIEW_FALLBACK_MARKER
+
+    raw_text = (
+        "I found a SQL injection in login() that would let an attacker bypass auth. "
+        "Severity: CRITICAL. File: auth.py:42."
+    )
+    lines = _run_security_review(
+        {"id": 4246, "project_id": 1, "title": "x", "description": "y"},
+        tmp_path,
+        result_text=raw_text,
+    )
+    review_path = tmp_path / "SECURITY-REVIEW-4246.md"
+    assert review_path.exists(), (
+        f"expected orchestrator to write fallback file {review_path}; "
+        f"log lines: {lines}"
+    )
+    body = review_path.read_text(encoding="utf-8")
+    # Fallback marker is present so this file is NOT mistaken for a structured artifact.
+    assert SECURITY_REVIEW_FALLBACK_MARKER in body
+    # The raw agent output is preserved verbatim.
+    assert raw_text in body
+    # Log line confirms the save.
+    assert any("fallback dump" in ln for ln in lines)
+
+
+def test_fallback_dump_does_not_satisfy_merge_gate(tmp_path: Path) -> None:
+    """The fallback dump must NOT be treated as a structured artifact, so the
+    fail-closed merge gate (dispatch._security_review_blocks_merge) still
+    fires. Verified at the parser level: _count_findings_in_review_file
+    returns None for a fallback file even though the file exists."""
+    from equipa.loops import (
+        SECURITY_REVIEW_FALLBACK_MARKER,
+        _count_findings_in_review_file,
+    )
+
+    fallback = tmp_path / "SECURITY-REVIEW-4247.md"
+    fallback.write_text(
+        "# SECURITY-REVIEW fallback (orchestrator-saved, task 4247)\n"
+        f"{SECURITY_REVIEW_FALLBACK_MARKER}\n\n"
+        # Even with a structured-looking finding header in the dump, the marker
+        # must dominate — fallback dumps capture untrusted raw stdout and must
+        # never count as a real artifact.
+        "### [F1] CRITICAL — this looks like a finding but it's only raw stdout\n",
+        encoding="utf-8",
+    )
+    assert _count_findings_in_review_file(fallback) is None
+
+
+def test_fallback_does_not_overwrite_existing_artifact(tmp_path: Path) -> None:
+    """If the agent wrote a real artifact after our read, never clobber it."""
+    from equipa.loops import _write_security_review_fallback
+
+    review_path = tmp_path / "SECURITY-REVIEW-4248.md"
+    original = "### [S1] HIGH — real finding\n"
+    review_path.write_text(original, encoding="utf-8")
+    _write_security_review_fallback(review_path, 4248, "raw text", output=None)
+    assert review_path.read_text(encoding="utf-8") == original
+
+
+def test_security_review_prompt_uses_task_scoped_filename() -> None:
+    """Task 2412: the reviewer prompt MUST name the exact task-scoped
+    filename (SECURITY-REVIEW-{task_id}.md). Historical bug: instruction said
+    a generic 'SECURITY-REVIEW.md' so the agent wrote the wrong filename and
+    the orchestrator dropped the findings."""
+    from unittest.mock import MagicMock, patch
+
+    captured: dict[str, Any] = {}
+
+    async def fake_run_agent(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        return {"success": True, "result_text": "", "duration": 0.1, "errors": []}
+
+    def fake_build_system_prompt(security_task, *a, **kw):
+        # Capture the description passed to the prompt builder so we can
+        # assert the filename is embedded correctly.
+        captured["description"] = security_task["description"]
+        return "prompt"
+
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    @contextmanager
+    def fake_build_cli_command(*args: Any, **kwargs: Any):
+        yield SimpleNamespace(cmd=["claude"])
+
+    class _Args:
+        dispatch_config = None
+
+    with (
+        patch("equipa.loops.log", new=lambda *a, **k: None),
+        patch("equipa.loops.run_agent", new=fake_run_agent),
+        patch("equipa.loops.load_dispatch_config", return_value={}),
+        patch("equipa.loops.get_role_turns", return_value=20),
+        patch("equipa.loops.get_role_model", return_value="opus"),
+        patch("equipa.loops.build_system_prompt", side_effect=fake_build_system_prompt),
+        patch("equipa.loops._extract_security_findings", return_value=[]),
+        patch("equipa.loops.build_cli_command", new=fake_build_cli_command),
+    ):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            asyncio.run(
+                run_security_review(
+                    task={"id": 2412, "project_id": 23, "title": "x", "description": "y"},
+                    project_dir=td,
+                    project_context={},
+                    args=_Args(),
+                    output=None,
+                )
+            )
+    desc = captured["description"]
+    assert "SECURITY-REVIEW-2412.md" in desc, (
+        f"expected task-scoped filename in prompt; got: {desc!r}"
+    )
+    # The bug-2412 mistake (generic filename) MUST not be the only instruction.
+    # The exact-filename language must appear.
+    assert "EXACT filename" in desc or "exact filename" in desc
+
+
 def test_zero_findings_reports_zero(tmp_path: Path) -> None:
     _write(
         tmp_path,

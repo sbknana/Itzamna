@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "generated_at": "2026-05-15T21:46:08Z",
+  "generated_at": "2026-05-17T23:15:47Z",
   "description": "SHA-256 hashes of prompt and skill files for integrity verification",
   "files": {
     "prompts/_common.md": "4efe8fa5c6b7d57697fb8fd7c88d47867e6d3c39008f5bd0676f50ded4fcb606",
@@ -25,7 +25,7 @@
     "prompts/planner.md": "a59be9de7529c2af975b9846a9538ffad19014d8be85f49aec39e279d645687f",
     "prompts/qa-tester.md": "4ec5e05dbbf41b0f83d7ef8ef3d82c69844d4be90eabaf56b414ef41aa3f355e",
     "prompts/researcher.md": "e369f60bce5fb078176770cfbde9ba42b88a310498c27f3913cf6066b39ff326",
-    "prompts/security-reviewer.md": "d1580b450e7d39b1b76c21befb359b899bff39aeb44aee7b20c0c0c71360ebc2",
+    "prompts/security-reviewer.md": "b7294e8e56d0fce51255b4d7aa412df83ffaf08521a8489ca0bd9536351aeced",
     "prompts/story-tester.md": "59f5d09c08d1321a6ac0ec5ddc7dbc45979039c6e690ce82fd2565f13902279d",
     "prompts/tester.md": "3c6a0a89f8d62fbfa877b42d5172a383e88885a9b90aa032303f1af41d1b7365",
     "prompts/world-builder.md": "727138b2b23ff2d947b1032b0b4fb265da56b46fe23ecc213c38018ef62eceb8",
