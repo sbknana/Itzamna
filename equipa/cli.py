@@ -74,6 +74,10 @@ from equipa.reflexion import maybe_run_reflexion
 from equipa.roles import _discover_roles, get_role_model, get_role_turns
 from equipa.routing import record_model_outcome
 from equipa.security import write_skill_manifest
+from equipa.security_gate import (
+    get_changed_files_for_branch,
+    is_doc_only_diff,
+)
 from equipa.tasks import (
     fetch_next_todo,
     fetch_project_context,
@@ -1073,7 +1077,23 @@ async def run_mode_task(args: argparse.Namespace) -> None:
             is_security_review_enabled(args)
             and outcome in ("tests_passed", "no_tests")
         ):
-            await run_security_review(task, project_dir, project_context, args)
+            # Task 2360 defect 1: doc-only diffs (only .md/.txt/.rst etc.)
+            # cannot introduce code-level vulnerabilities, so the security
+            # gate must skip them rather than risk a prose-matching false
+            # positive blocking the merge. Concrete trigger: task 2358 — a
+            # CRYPTOTRADER-V3-ARCHITECTURE.md spec was blocked because the
+            # document used the word "HIGH" and discussed API-key auth.
+            changed_files = await get_changed_files_for_branch(
+                project_dir, base_ref="master",
+            )
+            if is_doc_only_diff(changed_files):
+                print(
+                    f"  [Task #{task['id']}] SECURITY GATE: skipping "
+                    f"review — doc-only change "
+                    f"({len(changed_files)} file(s), all docs)."
+                )
+            else:
+                await run_security_review(task, project_dir, project_context, args)
 
         # Verify the task status in TheForge
         verified, verify_msg = verify_task_updated(task["id"])

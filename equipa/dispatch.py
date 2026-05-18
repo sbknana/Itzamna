@@ -69,6 +69,10 @@ from equipa.output import (
 from equipa.prompts import build_planner_prompt
 from equipa.reflexion import maybe_run_reflexion
 from equipa.roles import get_role_model, get_role_turns
+from equipa.security_gate import (
+    get_changed_files_for_branch,
+    is_doc_only_diff,
+)
 from equipa.single_agent_guard import (
     SingleAgentOutcome,
     TasksCreatedValidation,
@@ -1546,33 +1550,61 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
                 is_security_review_enabled(args)
                 and outcome in ("tests_passed", "no_tests")
             ):
-                # Task 2341 S2: if run_security_review raises, the artifact
-                # check on its own is not enough to gate the merge — a
-                # stale SECURITY-REVIEW-NNNN.md from a prior run could
-                # exist in the worktree and silently re-authorise. The
-                # explicit flag here ensures a crashed reviewer always
-                # blocks, independently of artifact state.
+                # Task 2360 defect 1: doc-only diffs (only .md/.txt/.rst
+                # etc.) cannot introduce code-level vulnerabilities, so
+                # the security gate must skip them rather than risk a
+                # prose-matching false positive blocking the merge.
+                # Concrete trigger: task 2358 — a pure CRYPTOTRADER-V3-
+                # ARCHITECTURE.md spec was blocked because the document
+                # used the word "HIGH" and discussed API-key auth.
+                changed_files = await get_changed_files_for_branch(
+                    task_dir, base_ref="master",
+                )
+                review_skipped_doc_only = is_doc_only_diff(changed_files)
                 review_crashed = False
-                try:
-                    await run_security_review(
-                        task, task_dir, project_context, args, output=output,
+                if review_skipped_doc_only:
+                    log(
+                        f"[Task #{task['id']}] SECURITY GATE: skipping "
+                        f"review — doc-only change "
+                        f"({len(changed_files)} file(s), all docs).",
+                        output,
                     )
-                except Exception:  # pragma: no cover - defensive
-                    review_crashed = True
-                    logger.exception(
-                        "[Task #%s] security review crashed", task["id"],
+                else:
+                    # Task 2341 S2: if run_security_review raises, the
+                    # artifact check on its own is not enough to gate
+                    # the merge — a stale SECURITY-REVIEW-NNNN.md from
+                    # a prior run could exist in the worktree and
+                    # silently re-authorise. The explicit flag here
+                    # ensures a crashed reviewer always blocks,
+                    # independently of artifact state.
+                    try:
+                        await run_security_review(
+                            task, task_dir, project_context, args, output=output,
+                        )
+                    except Exception:  # pragma: no cover - defensive
+                        review_crashed = True
+                        logger.exception(
+                            "[Task #%s] security review crashed", task["id"],
+                        )
+                if review_skipped_doc_only:
+                    # Doc-only short-circuit: no artifact expected, so
+                    # skip the artifact-required check (an absent
+                    # SECURITY-REVIEW-NNNN.md must NOT trigger the
+                    # task-2341 fail-closed path here).
+                    review_blocks_merge = False
+                    review_counts = None
+                else:
+                    _config_for_flag = getattr(args, "dispatch_config", None) or {}
+                    _block_on_missing = is_feature_enabled(
+                        _config_for_flag,
+                        "security_review_block_on_missing_artifact",
                     )
-                _config_for_flag = getattr(args, "dispatch_config", None) or {}
-                _block_on_missing = is_feature_enabled(
-                    _config_for_flag,
-                    "security_review_block_on_missing_artifact",
-                )
-                review_blocks_merge, review_counts = (
-                    _security_review_blocks_merge(
-                        task_dir, task["id"],
-                        block_on_missing=_block_on_missing,
+                    review_blocks_merge, review_counts = (
+                        _security_review_blocks_merge(
+                            task_dir, task["id"],
+                            block_on_missing=_block_on_missing,
+                        )
                     )
-                )
                 if review_crashed:
                     # Fail-closed: the review pipeline crashed, do not
                     # trust the artifact check. Override any (False, ...)
