@@ -1373,7 +1373,7 @@ async def run_dev_test_loop(
             log(f"{'=' * 50}", output)
 
             # --- Lifecycle hooks: pre_cycle ---
-            await fire_hook(
+            pre_cycle_returns = await fire_hook(
                 "pre_cycle",
                 task_id=task_id, cycle=cycle, project_dir=project_dir,
                 total_cost=state.total_cost,
@@ -1400,6 +1400,16 @@ async def run_dev_test_loop(
             extra_context = _build_dev_extra_context(
                 state.compaction_history, cycle, message_context, _dc
             )
+
+            # Merge any extra_context contributed by pre_cycle hook callbacks.
+            # Plugins may return {"extra_context": "..."} to inject text into
+            # the developer prompt for this cycle.
+            for _hr in (pre_cycle_returns or []):
+                if isinstance(_hr, dict) and _hr.get("extra_context"):
+                    _injected = _hr["extra_context"]
+                    if _injected and _injected not in (extra_context or ""):
+                        extra_context = (extra_context or "") + _injected
+                        log(f"  [Cycle {cycle}] Plugin extra_context injected ({len(_injected)} chars)", output)
 
             dev_prompt = build_system_prompt(
                 task, project_context, project_dir,

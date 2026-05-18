@@ -500,6 +500,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         metavar="VERB",
                         help="Config-versioning subcommand: snapshot|list|diff|rollback")
 
+    parser.add_argument("--qiao", choices=["on", "off", "default"], default="default",
+                        help="Enable/disable the qiao experimental plugin for this invocation. "
+                             "Overrides dispatch_config.qiao_enabled. Default reads the config.")
     parser.add_argument("--project-dir", type=str, metavar="PATH",
                         help="Project directory (used with --add-project)")
     parser.add_argument("--goal-project", type=int, help="Project ID (required with --goal)")
@@ -1282,6 +1285,55 @@ async def async_main() -> None:
     await handler(args)
 
 
+def _resolve_disabled_plugins(argv: list[str]) -> list[str]:
+    """Build the list of plugin names to skip at startup.
+
+    Precedence (highest first):
+      1. CLI: ``--qiao on``  -> qiao enabled (not in disabled list)
+      2. CLI: ``--qiao off`` -> qiao disabled
+      3. ``dispatch_config.qiao_enabled`` value (true/false)
+      4. Default if config absent or field missing: qiao disabled
+
+    Runs before full argparse so we can decide which plugins to register
+    BEFORE any hooks fire. Reads sys.argv directly and does a minimal
+    JSON load of the dispatch config — heavier config plumbing happens
+    later in async_main.
+    """
+    cli_choice: str | None = None
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--qiao" and i + 1 < len(argv):
+            v = argv[i + 1].lower()
+            if v in ("on", "off"):
+                cli_choice = v
+            break
+        if a.startswith("--qiao="):
+            v = a.split("=", 1)[1].lower()
+            if v in ("on", "off"):
+                cli_choice = v
+            break
+        i += 1
+
+    if cli_choice == "on":
+        return []
+    if cli_choice == "off":
+        return ["qiao"]
+
+    cfg_path = os.environ.get("EQUIPA_DISPATCH_CONFIG") or "dispatch_config.json"
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        # qiao_enabled may live at top level or under features (legacy layout).
+        if cfg.get("qiao_enabled") is True:
+            return []
+        if isinstance(cfg.get("features"), dict) and cfg["features"].get("qiao_enabled") is True:
+            return []
+    except (OSError, json.JSONDecodeError):
+        pass
+    return ["qiao"]
+
+
 def main() -> None:
     """Entry point that runs the async main.
 
@@ -1292,7 +1344,12 @@ def main() -> None:
     load_config()
     _discover_roles()
 
-    load_plugins(_hooks_module)
+    # Resolve which plugins to skip at startup. Default policy: skip the
+    # qiao plugin unless dispatch_config.qiao_enabled is true OR --qiao on
+    # was passed on the CLI. This keeps daily work isolated from the
+    # experimental plugin while letting A/B benchmarks opt in per-invocation.
+    disabled_plugins: list[str] = _resolve_disabled_plugins(sys.argv)
+    load_plugins(_hooks_module, disabled=disabled_plugins)
 
     # 'equipa template <verb> ...' subcommand short-circuit. Handled here
     # so the existing mutually-exclusive flag group in async_main does not

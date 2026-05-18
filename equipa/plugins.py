@@ -23,29 +23,39 @@ from __future__ import annotations
 
 import importlib.metadata
 import logging
+from collections.abc import Iterable
 
 log = logging.getLogger(__name__)
 
 PLUGIN_GROUP = "equipa.plugins"
 
 
-def load_plugins(hooks) -> int:
+def load_plugins(hooks, disabled: Iterable[str] = ()) -> int:
     """Discover and load all installed EQUIPA plugins via entry points.
 
     Args:
         hooks: The hooks registry object (from equipa.hooks).
+        disabled: Iterable of plugin entry-point names to skip at load
+            time. Use this to opt out of specific plugins without
+            uninstalling them — e.g. for A/B benchmarks or to disable
+            an experimental plugin in daily work. The plugin's hooks
+            are not registered when it is skipped.
 
     Returns:
         Number of plugins successfully loaded.
     """
+    disabled_set = {str(name) for name in disabled}
     loaded = 0
     try:
         eps = importlib.metadata.entry_points(group=PLUGIN_GROUP)
     except TypeError:
-        # Python 3.9 fallback — entry_points() returns a dict
         eps = importlib.metadata.entry_points().get(PLUGIN_GROUP, [])
 
     for ep in eps:
+        if ep.name in disabled_set:
+            log.info("Plugin disabled — skipping: %s", ep.name)
+            print(f"  [Plugin] Disabled: {ep.name}")
+            continue
         try:
             register_fn = ep.load()
             register_fn(hooks)
