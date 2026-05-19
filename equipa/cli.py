@@ -346,16 +346,28 @@ async def _gated_post_merge(
         - ``"skipped"`` — outcome was not merge-eligible (e.g. tests failed
           before the gate even ran); no merge attempted.
     """
-    from equipa.dispatch import _gated_merge_task
+    from equipa.dispatch import _gate_audit_log
+    from equipa.security_gate import SecurityGateBypassError
 
     project_dir = os.fspath(repo)
 
-    # Honour the caller's gate decision first — covers the cases where
-    # the gate fired because of a crashed reviewer, missing artifact under
-    # fail-closed, or a doc-only short-circuit that the file-based gate
-    # cannot re-derive from disk.
+    # Honour the caller's gate decision first — the caller owns context the
+    # file-based gate cannot re-derive (doc-only short-circuit, crashed
+    # reviewer, missing artifact under fail-closed). Re-checking the artifact
+    # here would falsely block merges the caller already authorised.
     if review_blocks_merge or outcome == "security_review_blocked":
+        _gate_audit_log(
+            f"task={task_id} event=merge-skipped reason=caller-gate-blocked "
+            f"outcome={outcome}"
+        )
         return "blocked"
+
+    if outcome not in ("tests_passed", "no_tests"):
+        _gate_audit_log(
+            f"task={task_id} event=merge-skipped reason=outcome-not-eligible "
+            f"outcome={outcome}"
+        )
+        return "skipped"
 
     if task_id is None:
         try:
@@ -366,15 +378,22 @@ async def _gated_post_merge(
                 f"{branch!r}; pass task_id= explicitly"
             ) from e
 
-    # Delegate to the unified helper so both dispatch modes share one
-    # code path. The helper re-evaluates the artifact gate and triggers
-    # the defensive invariant inside ``_merge_task_branch``.
-    return await _gated_merge_task(
-        repo=project_dir,
-        branch=branch,
-        outcome=outcome,
-        task_id=task_id,
+    _gate_audit_log(
+        f"task={task_id} event=merge-attempt branch={branch} "
+        f"path=single-task"
     )
+    # The defensive invariant inside ``_merge_task_branch`` (task #2451)
+    # still raises ``SecurityGateBypassError`` if the on-disk artifact
+    # reports a HIGH/CRITICAL finding — making it impossible to merge
+    # past a known-blocking review even if the caller's flag was wrong.
+    try:
+        merged = await _merge_task_branch(project_dir, task_id, branch)
+    except SecurityGateBypassError as exc:
+        _gate_audit_log(
+            f"task={task_id} event=defensive-invariant-blocked detail={exc}"
+        )
+        return "blocked"
+    return "merged" if merged else "merge_failed"
 
 
 # --- Template subcommand (PLAN-1067 §3.C3) ---

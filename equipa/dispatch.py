@@ -1429,12 +1429,20 @@ async def _gated_merge_task(
     outcome: str,
     task_id: int,
     project_context: dict | None = None,
+    review_blocks_merge: bool | None = None,
 ) -> str:
     """Unified, gated merge entry point used by BOTH dispatch modes.
 
     Task #2451: single-task ``--dev-test`` (``cli.run_mode_task``) and
     parallel ``--tasks`` (``run_parallel_tasks``) both funnel through
     this helper so the security gate cannot be bypassed by either path.
+
+    ``review_blocks_merge`` lets the caller pass a pre-computed gate
+    decision (covering doc-only short-circuits, reviewer crashes, missing
+    artifacts under fail-closed) which the helper trusts. When None the
+    helper re-evaluates the artifact gate from disk. In BOTH paths the
+    defensive invariant inside ``_merge_task_branch`` still raises
+    ``SecurityGateBypassError`` if the artifact reports HIGH/CRITICAL.
 
     Returns one of:
       * ``"skipped"``  — outcome is not merge-eligible (e.g. tests failed).
@@ -1443,6 +1451,8 @@ async def _gated_merge_task(
       * ``"merge_failed"`` — gate passed but ``_merge_task_branch`` returned
         False (conflict, no commits ahead, etc.). Branch preserved.
     """
+    from equipa.security_gate import SecurityGateBypassError
+
     project_dir = os.fspath(repo)
 
     if outcome not in ("tests_passed", "no_tests"):
@@ -1452,20 +1462,34 @@ async def _gated_merge_task(
         )
         return "skipped"
 
-    blocks, counts = _security_review_blocks_merge(
-        project_dir, task_id, block_on_missing=True,
-    )
-    if blocks:
+    if review_blocks_merge is True:
         _gate_audit_log(
-            f"task={task_id} event=merge-skipped "
-            f"reason=security-review-blocked counts={counts!r}"
+            f"task={task_id} event=merge-skipped reason=caller-gate-blocked"
         )
         return "blocked"
 
+    if review_blocks_merge is None:
+        blocks, counts = _security_review_blocks_merge(
+            project_dir, task_id, block_on_missing=True,
+        )
+        if blocks:
+            _gate_audit_log(
+                f"task={task_id} event=merge-skipped "
+                f"reason=security-review-blocked counts={counts!r}"
+            )
+            return "blocked"
+
     _gate_audit_log(
-        f"task={task_id} event=merge-attempt branch={branch} counts={counts!r}"
+        f"task={task_id} event=merge-attempt branch={branch} "
+        f"caller_flag={review_blocks_merge!r}"
     )
-    merged = await _merge_task_branch(project_dir, task_id, branch)
+    try:
+        merged = await _merge_task_branch(project_dir, task_id, branch)
+    except SecurityGateBypassError as exc:
+        _gate_audit_log(
+            f"task={task_id} event=defensive-invariant-blocked detail={exc}"
+        )
+        return "blocked"
     if merged:
         _gate_audit_log(f"task={task_id} event=merge-succeeded branch={branch}")
         return "merged"
@@ -1887,6 +1911,7 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
                     outcome=r["outcome"],
                     task_id=task_id,
                     project_context=project_context,
+                    review_blocks_merge=r.get("review_blocks_merge", False),
                 )
             except Exception:  # pragma: no cover - defensive
                 logger.exception(
