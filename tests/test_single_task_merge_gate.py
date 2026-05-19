@@ -80,13 +80,17 @@ def _run_gated_merge(
     This wraps the post-loop gate-then-merge logic so the tests can exercise
     it independently of run_dev_test_loop's full async stack.
     """
+    import asyncio
+
     from equipa import cli
 
-    return cli._gated_post_merge(  # type: ignore[attr-defined]
-        repo=repo,
-        branch=branch,
-        outcome=outcome,
-        review_blocks_merge=review_blocks_merge,
+    return asyncio.run(
+        cli._gated_post_merge(  # type: ignore[attr-defined]
+            repo=repo,
+            branch=branch,
+            outcome=outcome,
+            review_blocks_merge=review_blocks_merge,
+        )
     )
 
 

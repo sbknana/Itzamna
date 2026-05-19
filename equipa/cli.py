@@ -306,7 +306,7 @@ async def _post_task_telemetry(
     record_model_outcome(model, success)
 
 
-def _gated_post_merge(
+async def _gated_post_merge(
     *,
     repo: str | os.PathLike,
     branch: str,
@@ -363,7 +363,7 @@ def _gated_post_merge(
                 f"{branch!r}; pass task_id= explicitly"
             ) from e
 
-    merged = asyncio.run(_merge_task_branch(project_dir, task_id, branch))
+    merged = await _merge_task_branch(project_dir, task_id, branch)
     return "merged" if merged else "merge_failed"
 
 
@@ -1231,7 +1231,7 @@ async def run_mode_task(args: argparse.Namespace) -> None:
         # outcome=security_review_blocked but commits on master, branch gone).
         if args.dev_test:
             merge_branch = f"forge-task-{task['id']}"
-            merge_result = _gated_post_merge(
+            merge_result = await _gated_post_merge(
                 repo=project_dir,
                 branch=merge_branch,
                 outcome=outcome,
