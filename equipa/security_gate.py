@@ -66,6 +66,15 @@ def is_doc_only_diff(changed_files: list[str]) -> bool:
     return True
 
 
+class SecurityGateBypassError(RuntimeError):
+    """Raised when ``_merge_task_branch`` is entered while the
+    security-review artifact for the task reports a HIGH or CRITICAL
+    finding. The defensive invariant (task #2451) is that no code path
+    can ever ``git merge`` past a known-blocking review, even if a
+    caller forgets to consult the gate first.
+    """
+
+
 @dataclass(frozen=True)
 class GateVerdict:
     """Decision returned by ``evaluate_gate``.
