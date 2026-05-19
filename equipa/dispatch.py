@@ -1401,6 +1401,11 @@ def _security_review_blocks_merge(
     """
     review_path = Path(project_dir) / f"SECURITY-REVIEW-{task_id}.md"
     counts = _count_findings_in_review_file(review_path)
+    _gate_audit_log(
+        f"task={task_id} event=blocks-merge-eval "
+        f"artifact_exists={review_path.exists()} counts={counts!r} "
+        f"block_on_missing={block_on_missing}"
+    )
     if counts is None:
         if block_on_missing:
             logger.warning(
