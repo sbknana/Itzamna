@@ -153,11 +153,24 @@ async def run_security_review(
     project_context: dict[str, Any],
     args: Any,
     output: Any = None,
+    stable_project_dir: str | None = None,
 ) -> dict[str, Any]:
     """Run an automatic security review after dev-test succeeds.
 
     Uses the security-reviewer role with ClaudeStick tools.
     Only runs if security_review is enabled in dispatch config.
+
+    ``stable_project_dir`` is the project's REAL root (the path that
+    survives worktree teardown). When the agent runs inside an
+    isolation worktree (parallel mode, task 2321), ``project_dir`` is
+    the worktree and ``stable_project_dir`` is the real root. After
+    the agent runs, this helper persists the SECURITY-REVIEW-{id}.md
+    artifact (or a synthesized fallback) to ``stable_project_dir`` so
+    operators can audit findings after the worktree is removed
+    (task 2447 — the recurring 2412 regression).
+
+    When ``stable_project_dir`` is None or equal to ``project_dir`` the
+    single-task path is in effect and no extra copy is needed.
     """
     log(f"\n{'=' * 50}", output)
     log(f"  SECURITY REVIEW", output)
@@ -254,7 +267,118 @@ async def run_security_review(
         for err in sec_result.get("errors", []):
             log(f"    Error: {err[:200]}", output)
 
+    # Task 2447: persist the artifact to a path that SURVIVES worktree
+    # teardown. Without this, parallel-mode (task_dir = worktree)
+    # security_review_blocked runs leave NO trace of WHAT the findings
+    # were — operators see "Found N HIGH" in the log but cannot audit.
+    # The orchestrator captures the agent's result_text and synthesizes
+    # a fallback if the reviewer did not save its own file. Belt and
+    # suspenders: do this on EVERY outcome (success, failure, missing).
+    if stable_project_dir and stable_project_dir != project_dir:
+        _persist_security_review_artifact(
+            worktree_dir=project_dir,
+            stable_dir=stable_project_dir,
+            task_id=task.get("id"),
+            result_text=sec_result.get("result_text", "") if sec_result else "",
+            agent_succeeded=bool(sec_result.get("success")) if sec_result else False,
+            output=output,
+        )
+
     return sec_result
+
+
+def _persist_security_review_artifact(
+    *,
+    worktree_dir: str,
+    stable_dir: str,
+    task_id: int | None,
+    result_text: str,
+    agent_succeeded: bool,
+    output: Any = None,
+) -> None:
+    """Copy (or synthesize) SECURITY-REVIEW-{task_id}.md to ``stable_dir``.
+
+    Called from ``run_security_review`` whenever the agent's working
+    directory differs from the project's stable root (parallel/worktree
+    mode). Behavior:
+
+    * If the agent wrote a structured artifact in ``worktree_dir``,
+      copy it to ``stable_dir`` verbatim.
+    * Otherwise synthesize a fallback dump from ``result_text`` so the
+      findings text is preserved on disk for operator review. The
+      fallback is marked with ``SECURITY_REVIEW_FALLBACK_MARKER`` so
+      ``_count_findings_in_review_file`` returns None for it (the
+      fail-closed merge gate still fires).
+
+    Refuses to clobber an existing structured artifact at ``stable_dir``
+    (e.g. from a prior run). Always asserts the artifact exists at
+    ``stable_dir`` after writing — a missing-artifact verdict without
+    a persisted file is treated as an orchestrator failure and logged.
+    """
+    if not task_id:
+        return
+    filename = f"SECURITY-REVIEW-{task_id}.md"
+    src = Path(worktree_dir) / filename
+    dst = Path(stable_dir) / filename
+
+    try:
+        if src.is_file():
+            src_text = src.read_text(encoding="utf-8", errors="replace")
+            is_fallback = SECURITY_REVIEW_FALLBACK_MARKER in src_text
+            # Copy the worktree artifact to the stable path. Always
+            # overwrite — the agent's just-written artifact for THIS
+            # task supersedes any stale file at the stable path.
+            dst.write_text(src_text, encoding="utf-8")
+            kind = "fallback dump" if is_fallback else "structured artifact"
+            log(
+                f"  Persisted security-review {kind} to stable path "
+                f"{dst} (survives worktree teardown)",
+                output,
+            )
+        else:
+            # Agent did not write the artifact. Synthesize a fallback
+            # from the captured stdout so findings are not lost.
+            if dst.exists() and SECURITY_REVIEW_FALLBACK_MARKER not in (
+                dst.read_text(encoding="utf-8", errors="replace")
+            ):
+                # Stable path already has a structured artifact (prior
+                # run); do not clobber. The merge gate will see it
+                # and decide on its own.
+                log(
+                    f"  Stable path already contains a structured "
+                    f"{dst.name} — not overwriting with synthesized "
+                    f"fallback",
+                    output,
+                )
+            else:
+                _write_security_review_fallback(
+                    dst, task_id, result_text, output=output,
+                )
+                log(
+                    f"  Synthesized SECURITY-REVIEW-{task_id}.md fallback "
+                    f"at stable path {dst} from captured agent output "
+                    f"(reviewer did not save its own file; "
+                    f"agent_succeeded={agent_succeeded})",
+                    output,
+                )
+    except OSError as exc:
+        log(
+            f"  ERROR: failed to persist security-review artifact to "
+            f"stable path {dst}: {exc}",
+            output,
+        )
+        return
+
+    # Assert the artifact exists at the stable path after persistence.
+    # A gating verdict (block) with no persisted artifact must be
+    # impossible — this is the explicit task 2447 invariant.
+    if not dst.exists():
+        log(
+            f"  CRITICAL: security-review artifact still missing at "
+            f"{dst} after persistence attempt — operator must "
+            f"investigate (orchestrator/reviewer failure).",
+            output,
+        )
 
 
 # Matches finding section headers in SECURITY-REVIEW-NNNN.md files. The

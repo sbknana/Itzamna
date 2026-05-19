@@ -1579,13 +1579,43 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
                     # independently of artifact state.
                     try:
                         await run_security_review(
-                            task, task_dir, project_context, args, output=output,
+                            task, task_dir, project_context, args,
+                            output=output,
+                            # Task 2447: persist the artifact to the
+                            # REAL project root so it survives worktree
+                            # teardown. project_dir is the shared
+                            # stable root; task_dir is the per-task
+                            # worktree (or project_dir when worktrees
+                            # are disabled, in which case the helper
+                            # short-circuits).
+                            stable_project_dir=project_dir,
                         )
                     except Exception:  # pragma: no cover - defensive
                         review_crashed = True
                         logger.exception(
                             "[Task #%s] security review crashed", task["id"],
                         )
+                        # Task 2447: even on a reviewer crash, persist
+                        # whatever we have (probably nothing) to the
+                        # stable path so the missing-artifact path is
+                        # auditable rather than invisible.
+                        try:
+                            from equipa.loops import (
+                                _persist_security_review_artifact,
+                            )
+                            _persist_security_review_artifact(
+                                worktree_dir=task_dir,
+                                stable_dir=project_dir,
+                                task_id=task["id"],
+                                result_text="",
+                                agent_succeeded=False,
+                                output=output,
+                            )
+                        except Exception:  # pragma: no cover
+                            logger.exception(
+                                "[Task #%s] failed to persist post-crash "
+                                "security-review artifact", task["id"],
+                            )
                 if review_skipped_doc_only:
                     # Doc-only short-circuit: no artifact expected, so
                     # skip the artifact-required check (an absent
@@ -1599,9 +1629,14 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
                         _config_for_flag,
                         "security_review_block_on_missing_artifact",
                     )
+                    # Task 2447: read from the STABLE project root, not
+                    # the worktree. The orchestrator just persisted the
+                    # artifact there (or a fallback) — that is the path
+                    # operators audit, so the gate must read from the
+                    # same path.
                     review_blocks_merge, review_counts = (
                         _security_review_blocks_merge(
-                            task_dir, task["id"],
+                            project_dir, task["id"],
                             block_on_missing=_block_on_missing,
                         )
                     )
