@@ -35,6 +35,7 @@ from equipa.db import record_agent_run, update_task_status
 from equipa.config import is_security_review_enabled
 from equipa.dispatch import (
     _build_dispatch_attempt_reflection,
+    _security_review_blocks_merge,
     apply_dispatch_filters,
     cleanup_failed_attempt,
     is_feature_enabled,
@@ -1060,19 +1061,17 @@ async def run_mode_task(args: argparse.Namespace) -> None:
                 task["id"], project_dir, attempt_reflections,
             )
 
-        # Post-task telemetry (DB update, ForgeSmith recording, quality scoring, reflexion, MemRL)
-        task_role = task.get("role") or "developer"
-        await _post_task_telemetry(
-            task, result, outcome, role=task_role,
-            model=get_role_model(task_role, args, task=task),
-            max_turns=get_role_turns(task_role, args, task=task),
-            cycle_number=cycles,
-            dispatch_config=getattr(args, "dispatch_config", None))
-
-        # Optional security review after successful dev-test. Enablement
-        # precedence (CLI flag > dispatch_config top-level > features kill-switch)
-        # lives in equipa.config.is_security_review_enabled — shared with
-        # the parallel-mode path in equipa.dispatch (bug 2321 S3 follow-up).
+        # Optional security review after successful dev-test. Must run
+        # BEFORE _post_task_telemetry so that CRITICAL/HIGH findings can
+        # demote the outcome to ``security_review_blocked`` and prevent
+        # the task from being marked done (parity with parallel-mode in
+        # equipa.dispatch.run_parallel_tasks). Bug 2448: single-task mode
+        # used to call run_security_review here and ignore the result,
+        # so the merge gate was silently bypassed in single-task mode
+        # (concretely task #2382 on 2026-05-19: 4 HIGH findings reported
+        # but the task was marked SUCCESS and merged to master).
+        review_blocks_merge = False
+        review_counts: dict | None = None
         if (
             is_security_review_enabled(args)
             and outcome in ("tests_passed", "no_tests")
@@ -1086,14 +1085,90 @@ async def run_mode_task(args: argparse.Namespace) -> None:
             changed_files = await get_changed_files_for_branch(
                 project_dir, base_ref="master",
             )
-            if is_doc_only_diff(changed_files):
+            review_skipped_doc_only = is_doc_only_diff(changed_files)
+            review_crashed = False
+            if review_skipped_doc_only:
                 print(
                     f"  [Task #{task['id']}] SECURITY GATE: skipping "
                     f"review — doc-only change "
                     f"({len(changed_files)} file(s), all docs)."
                 )
             else:
-                await run_security_review(task, project_dir, project_context, args)
+                # Task 2341 S2 parity: if run_security_review raises, the
+                # artifact check alone is not enough — a stale review
+                # file from a prior run could exist and silently
+                # re-authorise. Treat a crashed reviewer as fail-closed
+                # regardless of artifact state.
+                try:
+                    await run_security_review(
+                        task, project_dir, project_context, args,
+                    )
+                except Exception:  # pragma: no cover - defensive
+                    review_crashed = True
+                    import logging
+                    logging.getLogger(__name__).exception(
+                        "[Task #%s] security review crashed", task["id"],
+                    )
+            if review_skipped_doc_only:
+                # Doc-only short-circuit: no artifact expected, do not
+                # let the missing-artifact fail-closed path block the
+                # merge here.
+                review_blocks_merge = False
+                review_counts = None
+            else:
+                _config_for_flag = (
+                    getattr(args, "dispatch_config", None) or {}
+                )
+                _block_on_missing = is_feature_enabled(
+                    _config_for_flag,
+                    "security_review_block_on_missing_artifact",
+                )
+                review_blocks_merge, review_counts = (
+                    _security_review_blocks_merge(
+                        project_dir, task["id"],
+                        block_on_missing=_block_on_missing,
+                    )
+                )
+            if review_crashed:
+                review_blocks_merge = True
+                print(
+                    f"  [Task #{task['id']}] SECURITY GATE: blocking "
+                    f"merge — security review crashed; branch "
+                    f"forge-task-{task['id']} left unmerged for "
+                    f"operator review."
+                )
+                outcome = "security_review_blocked"
+            elif review_blocks_merge:
+                if review_counts is None:
+                    print(
+                        f"  [Task #{task['id']}] SECURITY GATE: blocking "
+                        f"merge — SECURITY-REVIEW-{task['id']}.md "
+                        f"artifact is missing (fail-closed). Branch "
+                        f"forge-task-{task['id']} left unmerged for "
+                        f"operator review."
+                    )
+                else:
+                    print(
+                        f"  [Task #{task['id']}] SECURITY GATE: blocking "
+                        f"merge — {review_counts.get('CRITICAL', 0)} "
+                        f"CRITICAL, {review_counts.get('HIGH', 0)} "
+                        f"HIGH finding(s). Branch forge-task-"
+                        f"{task['id']} left unmerged for operator "
+                        f"review."
+                    )
+                outcome = "security_review_blocked"
+
+        # Post-task telemetry (DB update, ForgeSmith recording, quality
+        # scoring, reflexion, MemRL). Runs AFTER the security gate so a
+        # ``security_review_blocked`` outcome is persisted to the task
+        # row (rather than ``tests_passed``).
+        task_role = task.get("role") or "developer"
+        await _post_task_telemetry(
+            task, result, outcome, role=task_role,
+            model=get_role_model(task_role, args, task=task),
+            max_turns=get_role_turns(task_role, args, task=task),
+            cycle_number=cycles,
+            dispatch_config=getattr(args, "dispatch_config", None))
 
         # Verify the task status in TheForge
         verified, verify_msg = verify_task_updated(task["id"])

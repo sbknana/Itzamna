@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from equipa.dispatch import _security_review_blocks_merge
+from equipa.loops import SECURITY_REVIEW_FALLBACK_MARKER
 
 
 def _write_review(project_dir: Path, task_id: int, body: str) -> Path:
@@ -35,8 +36,8 @@ def test_single_task_devtest_blocks_merge_on_high(tmp_path: Path) -> None:
         tmp_path,
         task_id,
         "# Security Review\n\n"
-        "## Summary\n0 CRITICAL / 1 HIGH / 0 MEDIUM\n\n"
-        "## Findings\n- H1 HIGH: trust boundary bypass\n",
+        "## Findings\n\n"
+        "### [S1] HIGH — Trust boundary bypass\n\nDetails...\n",
     )
     blocks, counts = _security_review_blocks_merge(
         tmp_path, task_id, block_on_missing=True
@@ -52,8 +53,8 @@ def test_single_task_devtest_blocks_merge_on_critical(tmp_path: Path) -> None:
         tmp_path,
         task_id,
         "# Security Review\n\n"
-        "## Summary\n1 CRITICAL / 0 HIGH / 0 MEDIUM\n\n"
-        "## Findings\n- C1 CRITICAL: remote code execution\n",
+        "## Findings\n\n"
+        "### [C1] CRITICAL — Remote code execution\n\nDetails...\n",
     )
     blocks, counts = _security_review_blocks_merge(
         tmp_path, task_id, block_on_missing=True
@@ -69,8 +70,9 @@ def test_single_task_devtest_merges_on_clean_review(tmp_path: Path) -> None:
         tmp_path,
         task_id,
         "# Security Review\n\n"
-        "## Summary\n0 CRITICAL / 0 HIGH / 2 MEDIUM\n\n"
-        "## Findings\n- M1 MEDIUM: minor input validation gap\n",
+        "## Findings\n\n"
+        "### [M1] MEDIUM — Minor input validation gap\n\nDetails...\n"
+        "### [L1] LOW — Cosmetic\n",
     )
     blocks, counts = _security_review_blocks_merge(
         tmp_path, task_id, block_on_missing=True
@@ -96,3 +98,23 @@ def test_single_task_devtest_missing_artifact_flag_off_allows_merge(
         tmp_path, task_id, block_on_missing=False
     )
     assert blocks is False
+
+
+def test_single_task_devtest_fallback_dump_treated_as_missing(
+    tmp_path: Path,
+) -> None:
+    """An orchestrator-saved fallback dump must be treated as a missing artifact
+    so the fail-closed gate still fires (parity with parallel mode / task 2412).
+    """
+    task_id = 99006
+    _write_review(
+        tmp_path,
+        task_id,
+        f"# SECURITY-REVIEW fallback\n{SECURITY_REVIEW_FALLBACK_MARKER}\n\n"
+        "raw agent output\n",
+    )
+    blocks, counts = _security_review_blocks_merge(
+        tmp_path, task_id, block_on_missing=True,
+    )
+    assert blocks is True
+    assert counts is None
