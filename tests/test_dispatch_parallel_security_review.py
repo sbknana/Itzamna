@@ -217,8 +217,17 @@ def _patch_parallel_mode(
         )
 
     async def fake_security_review(task, project_dir, project_context, args,
-                                   output=None):
+                                   output=None, stable_project_dir=None):
         review_writer(Path(project_dir), task["id"])
+        # Task 2447: the real run_security_review also persists the
+        # artifact to stable_project_dir. Mirror that here so the
+        # merge gate (which now reads from stable_project_dir) sees
+        # the same artifact the agent wrote.
+        if stable_project_dir and stable_project_dir != project_dir:
+            src = Path(project_dir) / f"SECURITY-REVIEW-{task['id']}.md"
+            if src.is_file():
+                dst = Path(stable_project_dir) / f"SECURITY-REVIEW-{task['id']}.md"
+                dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
         return {"success": True, "duration": 0.0, "result_text": ""}
 
     async def fake_create_worktrees(tasks, project_dir, worktree_base):
@@ -412,8 +421,13 @@ async def test_parallel_mode_review_uses_count_from_artifact(tmp_path):
         )
 
     async def chatty_review(task, project_dir, project_context, args,
-                            output=None):
+                            output=None, stable_project_dir=None):
         writer(Path(project_dir), task["id"])
+        if stable_project_dir and stable_project_dir != project_dir:
+            src = Path(project_dir) / f"SECURITY-REVIEW-{task['id']}.md"
+            if src.is_file():
+                dst = Path(stable_project_dir) / f"SECURITY-REVIEW-{task['id']}.md"
+                dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
         # The stdout text mentions CRITICAL/HIGH but those are prose.
         return {
             "success": True,
@@ -542,7 +556,7 @@ async def test_review_crash_blocks_merge(tmp_path):
         _write_review(task_dir / f"SECURITY-REVIEW-{task_id}.md")
 
     async def crashing_review(task, project_dir, project_context, args,
-                              output=None):
+                              output=None, stable_project_dir=None):
         writer(Path(project_dir), task["id"])
         raise RuntimeError("network outage during review")
 
@@ -631,7 +645,7 @@ async def test_review_crash_logs_traceback(tmp_path, caplog):
         return None
 
     async def crashing_review(task, project_dir, project_context, args,
-                              output=None):
+                              output=None, stable_project_dir=None):
         raise RuntimeError("boom")
 
     patches, merge_calls = _patch_parallel_mode(tmp_path, review_writer=writer)
