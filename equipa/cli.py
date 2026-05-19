@@ -35,6 +35,7 @@ from equipa.db import record_agent_run, update_task_status
 from equipa.config import is_security_review_enabled
 from equipa.dispatch import (
     _build_dispatch_attempt_reflection,
+    _merge_task_branch,
     _security_review_blocks_merge,
     apply_dispatch_filters,
     cleanup_failed_attempt,
@@ -303,6 +304,67 @@ async def _post_task_telemetry(
     # Record model outcome for circuit breaker (cost routing)
     success = outcome in ("tests_passed", "no_tests")
     record_model_outcome(model, success)
+
+
+def _gated_post_merge(
+    *,
+    repo: str | os.PathLike,
+    branch: str,
+    outcome: str,
+    review_blocks_merge: bool,
+    task_id: int | None = None,
+) -> str:
+    """Unified post-loop gated merge for single-task ``--dev-test`` mode.
+
+    Bug #2450: before this helper existed, single-task ``--dev-test`` mode's
+    worktree-branch merge happened inside ``run_dev_test_loop`` BEFORE the
+    security gate was evaluated. The gate could mark a task as
+    ``security_review_blocked`` in TheForge while its commits were already on
+    master — a fail-open gate. This helper couples the gate decision and the
+    git-merge in ONE place that callers invoke AFTER the gate runs, mirroring
+    the parallel-mode contract in ``equipa.dispatch.run_parallel_tasks``.
+
+    Args:
+        repo: Project directory containing the git repo (master + the task
+            branch).
+        branch: Name of the task branch to (maybe) merge — typically
+            ``forge-task-<id>``.
+        outcome: The dev-test outcome AFTER the security gate has run. Values
+            ``tests_passed`` and ``no_tests`` are merge-eligible; anything
+            else (e.g. ``security_review_blocked``, ``tests_failed``) is not.
+        review_blocks_merge: Truthy iff the security gate decided this task
+            must NOT merge (CRITICAL/HIGH finding, crashed reviewer, missing
+            artifact under fail-closed policy).
+        task_id: Optional explicit task id. When ``None``, parsed from
+            ``branch`` (the ``forge-task-<id>`` convention).
+
+    Returns:
+        - ``"blocked"`` — gate fired; branch left unmerged and intact.
+        - ``"merged"`` — branch successfully merged into master.
+        - ``"merge_failed"`` — gate passed but ``_merge_task_branch`` reported
+          failure (conflict, no commits ahead, etc.). Branch preserved.
+        - ``"skipped"`` — outcome was not merge-eligible (e.g. tests failed
+          before the gate even ran); no merge attempted.
+    """
+    project_dir = os.fspath(repo)
+
+    if review_blocks_merge or outcome == "security_review_blocked":
+        return "blocked"
+
+    if outcome not in ("tests_passed", "no_tests"):
+        return "skipped"
+
+    if task_id is None:
+        try:
+            task_id = int(branch.rsplit("-", 1)[-1])
+        except (ValueError, IndexError) as e:
+            raise ValueError(
+                f"_gated_post_merge: cannot infer task_id from branch "
+                f"{branch!r}; pass task_id= explicitly"
+            ) from e
+
+    merged = asyncio.run(_merge_task_branch(project_dir, task_id, branch))
+    return "merged" if merged else "merge_failed"
 
 
 # --- Template subcommand (PLAN-1067 §3.C3) ---
@@ -1157,6 +1219,40 @@ async def run_mode_task(args: argparse.Namespace) -> None:
                         f"review."
                     )
                 outcome = "security_review_blocked"
+
+        # Bug #2450: unified gated post-merge. Single-task ``--dev-test`` mode
+        # now performs the worktree-branch merge here, AFTER the security gate
+        # has run, via the same ``_merge_task_branch`` helper that parallel
+        # mode uses (equipa.dispatch.run_parallel_tasks). If the gate blocked
+        # (``review_blocks_merge`` truthy OR outcome demoted to
+        # ``security_review_blocked``), no merge is attempted and the branch
+        # is left intact for operator review. This couples the DB-gate and
+        # the git-merge that were previously decoupled (task 2449 proof:
+        # outcome=security_review_blocked but commits on master, branch gone).
+        if args.dev_test:
+            merge_branch = f"forge-task-{task['id']}"
+            merge_result = _gated_post_merge(
+                repo=project_dir,
+                branch=merge_branch,
+                outcome=outcome,
+                review_blocks_merge=review_blocks_merge,
+                task_id=task["id"],
+            )
+            if merge_result == "merged":
+                print(
+                    f"  [Task #{task['id']}] MERGE: branch {merge_branch} "
+                    f"merged to master via gated post-merge."
+                )
+            elif merge_result == "merge_failed":
+                print(
+                    f"  [Task #{task['id']}] MERGE: gated post-merge failed "
+                    f"for {merge_branch}; branch preserved for operator."
+                )
+            elif merge_result == "blocked":
+                print(
+                    f"  [Task #{task['id']}] MERGE: skipped — security gate "
+                    f"blocked merge of {merge_branch}."
+                )
 
         # Post-task telemetry (DB update, ForgeSmith recording, quality
         # scoring, reflexion, MemRL). Runs AFTER the security gate so a
