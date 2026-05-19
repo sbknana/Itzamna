@@ -714,6 +714,21 @@ def _check_git_commit_substitution(
     # patterns (`2>&1`, trailing `| tail/head/cat/wc/grep ...`) first — bug
     # 2214: these are legitimate shell composition for capturing git output.
     if remainder.strip():
+        # Per-segment evaluation (bug 2446, follow-up to 2316): a trailing
+        # ``&& <cmd>`` is legitimate shell sequencing, not injection. Strip
+        # the leading ``&&`` and re-validate the trailing segment through
+        # the full bash security pipeline — every check (including check 12
+        # again if it's another git commit) runs against the trailing
+        # command on its own merits. If the trailing segment is safe, the
+        # whole chain is safe. Note: ``;`` and ``|`` stay blocked here
+        # because they are higher-risk (``;`` is the classic injection
+        # operator; ``|`` exfiltrates stdout to the next command).
+        and_chain = re.match(r"\A\s*&&\s+(.+)\Z", remainder, re.DOTALL)
+        if and_chain:
+            trailing = and_chain.group(1).strip()
+            if trailing:
+                return check_bash_command(trailing)
+
         unquoted_rem = _extract_unquoted(remainder)
         unquoted_rem = _strip_benign_commit_remainder(unquoted_rem)
         if re.search(r"[;|&()`]|\$\(|\$\{", unquoted_rem):

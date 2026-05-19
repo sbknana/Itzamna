@@ -809,17 +809,83 @@ class TestGitCommitSubstitution:
             f"{result.message}"
         )
 
-    def test_commit_with_and_operator_still_blocked(self) -> None:
-        """Whitelist must NOT allow `&&` chained payloads."""
-        result = check_bash_command('git commit -m "msg" && rm -rf /')
-        assert not result.safe
-        assert result.check_id == CheckID.GIT_COMMIT_SUBSTITUTION
-
-    def test_commit_with_empty_m_and_chained_payload_still_blocked(self) -> None:
-        """Single empty -m followed by && evil — empty-m allowlist requires
-        the empty -m be sandwiched between non-empty -m args.
+    def test_check12_allows_git_commit_with_singlequoted_cat_heredoc(self) -> None:
+        """Bug 2446 regression: ``git commit -m "$(cat <<'EOF' ... EOF)"``
+        is the canonical Claude Code multi-line commit pattern and MUST
+        pass check 12 — the single-quoted heredoc delimiter suppresses all
+        expansion, so ``cat`` only emits literal text.
         """
-        result = check_bash_command('git commit -m "" && evil')
+        cmd = (
+            "git commit -m \"$(cat <<'EOF'\n"
+            "fix(bashsec): per-segment validation for && chains (T2446)\n"
+            "\n"
+            "Co-Authored-By: Claude <noreply@anthropic.com>\n"
+            "EOF\n"
+            ")\""
+        )
+        result = check_bash_command(cmd)
+        assert result.safe, (
+            f"Single-quoted cat heredoc blocked by check {result.check_id}: "
+            f"{result.message}"
+        )
+
+    def test_check12_allows_git_commit_then_ampersand_chain(self) -> None:
+        """Bug 2446 regression: ``git commit -m "msg" && <safe cmd>`` is
+        legitimate shell sequencing, not injection. Check 12 must allow
+        it after re-validating the trailing command per-segment.
+        """
+        result = check_bash_command(
+            'git commit -m "fix: thing" && timeout 90 npm test'
+        )
+        assert result.safe, (
+            f"Benign && chain blocked by check {result.check_id}: "
+            f"{result.message}"
+        )
+
+    def test_check12_allows_git_commit_then_ampersand_git_push(self) -> None:
+        """Bug 2446: the agent's typical pattern is
+        ``git commit -m "..." && git push`` — must pass.
+        """
+        result = check_bash_command(
+            'git commit -m "feat: ship it" && git push origin HEAD'
+        )
+        assert result.safe, (
+            f"commit && git push blocked by check {result.check_id}: "
+            f"{result.message}"
+        )
+
+    def test_check12_ampersand_chain_revalidates_trailing_command(self) -> None:
+        """Bug 2446: per-segment evaluation means the trailing command
+        must still pass bash_security on its own. A chain to a command
+        that the trailing-segment checks reject must propagate that
+        rejection (i.e., we do NOT blanket-allow everything after ``&&``).
+        """
+        # ``$IFS`` in the trailing segment trips the IFS injection check.
+        result = check_bash_command(
+            'git commit -m "msg" && echo $IFS'
+        )
+        assert not result.safe
+        assert result.check_id == CheckID.IFS_INJECTION
+
+    def test_check12_still_blocks_real_injection_after_dash_m(self) -> None:
+        """Bug 2446 regression: ``;`` is the classic injection operator
+        and MUST stay blocked even though ``&&`` is now allowed. The
+        per-segment relaxation is for shell sequencing only, not for
+        every shell metacharacter.
+        """
+        result = check_bash_command('git commit -m "x" ; rm -rf /')
+        assert not result.safe
+
+    def test_commit_with_empty_m_and_semicolon_payload_still_blocked(self) -> None:
+        """Single empty -m followed by ``;`` injection must stay blocked.
+
+        Bug 2446 relaxed ``&&`` (legitimate sequencing) but ``;`` remains a
+        classic injection operator and is NOT allowed via per-segment
+        revalidation. The empty-m allowlist also requires the empty -m be
+        sandwiched between non-empty -m args, so this command does not
+        qualify as benign multi-paragraph syntax either.
+        """
+        result = check_bash_command('git commit -m "" ; evil')
         assert not result.safe
 
     def test_commit_pipe_to_non_whitelisted_command_blocked(self) -> None:
@@ -1365,8 +1431,12 @@ class TestMultiLineCommitRegression:
         assert not result.safe
         assert result.check_id == CheckID.HEREDOC_IN_SUBSTITUTION
 
-    def test_malicious_chain_after_commit_still_blocked(self) -> None:
-        result = check_bash_command('git commit -m "msg" && rm -rf ~/.bashrc')
+    def test_malicious_semicolon_chain_after_commit_still_blocked(self) -> None:
+        """Bug 2446 policy: ``;`` injection after ``git commit -m`` stays
+        blocked. (``&&`` is now treated as legitimate sequencing — see
+        ``test_check12_allows_git_commit_then_ampersand_chain``.)
+        """
+        result = check_bash_command('git commit -m "msg" ; rm -rf ~/.bashrc')
         assert not result.safe
 
     def test_plain_dollar_paren_substitution_still_blocked(self) -> None:
