@@ -19,11 +19,26 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+def _gate_audit_log(message: str) -> None:
+    """Emit a ``[GATE-AUDIT]`` log line when EQUIPA_GATE_AUDIT_LOG=1.
+
+    Task #2451: a single grep-able prefix lets operators reconstruct the
+    sequence of merge-gate decisions from a dispatch run. The env var
+    defaults to enabled — set EQUIPA_GATE_AUDIT_LOG=0 to silence.
+    """
+    if os.environ.get("EQUIPA_GATE_AUDIT_LOG", "1") == "0":
+        return
+    line = f"[GATE-AUDIT] {message}"
+    logger.info(line)
+    print(line)
 
 from equipa.config import (
     DEFAULT_DISPATCH_CONFIG,
@@ -1124,9 +1139,32 @@ async def _merge_task_branch(project_dir: str, task_id: int, branch_name: str) -
     All failures are logged to stdout — the function NEVER swallows errors
     silently. On any failure path, the branch is preserved (not deleted).
 
+    Defensive invariant (task #2451): before issuing ``git merge``, re-read
+    SECURITY-REVIEW-{task_id}.md from ``project_dir`` and raise
+    :class:`SecurityGateBypassError` if it reports a HIGH or CRITICAL
+    finding. This makes it impossible to reach ``git merge`` past a
+    known-blocking review even if a caller forgets the gate.
+
     Uses ``git_run_async`` so the 6-12 git invocations per merge do not
     block the event loop.
     """
+    from equipa.security_gate import SecurityGateBypassError
+
+    review_path = Path(os.fspath(project_dir)) / f"SECURITY-REVIEW-{task_id}.md"
+    counts = _count_findings_in_review_file(review_path)
+    if counts is not None and (
+        counts.get("CRITICAL", 0) > 0 or counts.get("HIGH", 0) > 0
+    ):
+        _gate_audit_log(
+            f"task={task_id} event=defensive-invariant-fired "
+            f"artifact={review_path.name} counts={counts!r}"
+        )
+        raise SecurityGateBypassError(
+            f"Refusing to merge branch {branch_name!r}: "
+            f"SECURITY-REVIEW-{task_id}.md reports "
+            f"{counts.get('CRITICAL', 0)} CRITICAL, "
+            f"{counts.get('HIGH', 0)} HIGH finding(s)."
+        )
     try:
         current = await git_run_async(
             ["branch", "--show-current"], project_dir, timeout=10,
@@ -1382,6 +1420,57 @@ def _security_review_blocks_merge(
         return False, None
     blocks = counts.get("CRITICAL", 0) > 0 or counts.get("HIGH", 0) > 0
     return blocks, counts
+
+
+async def _gated_merge_task(
+    *,
+    repo: str | os.PathLike,
+    branch: str,
+    outcome: str,
+    task_id: int,
+    project_context: dict | None = None,
+) -> str:
+    """Unified, gated merge entry point used by BOTH dispatch modes.
+
+    Task #2451: single-task ``--dev-test`` (``cli.run_mode_task``) and
+    parallel ``--tasks`` (``run_parallel_tasks``) both funnel through
+    this helper so the security gate cannot be bypassed by either path.
+
+    Returns one of:
+      * ``"skipped"``  — outcome is not merge-eligible (e.g. tests failed).
+      * ``"blocked"``  — gate fired; branch left intact, no merge attempted.
+      * ``"merged"``   — branch merged into master, HEAD advanced.
+      * ``"merge_failed"`` — gate passed but ``_merge_task_branch`` returned
+        False (conflict, no commits ahead, etc.). Branch preserved.
+    """
+    project_dir = os.fspath(repo)
+
+    if outcome not in ("tests_passed", "no_tests"):
+        _gate_audit_log(
+            f"task={task_id} event=merge-skipped reason=outcome-not-eligible "
+            f"outcome={outcome}"
+        )
+        return "skipped"
+
+    blocks, counts = _security_review_blocks_merge(
+        project_dir, task_id, block_on_missing=True,
+    )
+    if blocks:
+        _gate_audit_log(
+            f"task={task_id} event=merge-skipped "
+            f"reason=security-review-blocked counts={counts!r}"
+        )
+        return "blocked"
+
+    _gate_audit_log(
+        f"task={task_id} event=merge-attempt branch={branch} counts={counts!r}"
+    )
+    merged = await _merge_task_branch(project_dir, task_id, branch)
+    if merged:
+        _gate_audit_log(f"task={task_id} event=merge-succeeded branch={branch}")
+        return "merged"
+    _gate_audit_log(f"task={task_id} event=merge-failed branch={branch}")
+    return "merge_failed"
 
 
 async def run_parallel_tasks(task_ids: list[int], args) -> None:
@@ -1776,34 +1865,36 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
         print(f"Cost: ${total_cost:.4f}")
     print(f"{'#' * 60}")
 
-    # Sequential merge — merge task branches one at a time to avoid conflicts
+    # Sequential merge — task #2451 unified gate. All merge decisions
+    # now flow through `_gated_merge_task`, which re-runs the
+    # security-review check and the defensive invariant inside
+    # `_merge_task_branch`. This replaces the older filter-then-merge
+    # loop that could miss a blocked task whose outcome was mutated
+    # back to tests_passed.
     merged_tasks_seq: set[int] = set()
     if use_worktrees:
-        merge_candidates = []
         for r in results:
             if isinstance(r, Exception):
                 continue
-            # Bug 2321: skip merge candidates that the security review gated.
-            # needs_merge already encodes review_blocks_merge, but the fallback
-            # outcome check below would otherwise reinstate a blocked task.
-            if r.get("review_blocks_merge", False):
-                continue
-            if r.get("needs_merge", False) or (
-                r["task"]["id"] in worktree_dirs
-                and r["outcome"] in ("tests_passed", "no_tests")
-            ):
-                merge_candidates.append(r)
-
-        for r in merge_candidates:
             task_id = r["task"]["id"]
+            if task_id not in worktree_dirs:
+                continue
             branch_name = f"forge-task-{task_id}"
-            # Each merge issues 6-12 git invocations; the helper is now
-            # natively async (uses git_run_async) so the event loop stays
-            # responsive for any background work draining post-gather.
-            merge_ok = await _merge_task_branch(
-                project_dir, task_id, branch_name,
-            )
-            if merge_ok:
+            try:
+                merge_status = await _gated_merge_task(
+                    repo=project_dir,
+                    branch=branch_name,
+                    outcome=r["outcome"],
+                    task_id=task_id,
+                    project_context=project_context,
+                )
+            except Exception:  # pragma: no cover - defensive
+                logger.exception(
+                    "[GATE-AUDIT] task=%s event=gated-merge-errored",
+                    task_id,
+                )
+                continue
+            if merge_status == "merged":
                 r["merge_ok"] = True
                 merged_tasks_seq.add(task_id)
 
