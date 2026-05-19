@@ -346,13 +346,16 @@ async def _gated_post_merge(
         - ``"skipped"`` — outcome was not merge-eligible (e.g. tests failed
           before the gate even ran); no merge attempted.
     """
+    from equipa.dispatch import _gated_merge_task
+
     project_dir = os.fspath(repo)
 
+    # Honour the caller's gate decision first — covers the cases where
+    # the gate fired because of a crashed reviewer, missing artifact under
+    # fail-closed, or a doc-only short-circuit that the file-based gate
+    # cannot re-derive from disk.
     if review_blocks_merge or outcome == "security_review_blocked":
         return "blocked"
-
-    if outcome not in ("tests_passed", "no_tests"):
-        return "skipped"
 
     if task_id is None:
         try:
@@ -363,8 +366,15 @@ async def _gated_post_merge(
                 f"{branch!r}; pass task_id= explicitly"
             ) from e
 
-    merged = await _merge_task_branch(project_dir, task_id, branch)
-    return "merged" if merged else "merge_failed"
+    # Delegate to the unified helper so both dispatch modes share one
+    # code path. The helper re-evaluates the artifact gate and triggers
+    # the defensive invariant inside ``_merge_task_branch``.
+    return await _gated_merge_task(
+        repo=project_dir,
+        branch=branch,
+        outcome=outcome,
+        task_id=task_id,
+    )
 
 
 # --- Template subcommand (PLAN-1067 §3.C3) ---

@@ -7,6 +7,7 @@ of dispatch mode (single-task or parallel).
 
 from __future__ import annotations
 
+import asyncio
 import os
 import subprocess
 from pathlib import Path
@@ -70,13 +71,13 @@ def test_single_task_path_blocks_high(gated_repo, monkeypatch):
     _write_review(repo, 9999, "HIGH")
     monkeypatch.setenv("EQUIPA_GATE_AUDIT_LOG", "1")
 
-    result = dispatch._gated_merge_task(
-        repo=repo,
+    result = asyncio.run(dispatch._gated_merge_task(
+        repo=str(repo),
         branch="forge-task-9999",
         outcome="tests_passed",
         task_id=9999,
         project_context={"id": 23},
-    )
+    ))
 
     assert result == "blocked"
     assert _git(repo, "rev-parse", "HEAD") == master_head
@@ -92,13 +93,13 @@ def test_parallel_path_blocks_critical(gated_repo, monkeypatch):
     _write_review(repo, 9999, "CRITICAL")
     monkeypatch.setenv("EQUIPA_GATE_AUDIT_LOG", "1")
 
-    result = dispatch._gated_merge_task(
-        repo=repo,
+    result = asyncio.run(dispatch._gated_merge_task(
+        repo=str(repo),
         branch="forge-task-9999",
         outcome="tests_passed",
         task_id=9999,
         project_context={"id": 23},
-    )
+    ))
 
     assert result == "blocked"
     assert _git(repo, "rev-parse", "HEAD") == master_head
@@ -114,7 +115,9 @@ def test_defensive_invariant_raises(gated_repo, monkeypatch):
     monkeypatch.setenv("EQUIPA_GATE_AUDIT_LOG", "1")
 
     with pytest.raises(SecurityGateBypassError):
-        dispatch._merge_task_branch(repo, 9999, "forge-task-9999")
+        asyncio.run(
+            dispatch._merge_task_branch(str(repo), 9999, "forge-task-9999")
+        )
 
     assert _git(repo, "rev-parse", "HEAD") == master_head
 
@@ -130,14 +133,34 @@ def test_happy_path_merges_when_clean(gated_repo, monkeypatch):
     )
     monkeypatch.setenv("EQUIPA_GATE_AUDIT_LOG", "1")
 
-    result = dispatch._gated_merge_task(
-        repo=repo,
+    result = asyncio.run(dispatch._gated_merge_task(
+        repo=str(repo),
         branch="forge-task-9999",
         outcome="tests_passed",
         task_id=9999,
         project_context={"id": 23},
-    )
+    ))
 
     assert result == "merged"
     new_head = _git(repo, "rev-parse", "HEAD")
     assert new_head != master_head
+
+
+def test_outcome_not_eligible_skipped(gated_repo, monkeypatch):
+    from equipa import dispatch
+
+    repo = gated_repo["repo"]
+    master_head = gated_repo["master_head"]
+    _write_review(repo, 9999, "HIGH")
+    monkeypatch.setenv("EQUIPA_GATE_AUDIT_LOG", "1")
+
+    result = asyncio.run(dispatch._gated_merge_task(
+        repo=str(repo),
+        branch="forge-task-9999",
+        outcome="tests_failed",
+        task_id=9999,
+        project_context={"id": 23},
+    ))
+
+    assert result == "skipped"
+    assert _git(repo, "rev-parse", "HEAD") == master_head
