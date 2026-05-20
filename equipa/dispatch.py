@@ -1152,18 +1152,35 @@ async def _merge_task_branch(project_dir: str, task_id: int, branch_name: str) -
 
     review_path = Path(os.fspath(project_dir)) / f"SECURITY-REVIEW-{task_id}.md"
     counts = _count_findings_in_review_file(review_path)
-    if counts is not None and (
-        counts.get("CRITICAL", 0) > 0 or counts.get("HIGH", 0) > 0
-    ):
+    if counts is None:
         _gate_audit_log(
             f"task={task_id} event=defensive-invariant-fired "
-            f"artifact={review_path.name} counts={counts!r}"
+            f"artifact={review_path.name} "
+            f"reason=artifact-unparseable-or-missing "
+            f"C=0 H=0 M=0 L=0 I=0"
+        )
+        raise SecurityGateBypassError(
+            f"Refusing to merge branch {branch_name!r}: "
+            f"SECURITY-REVIEW-{task_id}.md is missing or unparseable "
+            f"(fallback dump, or no findings table). The defensive "
+            f"invariant fails closed (task #2451) — operator must "
+            f"resolve before merge."
+        )
+    if counts.get("CRITICAL", 0) > 0 or counts.get("HIGH", 0) > 0:
+        c = counts.get("CRITICAL", 0)
+        h = counts.get("HIGH", 0)
+        m = counts.get("MEDIUM", 0)
+        low = counts.get("LOW", 0)
+        i = counts.get("INFO", 0)
+        _gate_audit_log(
+            f"task={task_id} event=defensive-invariant-fired "
+            f"artifact={review_path.name} "
+            f"C={c} H={h} M={m} L={low} I={i}"
         )
         raise SecurityGateBypassError(
             f"Refusing to merge branch {branch_name!r}: "
             f"SECURITY-REVIEW-{task_id}.md reports "
-            f"{counts.get('CRITICAL', 0)} CRITICAL, "
-            f"{counts.get('HIGH', 0)} HIGH finding(s)."
+            f"{c} CRITICAL, {h} HIGH finding(s)."
         )
     try:
         current = await git_run_async(
