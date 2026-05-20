@@ -387,9 +387,36 @@ def _persist_security_review_artifact(
 # (em-dash, en-dash, or hyphen separator). Severity is one of
 # CRITICAL/HIGH/MEDIUM/LOW/INFO. Anchoring on the bracketed tag is what makes
 # this robust against prose mentions of CRITICAL/HIGH in the surrounding text.
+# Task #2451 Phase D: loosened to match reviewer drift across formats:
+#   ### [F-01] HIGH — description
+#   ### F-01 HIGH: description
+#   ### HIGH — description
+#   ### **HIGH** — description
+# Treat any of CRITICAL/HIGH/MEDIUM/LOW/INFO appearing in the first 80
+# characters of a level-3 header line as a finding header. The previous
+# bracketed-tag-required form silently dropped to zero on format drift,
+# which made the merge gate fail-open on unparseable artifacts.
 _REVIEW_FINDING_HEADER_RE = re.compile(
-    r"^###\s+\[[^\]]+\]\s+(CRITICAL|HIGH|MEDIUM|LOW|INFO)\b",
+    r"^###[ \t][^\n]{0,80}?(?<![A-Za-z])"
+    r"(CRITICAL|HIGH|MEDIUM|LOW|INFO)(?![A-Za-z])",
     re.MULTILINE,
+)
+
+# Tamper-evident footer the security-review prompt is required to emit
+# at the end of every SECURITY-REVIEW-NNNN.md artifact. When present the
+# parser PREFERS the footer numbers over header counting, so a reviewer
+# that mis-formats individual finding headers but still emits the
+# explicit footer survives format drift. Format:
+#   ## Counts
+#   CRITICAL: 0 | HIGH: 0 | MEDIUM: 4 | LOW: 3 | INFO: 2
+_REVIEW_COUNTS_FOOTER_RE = re.compile(
+    r"^##\s+Counts\s*\n[^\n]*?"
+    r"CRITICAL\s*:\s*(\d+)[^\n]*?"
+    r"HIGH\s*:\s*(\d+)[^\n]*?"
+    r"MEDIUM\s*:\s*(\d+)[^\n]*?"
+    r"LOW\s*:\s*(\d+)[^\n]*?"
+    r"INFO\s*:\s*(\d+)",
+    re.MULTILINE | re.IGNORECASE,
 )
 
 # Sentinel marker written into orchestrator-saved fallback dumps when the
@@ -424,8 +451,24 @@ def _count_findings_in_review_file(review_path: Path) -> dict[str, int] | None:
 
     # Fallback dumps preserve raw agent output for operator review but are NOT
     # structured artifacts — the merge gate must still fail-closed on them.
-    if SECURITY_REVIEW_FALLBACK_MARKER in text:
+    # GATE-10 (task #2451 Phase G): anchor the marker check to the file head
+    # so a real review file that documents the marker string in its prose
+    # body cannot self-DoS the gate.
+    if SECURITY_REVIEW_FALLBACK_MARKER in text[:512]:
         return None
+
+    # Task #2451 Phase D: prefer the explicit Counts footer when present.
+    # A reviewer that mis-formats individual finding headers but emits the
+    # footer still produces correct counts; the footer is tamper-evident.
+    footer = _REVIEW_COUNTS_FOOTER_RE.search(text)
+    if footer is not None:
+        return {
+            "CRITICAL": int(footer.group(1)),
+            "HIGH": int(footer.group(2)),
+            "MEDIUM": int(footer.group(3)),
+            "LOW": int(footer.group(4)),
+            "INFO": int(footer.group(5)),
+        }
 
     counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
     for match in _REVIEW_FINDING_HEADER_RE.finditer(text):
