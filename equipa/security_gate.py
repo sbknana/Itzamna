@@ -22,12 +22,46 @@ policy lives here so it can be unit-tested without spinning up an agent.
 from __future__ import annotations
 
 import logging
+import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 from equipa.git_ops import git_run_async
 
 logger = logging.getLogger(__name__)
+
+
+def _gate_audit_log(message: str) -> None:
+    """Emit a ``[GATE-AUDIT]`` line when EQUIPA_GATE_AUDIT_LOG=1 (default).
+
+    Task #2451 Phase G:
+      * Lives in the leaf ``security_gate`` module so both ``dispatch`` and
+        ``cli`` can import it without a circular dependency (GATE-07).
+      * Writes ONLY to ``sys.stderr`` — the prior implementation also called
+        ``logger.info`` which double-emitted in CI capture (GATE-06).
+    """
+    if os.environ.get("EQUIPA_GATE_AUDIT_LOG", "1") == "0":
+        return
+    print(f"[GATE-AUDIT] {message}", file=sys.stderr, flush=True)
+
+
+def format_counts(counts: dict | None) -> str:
+    """Render finding counts as ``C=N H=N M=N L=N I=N`` for audit lines.
+
+    Defensive against ``None`` and missing keys — used at every audit site
+    so future refactors cannot accidentally leak ``counts!r`` repr internals
+    (GATE-09).
+    """
+    if counts is None:
+        return "C=0 H=0 M=0 L=0 I=0"
+    return (
+        f"C={counts.get('CRITICAL', 0)} "
+        f"H={counts.get('HIGH', 0)} "
+        f"M={counts.get('MEDIUM', 0)} "
+        f"L={counts.get('LOW', 0)} "
+        f"I={counts.get('INFO', 0)}"
+    )
 
 # Extensions that carry executable code or executable configuration.
 # A diff containing ANY file with one of these extensions cannot be

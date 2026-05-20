@@ -26,20 +26,6 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-
-def _gate_audit_log(message: str) -> None:
-    """Emit a ``[GATE-AUDIT]`` log line when EQUIPA_GATE_AUDIT_LOG=1.
-
-    Task #2451: a single grep-able prefix lets operators reconstruct the
-    sequence of merge-gate decisions from a dispatch run. The env var
-    defaults to enabled — set EQUIPA_GATE_AUDIT_LOG=0 to silence.
-    """
-    if os.environ.get("EQUIPA_GATE_AUDIT_LOG", "1") == "0":
-        return
-    line = f"[GATE-AUDIT] {message}"
-    logger.info(line)
-    print(line)
-
 from equipa.config import (
     DEFAULT_DISPATCH_CONFIG,
     DEFAULT_FEATURE_FLAGS,
@@ -85,6 +71,9 @@ from equipa.prompts import build_planner_prompt
 from equipa.reflexion import maybe_run_reflexion
 from equipa.roles import get_role_model, get_role_turns
 from equipa.security_gate import (
+    SecurityGateBypassError,
+    _gate_audit_log,
+    format_counts,
     get_changed_files_for_branch,
     is_doc_only_diff,
 )
@@ -1148,8 +1137,6 @@ async def _merge_task_branch(project_dir: str, task_id: int, branch_name: str) -
     Uses ``git_run_async`` so the 6-12 git invocations per merge do not
     block the event loop.
     """
-    from equipa.security_gate import SecurityGateBypassError
-
     review_path = Path(os.fspath(project_dir)) / f"SECURITY-REVIEW-{task_id}.md"
     counts = _count_findings_in_review_file(review_path)
     if counts is None:
@@ -1157,7 +1144,7 @@ async def _merge_task_branch(project_dir: str, task_id: int, branch_name: str) -
             f"task={task_id} event=defensive-invariant-fired "
             f"artifact={review_path.name} "
             f"reason=artifact-unparseable-or-missing "
-            f"C=0 H=0 M=0 L=0 I=0"
+            f"{format_counts(None)}"
         )
         raise SecurityGateBypassError(
             f"Refusing to merge branch {branch_name!r}: "
@@ -1167,20 +1154,15 @@ async def _merge_task_branch(project_dir: str, task_id: int, branch_name: str) -
             f"resolve before merge."
         )
     if counts.get("CRITICAL", 0) > 0 or counts.get("HIGH", 0) > 0:
-        c = counts.get("CRITICAL", 0)
-        h = counts.get("HIGH", 0)
-        m = counts.get("MEDIUM", 0)
-        low = counts.get("LOW", 0)
-        i = counts.get("INFO", 0)
         _gate_audit_log(
             f"task={task_id} event=defensive-invariant-fired "
-            f"artifact={review_path.name} "
-            f"C={c} H={h} M={m} L={low} I={i}"
+            f"artifact={review_path.name} {format_counts(counts)}"
         )
         raise SecurityGateBypassError(
             f"Refusing to merge branch {branch_name!r}: "
             f"SECURITY-REVIEW-{task_id}.md reports "
-            f"{c} CRITICAL, {h} HIGH finding(s)."
+            f"{counts.get('CRITICAL', 0)} CRITICAL, "
+            f"{counts.get('HIGH', 0)} HIGH finding(s)."
         )
     try:
         current = await git_run_async(
@@ -1420,8 +1402,8 @@ def _security_review_blocks_merge(
     counts = _count_findings_in_review_file(review_path)
     _gate_audit_log(
         f"task={task_id} event=blocks-merge-eval "
-        f"artifact_exists={review_path.exists()} counts={counts!r} "
-        f"block_on_missing={block_on_missing}"
+        f"artifact_exists={review_path.exists()} "
+        f"{format_counts(counts)} block_on_missing={block_on_missing}"
     )
     if counts is None:
         if block_on_missing:
@@ -1473,8 +1455,6 @@ async def _gated_merge_task(
       * ``"merge_failed"`` — gate passed but ``_merge_task_branch`` returned
         False (conflict, no commits ahead, etc.). Branch preserved.
     """
-    from equipa.security_gate import SecurityGateBypassError
-
     project_dir = os.fspath(repo)
 
     if outcome not in ("tests_passed", "no_tests"):
@@ -1497,7 +1477,7 @@ async def _gated_merge_task(
         if blocks:
             _gate_audit_log(
                 f"task={task_id} event=merge-skipped "
-                f"reason=security-review-blocked counts={counts!r}"
+                f"reason=security-review-blocked {format_counts(counts)}"
             )
             return "blocked"
 
