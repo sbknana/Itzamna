@@ -121,8 +121,21 @@ def test_single_task_critical_finding_branch_not_on_master(task_repo: tuple[Path
 
 
 def test_single_task_clean_review_branch_merged(task_repo: tuple[Path, str]) -> None:
-    """0 HIGH/CRITICAL → branch is merged to master via _merge_task_branch."""
+    """0 HIGH/CRITICAL → branch is merged to master via _merge_task_branch.
+
+    A clean SECURITY-REVIEW artifact MUST exist on disk: task #2451 made the
+    gate fail-closed on missing artifacts, so the "no artifact" path now
+    blocks. Tests asserting the merged-happy-path must provide a real
+    zero-findings artifact (Counts footer is canonical).
+    """
     repo, branch = task_repo
+    # Infer task_id from branch name (forge-task-9999 → 9999).
+    task_id = int(branch.rsplit("-", 1)[-1])
+    (repo / f"SECURITY-REVIEW-{task_id}.md").write_text(
+        "# Security Review\n\nNo blocking findings.\n\n"
+        "## Counts\n"
+        "CRITICAL: 0 | HIGH: 0 | MEDIUM: 0 | LOW: 0 | INFO: 0\n"
+    )
     result = _run_gated_merge(
         repo, branch, outcome="tests_passed", review_blocks_merge=False
     )

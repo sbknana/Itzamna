@@ -1457,18 +1457,22 @@ async def _gated_merge_task(
     """
     project_dir = os.fspath(repo)
 
+    # Caller-asserted blocks fire FIRST so an outcome already demoted to
+    # ``security_review_blocked`` is reported as blocked (the gate fired),
+    # not skipped (outcome-not-eligible). The distinction matters for the
+    # operator-facing logs and for the audit trail.
+    if review_blocks_merge is True:
+        _gate_audit_log(
+            f"task={task_id} event=merge-skipped reason=caller-gate-blocked"
+        )
+        return "blocked"
+
     if outcome not in ("tests_passed", "no_tests"):
         _gate_audit_log(
             f"task={task_id} event=merge-skipped reason=outcome-not-eligible "
             f"outcome={outcome}"
         )
         return "skipped"
-
-    if review_blocks_merge is True:
-        _gate_audit_log(
-            f"task={task_id} event=merge-skipped reason=caller-gate-blocked"
-        )
-        return "blocked"
 
     if review_blocks_merge is None:
         blocks, counts = _security_review_blocks_merge(
@@ -1910,14 +1914,15 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
                 # GATE-02 (task #2451 Phase C): missing key MUST propagate
                 # as None so the unified gate re-reads the on-disk artifact
                 # instead of trusting an absent caller decision as False.
-                _caller_block = r.get("review_blocks_merge")
+                # An explicit False (e.g. doc-only short-circuit) IS still
+                # honoured because the producer site sets it deliberately.
                 merge_status = await _gated_merge_task(
                     repo=project_dir,
                     branch=branch_name,
                     outcome=r["outcome"],
                     task_id=task_id,
                     project_context=project_context,
-                    review_blocks_merge=(True if _caller_block else None),
+                    review_blocks_merge=r.get("review_blocks_merge"),
                 )
             except Exception:  # pragma: no cover - defensive
                 logger.exception(

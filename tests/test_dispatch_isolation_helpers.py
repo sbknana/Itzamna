@@ -114,6 +114,20 @@ def test_create_isolation_worktrees_error_path_logs_warning(tmp_path, capsys):
 # --- _merge_task_branch ---
 
 
+def _write_clean_review(repo, task_id):
+    """Write a no-findings SECURITY-REVIEW-{task_id}.md.
+
+    Required by the task #2451 defensive invariant: ``_merge_task_branch``
+    fails closed when the artifact is missing or unparseable. Legacy helper
+    tests that exercise the merge path must satisfy the invariant first.
+    """
+    (repo / f"SECURITY-REVIEW-{task_id}.md").write_text(
+        "# Security Review\n\nNo blocking findings.\n\n"
+        "## Counts\n"
+        "CRITICAL: 0 | HIGH: 0 | MEDIUM: 0 | LOW: 0 | INFO: 0\n"
+    )
+
+
 def test_merge_task_branch_happy_path(tmp_path, capsys):
     repo = tmp_path / "repo"
     _init_repo(repo)
@@ -125,6 +139,7 @@ def test_merge_task_branch_happy_path(tmp_path, capsys):
     (wt / "feature.txt").write_text("hello\n")
     _git(wt, "add", "feature.txt")
     _git(wt, "commit", "-m", "feat: add feature")
+    _write_clean_review(repo, 7)
 
     pre_head = _git(repo, "rev-parse", "HEAD").stdout.strip()
     ok = _merge_task_branch(str(repo), 7, "forge-task-7")
@@ -145,6 +160,7 @@ def test_merge_task_branch_no_commits_returns_false(tmp_path, capsys):
     _init_repo(repo)
     base = repo / ".forge-worktrees"
     _create_isolation_worktrees([{"id": 5}], str(repo), base)
+    _write_clean_review(repo, 5)
     capsys.readouterr()
 
     ok = _merge_task_branch(str(repo), 5, "forge-task-5")
@@ -160,6 +176,7 @@ def test_merge_task_branch_missing_branch_logs_explicitly(tmp_path, capsys):
     """
     repo = tmp_path / "repo"
     _init_repo(repo)
+    _write_clean_review(repo, 42)
 
     ok = _merge_task_branch(str(repo), 42, "forge-task-does-not-exist")
 
