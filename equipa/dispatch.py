@@ -1927,13 +1927,17 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
                 continue
             branch_name = f"forge-task-{task_id}"
             try:
+                # GATE-02 (task #2451 Phase C): missing key MUST propagate
+                # as None so the unified gate re-reads the on-disk artifact
+                # instead of trusting an absent caller decision as False.
+                _caller_block = r.get("review_blocks_merge")
                 merge_status = await _gated_merge_task(
                     repo=project_dir,
                     branch=branch_name,
                     outcome=r["outcome"],
                     task_id=task_id,
                     project_context=project_context,
-                    review_blocks_merge=r.get("review_blocks_merge", False),
+                    review_blocks_merge=(True if _caller_block else None),
                 )
             except Exception:  # pragma: no cover - defensive
                 logger.exception(

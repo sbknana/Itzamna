@@ -35,7 +35,7 @@ from equipa.db import record_agent_run, update_task_status
 from equipa.config import is_security_review_enabled
 from equipa.dispatch import (
     _build_dispatch_attempt_reflection,
-    _merge_task_branch,
+    _gated_merge_task,
     _security_review_blocks_merge,
     apply_dispatch_filters,
     cleanup_failed_attempt,
@@ -50,6 +50,7 @@ from equipa.dispatch import (
     score_project,
     validate_goals,
 )
+from equipa.security_gate import SecurityGateBypassError
 from equipa import templates as _templates
 from equipa.git_ops import setup_all_repos
 import equipa.hooks as _hooks_module
@@ -316,59 +317,16 @@ async def _gated_post_merge(
 ) -> str:
     """Unified post-loop gated merge for single-task ``--dev-test`` mode.
 
-    Bug #2450: before this helper existed, single-task ``--dev-test`` mode's
-    worktree-branch merge happened inside ``run_dev_test_loop`` BEFORE the
-    security gate was evaluated. The gate could mark a task as
-    ``security_review_blocked`` in TheForge while its commits were already on
-    master — a fail-open gate. This helper couples the gate decision and the
-    git-merge in ONE place that callers invoke AFTER the gate runs, mirroring
-    the parallel-mode contract in ``equipa.dispatch.run_parallel_tasks``.
+    Task #2451 Phase B: this is now a thin adapter that delegates to
+    :func:`equipa.dispatch._gated_merge_task` — both single-task and parallel
+    modes share one merge path so the gate semantics cannot diverge again.
 
-    Args:
-        repo: Project directory containing the git repo (master + the task
-            branch).
-        branch: Name of the task branch to (maybe) merge — typically
-            ``forge-task-<id>``.
-        outcome: The dev-test outcome AFTER the security gate has run. Values
-            ``tests_passed`` and ``no_tests`` are merge-eligible; anything
-            else (e.g. ``security_review_blocked``, ``tests_failed``) is not.
-        review_blocks_merge: Truthy iff the security gate decided this task
-            must NOT merge (CRITICAL/HIGH finding, crashed reviewer, missing
-            artifact under fail-closed policy).
-        task_id: Optional explicit task id. When ``None``, parsed from
-            ``branch`` (the ``forge-task-<id>`` convention).
-
-    Returns:
-        - ``"blocked"`` — gate fired; branch left unmerged and intact.
-        - ``"merged"`` — branch successfully merged into master.
-        - ``"merge_failed"`` — gate passed but ``_merge_task_branch`` reported
-          failure (conflict, no commits ahead, etc.). Branch preserved.
-        - ``"skipped"`` — outcome was not merge-eligible (e.g. tests failed
-          before the gate even ran); no merge attempted.
+    The caller-flag transform: pass ``review_blocks_merge=True`` when the
+    caller explicitly blocked (we trust positive blocks). Pass ``None`` when
+    the caller did NOT block — this forces ``_gated_merge_task`` to re-read
+    the artifact and re-apply the fail-closed rule, instead of silently
+    trusting an unreliable "do not block" assertion.
     """
-    from equipa.dispatch import _gate_audit_log
-    from equipa.security_gate import SecurityGateBypassError
-
-    project_dir = os.fspath(repo)
-
-    # Honour the caller's gate decision first — the caller owns context the
-    # file-based gate cannot re-derive (doc-only short-circuit, crashed
-    # reviewer, missing artifact under fail-closed). Re-checking the artifact
-    # here would falsely block merges the caller already authorised.
-    if review_blocks_merge or outcome == "security_review_blocked":
-        _gate_audit_log(
-            f"task={task_id} event=merge-skipped reason=caller-gate-blocked "
-            f"outcome={outcome}"
-        )
-        return "blocked"
-
-    if outcome not in ("tests_passed", "no_tests"):
-        _gate_audit_log(
-            f"task={task_id} event=merge-skipped reason=outcome-not-eligible "
-            f"outcome={outcome}"
-        )
-        return "skipped"
-
     if task_id is None:
         try:
             task_id = int(branch.rsplit("-", 1)[-1])
@@ -378,22 +336,20 @@ async def _gated_post_merge(
                 f"{branch!r}; pass task_id= explicitly"
             ) from e
 
-    _gate_audit_log(
-        f"task={task_id} event=merge-attempt branch={branch} "
-        f"path=single-task"
+    if outcome == "security_review_blocked":
+        # Outcome already demoted by the caller — preserve the explicit
+        # block signal through to the unified gate.
+        caller_flag: bool | None = True
+    else:
+        caller_flag = True if review_blocks_merge else None
+
+    return await _gated_merge_task(
+        repo=repo,
+        branch=branch,
+        outcome=outcome,
+        task_id=task_id,
+        review_blocks_merge=caller_flag,
     )
-    # The defensive invariant inside ``_merge_task_branch`` (task #2451)
-    # still raises ``SecurityGateBypassError`` if the on-disk artifact
-    # reports a HIGH/CRITICAL finding — making it impossible to merge
-    # past a known-blocking review even if the caller's flag was wrong.
-    try:
-        merged = await _merge_task_branch(project_dir, task_id, branch)
-    except SecurityGateBypassError as exc:
-        _gate_audit_log(
-            f"task={task_id} event=defensive-invariant-blocked detail={exc}"
-        )
-        return "blocked"
-    return "merged" if merged else "merge_failed"
 
 
 # --- Template subcommand (PLAN-1067 §3.C3) ---
