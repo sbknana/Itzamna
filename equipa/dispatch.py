@@ -1121,7 +1121,13 @@ async def _create_isolation_worktrees(
     return worktree_dirs
 
 
-async def _merge_task_branch(project_dir: str, task_id: int, branch_name: str) -> bool:
+async def _merge_task_branch(
+    project_dir: str,
+    task_id: int,
+    branch_name: str,
+    *,
+    expect_artifact: bool = True,
+) -> bool:
     """Merge a single task branch into the main repo's current branch.
 
     Returns True if the merge succeeded (HEAD advanced), False otherwise.
@@ -1134,36 +1140,53 @@ async def _merge_task_branch(project_dir: str, task_id: int, branch_name: str) -
     finding. This makes it impossible to reach ``git merge`` past a
     known-blocking review even if a caller forgets the gate.
 
+    ``expect_artifact`` (task #2451 Phase H, F-01 fix): callers that know
+    the diff is doc-only (the security reviewer was skipped on purpose by
+    the doc-only short-circuit, per task #2358) MUST pass
+    ``expect_artifact=False`` so the defensive invariant does NOT demand
+    a SECURITY-REVIEW-{task_id}.md that was never written. Without this
+    hint, every pure .md/.rst/.txt change is blocked at the merge —
+    a regression introduced when the Phase-A fail-closed-on-None rule
+    landed in attempt-2. When ``False``, the invariant is skipped
+    entirely; doc-only diffs cannot introduce code-level findings, so
+    there is nothing to gate on.
+
     Uses ``git_run_async`` so the 6-12 git invocations per merge do not
     block the event loop.
     """
     review_path = Path(os.fspath(project_dir)) / f"SECURITY-REVIEW-{task_id}.md"
-    counts = _count_findings_in_review_file(review_path)
-    if counts is None:
+    if not expect_artifact:
         _gate_audit_log(
-            f"task={task_id} event=defensive-invariant-fired "
-            f"artifact={review_path.name} "
-            f"reason=artifact-unparseable-or-missing "
-            f"{format_counts(None)}"
+            f"task={task_id} event=defensive-invariant-skipped "
+            f"reason=doc-only-no-artifact-expected"
         )
-        raise SecurityGateBypassError(
-            f"Refusing to merge branch {branch_name!r}: "
-            f"SECURITY-REVIEW-{task_id}.md is missing or unparseable "
-            f"(fallback dump, or no findings table). The defensive "
-            f"invariant fails closed (task #2451) — operator must "
-            f"resolve before merge."
-        )
-    if counts.get("CRITICAL", 0) > 0 or counts.get("HIGH", 0) > 0:
-        _gate_audit_log(
-            f"task={task_id} event=defensive-invariant-fired "
-            f"artifact={review_path.name} {format_counts(counts)}"
-        )
-        raise SecurityGateBypassError(
-            f"Refusing to merge branch {branch_name!r}: "
-            f"SECURITY-REVIEW-{task_id}.md reports "
-            f"{counts.get('CRITICAL', 0)} CRITICAL, "
-            f"{counts.get('HIGH', 0)} HIGH finding(s)."
-        )
+    else:
+        counts = _count_findings_in_review_file(review_path)
+        if counts is None:
+            _gate_audit_log(
+                f"task={task_id} event=defensive-invariant-fired "
+                f"artifact={review_path.name} "
+                f"reason=artifact-unparseable-or-missing "
+                f"{format_counts(None)}"
+            )
+            raise SecurityGateBypassError(
+                f"Refusing to merge branch {branch_name!r}: "
+                f"SECURITY-REVIEW-{task_id}.md is missing or unparseable "
+                f"(fallback dump, or no findings table). The defensive "
+                f"invariant fails closed (task #2451) — operator must "
+                f"resolve before merge."
+            )
+        if counts.get("CRITICAL", 0) > 0 or counts.get("HIGH", 0) > 0:
+            _gate_audit_log(
+                f"task={task_id} event=defensive-invariant-fired "
+                f"artifact={review_path.name} {format_counts(counts)}"
+            )
+            raise SecurityGateBypassError(
+                f"Refusing to merge branch {branch_name!r}: "
+                f"SECURITY-REVIEW-{task_id}.md reports "
+                f"{counts.get('CRITICAL', 0)} CRITICAL, "
+                f"{counts.get('HIGH', 0)} HIGH finding(s)."
+            )
     try:
         current = await git_run_async(
             ["branch", "--show-current"], project_dir, timeout=10,
@@ -1434,6 +1457,7 @@ async def _gated_merge_task(
     task_id: int,
     project_context: dict | None = None,
     review_blocks_merge: bool | None = None,
+    expect_artifact: bool = True,
 ) -> str:
     """Unified, gated merge entry point used by BOTH dispatch modes.
 
@@ -1490,7 +1514,10 @@ async def _gated_merge_task(
         f"caller_flag={review_blocks_merge!r}"
     )
     try:
-        merged = await _merge_task_branch(project_dir, task_id, branch)
+        merged = await _merge_task_branch(
+            project_dir, task_id, branch,
+            expect_artifact=expect_artifact,
+        )
     except SecurityGateBypassError as exc:
         _gate_audit_log(
             f"task={task_id} event=defensive-invariant-blocked detail={exc}"
@@ -1665,6 +1692,11 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
             # and the post-gather merge skips this branch.
             review_blocks_merge = False
             review_counts: dict | None = None
+            # Phase H (F-01): the doc-only short-circuit fires only inside
+            # the security-review block below; default to False so the
+            # merge loop never has to guess when the block was skipped
+            # outright (e.g. security review disabled, tests failed).
+            review_skipped_doc_only = False
             if (
                 is_security_review_enabled(args)
                 and outcome in ("tests_passed", "no_tests")
@@ -1839,6 +1871,10 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
                 "needs_merge": needs_merge,
                 "review_blocks_merge": review_blocks_merge,
                 "review_counts": review_counts,
+                # Phase H (F-01): propagate doc-only hint so the merge
+                # loop can tell the defensive invariant not to demand a
+                # SECURITY-REVIEW-{task_id}.md that was never written.
+                "review_skipped_doc_only": review_skipped_doc_only,
             }
 
     results = await asyncio.gather(
@@ -1916,6 +1952,11 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
                 # instead of trusting an absent caller decision as False.
                 # An explicit False (e.g. doc-only short-circuit) IS still
                 # honoured because the producer site sets it deliberately.
+                #
+                # Phase H (F-01): the doc-only short-circuit also tells
+                # _merge_task_branch's defensive invariant NOT to demand
+                # a SECURITY-REVIEW-{task_id}.md file that the reviewer
+                # never wrote (because the diff was pure docs).
                 merge_status = await _gated_merge_task(
                     repo=project_dir,
                     branch=branch_name,
@@ -1923,11 +1964,21 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
                     task_id=task_id,
                     project_context=project_context,
                     review_blocks_merge=r.get("review_blocks_merge"),
+                    expect_artifact=not r.get(
+                        "review_skipped_doc_only", False,
+                    ),
                 )
-            except Exception:  # pragma: no cover - defensive
-                logger.exception(
-                    "[GATE-AUDIT] task=%s event=gated-merge-errored",
-                    task_id,
+            except SecurityGateBypassError as exc:
+                # Phase K (F-04): narrow from `except Exception` so genuine
+                # bugs surface instead of being silently swallowed and a
+                # merge gets recorded as a no-op. The defensive invariant
+                # firing is an EXPECTED gating event — we log it and
+                # continue to the next task. Any other exception type
+                # propagates normally (treated by asyncio.gather's caller
+                # the same way other unhandled errors are).
+                _gate_audit_log(
+                    f"task={task_id} event=defensive-invariant-blocked "
+                    f"branch={branch_name} detail={exc}"
                 )
                 continue
             if merge_status == "merged":

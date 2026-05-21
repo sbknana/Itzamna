@@ -314,6 +314,7 @@ async def _gated_post_merge(
     outcome: str,
     review_blocks_merge: bool,
     task_id: int | None = None,
+    review_skipped_doc_only: bool = False,
 ) -> str:
     """Unified post-loop gated merge for single-task ``--dev-test`` mode.
 
@@ -326,6 +327,13 @@ async def _gated_post_merge(
     the caller did NOT block — this forces ``_gated_merge_task`` to re-read
     the artifact and re-apply the fail-closed rule, instead of silently
     trusting an unreliable "do not block" assertion.
+
+    Phase H (F-01) — when ``review_skipped_doc_only=True`` the doc-only
+    short-circuit fired, so no SECURITY-REVIEW-{task_id}.md was written.
+    The defensive invariant in ``_merge_task_branch`` must NOT then
+    demand one. The hint is forwarded as ``expect_artifact=False`` so
+    the invariant is skipped (the diff is provably doc-only, nothing
+    code-level to gate).
     """
     if task_id is None:
         try:
@@ -349,6 +357,7 @@ async def _gated_post_merge(
         outcome=outcome,
         task_id=task_id,
         review_blocks_merge=caller_flag,
+        expect_artifact=not review_skipped_doc_only,
     )
 
 
@@ -1119,6 +1128,11 @@ async def run_mode_task(args: argparse.Namespace) -> None:
         # but the task was marked SUCCESS and merged to master).
         review_blocks_merge = False
         review_counts: dict | None = None
+        # Phase H (F-01): track whether the doc-only short-circuit fired,
+        # so the post-merge call can tell the defensive invariant inside
+        # _merge_task_branch NOT to demand an artifact that was never
+        # produced (doc-only diffs skip the reviewer per task #2358).
+        review_skipped_doc_only = False
         if (
             is_security_review_enabled(args)
             and outcome in ("tests_passed", "no_tests")
@@ -1222,6 +1236,7 @@ async def run_mode_task(args: argparse.Namespace) -> None:
                 outcome=outcome,
                 review_blocks_merge=review_blocks_merge,
                 task_id=task["id"],
+                review_skipped_doc_only=review_skipped_doc_only,
             )
             if merge_result == "merged":
                 print(
