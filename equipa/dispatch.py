@@ -200,6 +200,19 @@ def _build_dispatch_attempt_reflection(
         reason = "agent reported blocked"
     elif outcome == "loop_detected":
         reason = "loop detected — agent kept trying the same approach"
+    elif outcome == "tests_inconclusive":
+        # Task #2242: tester reported "pass" but every test was skipped
+        # (typically missing env vars). The agent must either set up the
+        # env vars on the test runner OR rewrite the tests to run without
+        # them — a vanilla retry without that signal will reproduce the
+        # exact same skip pattern.
+        reason = (
+            "tests_inconclusive — every test was skipped (likely missing "
+            "env vars or unmet prerequisites). Real validation did NOT "
+            "occur. Either provide the required env defaults so the tests "
+            "execute, or rewrite the tests to exercise the code paths "
+            "without env gating."
+        )
     else:
         reason = outcome
 

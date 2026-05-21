@@ -106,6 +106,21 @@ class TestBuildReflection:
         )
         assert "something_new" in result
 
+    def test_tests_inconclusive_explains_skip_pattern(self) -> None:
+        """Task #2242: the all-tests-skipped outcome must surface a
+        clear, actionable reason in the cross-attempt reflection so
+        the retry knows it needs to either supply env defaults or
+        rewrite the env-gated tests."""
+        result = _build_dispatch_attempt_reflection(
+            attempt=1,
+            outcome="tests_inconclusive",
+            cycles=1,
+            result={"duration": 5, "cost": 0.0},
+        )
+        assert "tests_inconclusive" in result
+        assert "skipped" in result.lower()
+        assert "env" in result.lower()
+
 
 # ---------------------------------------------------------------------------
 # _inject_attempt_reflections
