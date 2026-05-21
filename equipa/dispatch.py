@@ -100,6 +100,54 @@ __all_reexports__ = (
 )
 
 
+def _bootstrap_scaffold_if_needed(task: dict, project_id: int | None) -> str | None:
+    """Resolve a scaffold-based project's local_path even when the dir is empty.
+
+    ``resolve_project_dir`` returns ``None`` when the recorded ``local_path``
+    does not point at an existing directory. For scaffold-based projects
+    that is exactly the case auto-clone is supposed to recover from: the
+    project row has a ``local_path`` set, the directory has not yet been
+    created, and we should create it and copy ForgeScaffold in. This
+    helper returns the candidate path (after creating it) so the calling
+    code can hand it to ``ensure_scaffold``.
+    """
+    if not project_id:
+        return None
+    try:
+        from equipa.db import db_conn
+        from equipa.scaffold import is_scaffold_project
+        if not is_scaffold_project(project_id):
+            return None
+        with db_conn() as conn:
+            row = conn.execute(
+                "SELECT local_path FROM projects WHERE id = ?",
+                (project_id,),
+            ).fetchone()
+    except Exception:  # pragma: no cover - defensive
+        return None
+    if not row:
+        return None
+    try:
+        local_path = row["local_path"]
+    except (KeyError, IndexError):
+        local_path = None
+    if not local_path:
+        return None
+    # Translate Windows-style paths to the Samba mount, mirroring
+    # ``tasks.resolve_project_dir``.
+    candidate = local_path.rstrip("/").rstrip("\\")
+    if candidate.startswith(("Z:\\AI_Stuff", "Z:/AI_Stuff")):
+        candidate = (
+            "/srv/forge-share/AI_Stuff"
+            + candidate[len("Z:\\AI_Stuff"):].replace("\\", "/")
+        )
+    try:
+        Path(candidate).mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    return candidate
+
+
 # --- Cross-Attempt Memory Helpers ---
 
 _ATTEMPT_MARKER = "\n\n--- PREVIOUS ATTEMPTS ---\n"
@@ -577,6 +625,19 @@ async def run_project_tasks(
             "total_cost": 0.0,
             "total_duration": 0.0,
         }
+
+    # Auto-clone ForgeScaffold for scaffold-based projects whose directory
+    # does not yet exist or is uninitialised. Returns True only when a
+    # clone was actually performed; benign no-op for non-scaffold projects.
+    try:
+        from equipa.scaffold import ensure_scaffold, ScaffoldCloneError
+        cloned = ensure_scaffold(project_dir, project_id, config=config)
+        if cloned:
+            log(f"  [{codename}] Auto-cloned ForgeScaffold into {project_dir}", output)
+    except ScaffoldCloneError as exc:
+        log(f"  [{codename}] ERROR: Scaffold auto-clone failed: {exc}", output)
+    except Exception as exc:  # pragma: no cover - defensive
+        log(f"  [{codename}] WARN: Scaffold auto-clone raised {exc!r}", output)
 
     if not Path(project_dir).exists():
         log(f"  [{codename}] ERROR: Directory does not exist: {project_dir}. Skipping.", output)
@@ -1565,8 +1626,22 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
     project_id = tasks[0].get("project_id")
     project_dir = resolve_project_dir(tasks[0])
     if not project_dir:
+        # Last-chance fallback: if the project is registered as
+        # scaffold-based and has a local_path configured but the directory
+        # is empty, auto-clone the scaffold so dispatch can proceed.
+        project_dir = _bootstrap_scaffold_if_needed(tasks[0], project_id)
+    if not project_dir:
         print("ERROR: Could not resolve project directory.")
         return
+    try:
+        from equipa.scaffold import ensure_scaffold, ScaffoldCloneError
+        if ensure_scaffold(project_dir, project_id):
+            print(f"Auto-cloned ForgeScaffold into {project_dir}")
+    except ScaffoldCloneError as exc:
+        print(f"ERROR: Scaffold auto-clone failed: {exc}")
+        return
+    except Exception as exc:  # pragma: no cover - defensive
+        print(f"WARN: Scaffold auto-clone raised {exc!r}")
     if not Path(project_dir).exists():
         print(f"ERROR: Project directory does not exist: {project_dir}")
         return

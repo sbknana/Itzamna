@@ -980,9 +980,31 @@ async def run_mode_task(args: argparse.Namespace) -> None:
     # Resolve project directory
     project_dir = resolve_project_dir(task)
     if not project_dir:
+        # Scaffold-based projects may have a recorded local_path that does
+        # not yet exist on disk. Detect that and let ensure_scaffold below
+        # populate it.
+        try:
+            from equipa.dispatch import _bootstrap_scaffold_if_needed
+            project_dir = _bootstrap_scaffold_if_needed(
+                task, task.get("project_id")
+            )
+        except Exception:
+            project_dir = None
+    if not project_dir:
         print(f"ERROR: Could not find project directory for '{task.get('project_name', 'Unknown')}'")
         print("Known projects:", ", ".join(sorted(_equipa_constants.PROJECT_DIRS.keys())))
         sys.exit(1)
+
+    # Auto-clone ForgeScaffold for empty/missing scaffold-based projects.
+    try:
+        from equipa.scaffold import ensure_scaffold, ScaffoldCloneError
+        if ensure_scaffold(project_dir, task.get("project_id")):
+            print(f"Auto-cloned ForgeScaffold into {project_dir}")
+    except ScaffoldCloneError as exc:
+        print(f"ERROR: Scaffold auto-clone failed: {exc}")
+        sys.exit(1)
+    except Exception as exc:  # pragma: no cover - defensive
+        print(f"WARN: Scaffold auto-clone raised {exc!r}")
 
     # Verify project directory exists
     if not Path(project_dir).exists():
