@@ -1499,15 +1499,25 @@ async def _gated_merge_task(
         return "skipped"
 
     if review_blocks_merge is None:
-        blocks, counts = _security_review_blocks_merge(
-            project_dir, task_id, block_on_missing=True,
-        )
-        if blocks:
+        # Phase H (F-01): when the caller explicitly tells us no artifact
+        # is expected (doc-only short-circuit), the artifact-required gate
+        # must NOT fire fail-closed on its absence — that's exactly the
+        # regression Phase H removes from _merge_task_branch.
+        if not expect_artifact:
             _gate_audit_log(
-                f"task={task_id} event=merge-skipped "
-                f"reason=security-review-blocked {format_counts(counts)}"
+                f"task={task_id} event=artifact-recheck-skipped "
+                f"reason=doc-only-no-artifact-expected"
             )
-            return "blocked"
+        else:
+            blocks, counts = _security_review_blocks_merge(
+                project_dir, task_id, block_on_missing=True,
+            )
+            if blocks:
+                _gate_audit_log(
+                    f"task={task_id} event=merge-skipped "
+                    f"reason=security-review-blocked {format_counts(counts)}"
+                )
+                return "blocked"
 
     _gate_audit_log(
         f"task={task_id} event=merge-attempt branch={branch} "

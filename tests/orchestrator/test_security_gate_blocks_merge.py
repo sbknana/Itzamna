@@ -297,6 +297,76 @@ def test_loosened_parser_detects_non_canonical_header(gated_repo, monkeypatch):
     assert _git(repo, "rev-parse", "HEAD") == master_head
 
 
+def test_doc_only_diff_merges_without_artifact(tmp_path, monkeypatch):
+    """Phase H (F-01): doc-only diff merges with expect_artifact=False.
+
+    The reviewer is skipped on doc-only diffs (task #2358), so no
+    SECURITY-REVIEW-NNNN.md is written. The defensive invariant must NOT
+    then demand one. Without this hint, the Phase-A fail-closed rule
+    blocks every pure .md/.rst/.txt change — the F-01 regression.
+    """
+    from equipa import dispatch
+
+    repo = tmp_path / "repo_doc_only"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "master")
+    _git(repo, "config", "user.email", "test@forgeborn.local")
+    _git(repo, "config", "user.name", "Test")
+    _git(repo, "config", "commit.gpgsign", "false")
+    (repo / "README.md").write_text("base\n")
+    _git(repo, "add", "README.md")
+    _git(repo, "commit", "-q", "-m", "base")
+    master_head = _git(repo, "rev-parse", "HEAD")
+
+    _git(repo, "checkout", "-q", "-b", "forge-task-9999")
+    (repo / "docs.md").write_text("# Docs\n\nProse only.\n")
+    _git(repo, "add", "docs.md")
+    _git(repo, "commit", "-q", "-m", "docs: prose only")
+    _git(repo, "checkout", "-q", "master")
+
+    # Intentionally NO SECURITY-REVIEW-9999.md on disk.
+    assert not (repo / "SECURITY-REVIEW-9999.md").exists()
+    monkeypatch.setenv("EQUIPA_GATE_AUDIT_LOG", "1")
+
+    result = asyncio.run(dispatch._gated_merge_task(
+        repo=str(repo),
+        branch="forge-task-9999",
+        outcome="tests_passed",
+        task_id=9999,
+        project_context={"id": 23},
+        expect_artifact=False,
+    ))
+
+    assert result == "merged"
+    assert _git(repo, "rev-parse", "HEAD") != master_head
+
+
+def test_non_doc_diff_blocks_when_artifact_missing(gated_repo, monkeypatch):
+    """Phase H (F-01): expect_artifact=True still fails closed on missing artifact.
+
+    Locks in the fail-closed direction: a code diff (.py) with NO security
+    review on disk MUST still raise — the doc-only short-circuit is the
+    ONLY way to bypass the defensive invariant. The gated_repo fixture
+    creates a forge-task-9999 branch with a feature.py file already.
+    """
+    from equipa import dispatch
+    from equipa.security_gate import SecurityGateBypassError
+
+    repo = gated_repo["repo"]
+    master_head = gated_repo["master_head"]
+    # Artifact intentionally NOT written; diff includes feature.py.
+    assert not (repo / "SECURITY-REVIEW-9999.md").exists()
+    monkeypatch.setenv("EQUIPA_GATE_AUDIT_LOG", "1")
+
+    with pytest.raises(SecurityGateBypassError):
+        asyncio.run(dispatch._merge_task_branch(
+            str(repo), 9999, "forge-task-9999",
+            expect_artifact=True,
+        ))
+
+    assert _git(repo, "rev-parse", "HEAD") == master_head
+
+
 def test_counts_footer_preferred_over_headers(gated_repo, monkeypatch):
     """GATE-04: explicit Counts footer wins over header counting."""
     from equipa import dispatch
