@@ -392,3 +392,39 @@ def test_counts_footer_preferred_over_headers(gated_repo, monkeypatch):
 
     assert result == "blocked"
     assert _git(repo, "rev-parse", "HEAD") == master_head
+
+
+def test_phase_i_prose_headers_yield_to_counts_footer(gated_repo, monkeypatch):
+    """Phase I-b (F-02): the Counts footer overrides false-positive prose.
+
+    Concrete F-02 example: a section heading like
+    ``### Summary of HIGH-impact findings`` matched the loosened Phase-D
+    finding-header regex and falsely contributed +1 HIGH. With the
+    mandated tamper-evident footer (CRITICAL: 0 | HIGH: 0 | ...) the
+    parser must prefer the footer numbers and let the merge proceed.
+    """
+    from equipa import dispatch
+
+    repo = gated_repo["repo"]
+    master_head = gated_repo["master_head"]
+    (repo / "SECURITY-REVIEW-9999.md").write_text(
+        "# Security Review\n\n"
+        "### Summary of HIGH-impact findings\n"
+        "Nothing critical or high was found in this audit.\n\n"
+        "### CRITICAL section (no findings)\n"
+        "Reviewed; no critical issues identified.\n\n"
+        "## Counts\n"
+        "CRITICAL: 0 | HIGH: 0 | MEDIUM: 0 | LOW: 0 | INFO: 0\n"
+    )
+    monkeypatch.setenv("EQUIPA_GATE_AUDIT_LOG", "1")
+
+    result = asyncio.run(dispatch._gated_merge_task(
+        repo=str(repo),
+        branch="forge-task-9999",
+        outcome="tests_passed",
+        task_id=9999,
+        project_context={"id": 23},
+    ))
+
+    assert result == "merged"
+    assert _git(repo, "rev-parse", "HEAD") != master_head

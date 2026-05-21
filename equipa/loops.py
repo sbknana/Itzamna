@@ -200,6 +200,21 @@ async def run_security_review(
         f"not a generic name). The orchestrator reads counts from this exact "
         f"path; if you write a different filename the findings will be lost. "
         f"Rate each finding: CRITICAL, HIGH, MEDIUM, LOW, INFO. "
+        # Task #2451 Phase I-b (F-02): MANDATE a final Counts footer so the
+        # orchestrator gate can read finding counts from a tamper-evident
+        # location rather than relying on header pattern-matching. The
+        # parser prefers this footer when present (equipa/loops.py
+        # _count_findings_in_review_file) so a footer mismatch with
+        # in-body headers ALWAYS resolves in the footer's favour. Mid-
+        # review prose like "### Summary of HIGH-impact findings" can
+        # then no longer false-positive as a HIGH finding.
+        f"The review MUST end with a footer formatted EXACTLY as:\n"
+        f"## Counts\n"
+        f"CRITICAL: N | HIGH: N | MEDIUM: N | LOW: N | INFO: N\n"
+        f"where each N is the integer count of findings at that "
+        f"severity. The orchestrator reads this footer to gate the "
+        f"merge — if you omit it or change the format the gate falls "
+        f"back to header counting which is brittle against prose. "
         f"Original task description: {task['description']}"
     )
 
