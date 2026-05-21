@@ -16,6 +16,19 @@ Heuristic (mirrors the prior inline behavior):
     * If FILES_CHANGED contains only documentation files (*.md) but the
       task description verb is "implement"/"add"/"fix", also vacuous.
 
+Task #2242: extend the guard to catch the "all tests skipped" loophole.
+Observed on task #2236 (Stage D, GutenForge): the agent wrote 982 real
+lines but every test was gated by ``test.skip()`` on missing env vars
+(FEATURE_ASYNC_AI_GENERATION, GOOGLE_AI_KEY, DATABASE_URL). On the
+dev-test runner those env vars are unset, so the tester reported
+"pass (0/1 passed)" — vacuously, because the only test was skipped.
+The orchestrator counted that as success. The guard now also fires when
+``tests_skipped > 0 and tests_skipped == tests_run`` (i.e. every test
+was skipped and none actually executed), regardless of FILES_CHANGED.
+The classification dict carries ``all_skipped=True`` so callers can
+route the outcome to a stricter retry (or escalate to an operator)
+rather than marking the task done.
+
 Task #2079: the per-cycle ``dev_result.files_changed`` view is too
 narrow. Agents legitimately commit all their work in cycles 1-2 and
 then idle in cycles 3-5; the guard would fire on the late idle cycles
@@ -135,7 +148,36 @@ def check_vacuous_pass(**kwargs: Any) -> dict[str, Any]:
     accumulated_files = _normalize_files(accumulated_raw)
 
     tests_run = int(tester_result.get("tests_run") or 0)
+    tests_passed = int(tester_result.get("tests_passed") or 0)
+    tests_skipped = int(tester_result.get("tests_skipped") or 0)
     tester_outcome = (tester_result.get("result") or "").lower()
+
+    # Task #2242: all-tests-skipped detector. If the tester ran a non-zero
+    # number of tests but every one of them was skipped (no real assertions
+    # executed), the "pass" outcome is vacuous regardless of how much code
+    # the developer wrote. This is the GutenForge Stage D loophole: env-var
+    # gated test.skip() turns a 982-LOC delivery into "pass (0/1 passed)"
+    # because the runner lacked the required env vars. We classify the
+    # attempt as inconclusive — neither pass nor fail — and surface
+    # ``all_skipped=True`` so the orchestrator can route to a stricter
+    # retry instead of marking the task done.
+    if (
+        tester_outcome in {"pass", "no-tests"}
+        and tests_run > 0
+        and tests_skipped >= tests_run
+        and tests_passed == 0
+    ):
+        return {
+            "vacuous": True,
+            "all_skipped": True,
+            "reason": (
+                f"all_tests_skipped: tester={tester_outcome} "
+                f"tests_run={tests_run} tests_skipped={tests_skipped} "
+                f"tests_passed={tests_passed} — every test was skipped "
+                f"(likely missing env vars or unmet prerequisites); "
+                f"cannot distinguish real validation from no validation"
+            ),
+        }
 
     # Task #2079: union per-cycle delta with the accumulated cross-cycle
     # set BEFORE applying the trivial/docs-only checks. Without this, the
@@ -152,6 +194,7 @@ def check_vacuous_pass(**kwargs: Any) -> dict[str, Any]:
         if _branch_has_real_work(project_dir):
             return {
                 "vacuous": False,
+                "all_skipped": False,
                 "reason": (
                     "non_vacuous: branch has commits past merge-base "
                     f"(per-cycle files_changed={files_changed!r}, "
@@ -160,6 +203,7 @@ def check_vacuous_pass(**kwargs: Any) -> dict[str, Any]:
             }
         return {
             "vacuous": True,
+            "all_skipped": False,
             "reason": (
                 f"vacuous_pass: tester={tester_outcome} tests_run={tests_run} "
                 f"files_changed={files_changed!r} "
@@ -176,13 +220,14 @@ def check_vacuous_pass(**kwargs: Any) -> dict[str, Any]:
         if _is_docs_only(combined_for_trivial) and not _branch_has_real_work(project_dir):
             return {
                 "vacuous": True,
+                "all_skipped": False,
                 "reason": (
                     "vacuous_pass: task description requires code changes "
                     f"but only documentation was touched ({combined_for_trivial!r})"
                 ),
             }
 
-    return {"vacuous": False, "reason": ""}
+    return {"vacuous": False, "all_skipped": False, "reason": ""}
 
 
 def register(dispatcher: Any) -> None:
