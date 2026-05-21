@@ -1,15 +1,16 @@
-"""Regression tests for task #2360.
+"""Regression tests for task #2360 (doc-only-skip predicate).
 
-Three behaviors:
-  1. Doc-only diffs (only .md/.txt/.rst files changed) skip security gate.
-  2. Diffs containing code files still gate normally.
-  3. A gating verdict without a saved SECURITY-REVIEW-NNNN.md artifact is
-     treated as a reviewer failure (NEVER a silent block).
+Task #2451 Phase J: the ``TestEvaluateGate`` class was removed when
+``evaluate_gate`` and ``GateVerdict`` were deleted (F-03 duplicate-gate
+fix). The gate policy now lives only in ``dispatch._gated_merge_task``
+and the defensive invariant in ``dispatch._merge_task_branch``; the
+unit tests for that policy live under
+``tests/orchestrator/test_security_gate_blocks_merge.py``. What remains
+here is the pure ``is_doc_only_diff`` predicate, which is still
+imported by both single-task and parallel dispatch.
 """
 
 from __future__ import annotations
-
-from pathlib import Path
 
 import pytest
 
@@ -50,72 +51,19 @@ class TestIsDocOnlyDiff:
         assert security_gate.is_doc_only_diff(["Makefile", "src/x.weird"]) is False
 
 
-class TestEvaluateGate:
-    def test_docs_only_diff_skips_security_gate(self, tmp_path: Path) -> None:
-        verdict = security_gate.evaluate_gate(
-            task_id=2358,
-            changed_files=["CRYPTOTRADER-V3-ARCHITECTURE.md"],
-            reviewer_verdict="BLOCK",
-            reviewer_findings_high=1,
-            reviewer_findings_critical=0,
-            artifact_dir=tmp_path,
-        )
-        assert verdict.gating is False
-        assert verdict.reason == "doc-only change — security gate skipped"
-        assert verdict.escalate is False
+def test_evaluate_gate_is_deleted() -> None:
+    """Task #2451 Phase J (F-03): evaluate_gate must not return.
 
-    def test_code_diff_still_gated(self, tmp_path: Path) -> None:
-        # Write the artifact so artifact-missing rule does not fire.
-        (tmp_path / "SECURITY-REVIEW-2400.md").write_text("# review\n1 HIGH finding\n")
-        verdict = security_gate.evaluate_gate(
-            task_id=2400,
-            changed_files=["src/foo.py"],
-            reviewer_verdict="BLOCK",
-            reviewer_findings_high=1,
-            reviewer_findings_critical=0,
-            artifact_dir=tmp_path,
-        )
-        assert verdict.gating is True
-        assert verdict.escalate is False
-
-    def test_gating_verdict_without_artifact_is_reviewer_failure(
-        self, tmp_path: Path
-    ) -> None:
-        # Reviewer says BLOCK but did NOT save an artifact for the operator.
-        verdict = security_gate.evaluate_gate(
-            task_id=2401,
-            changed_files=["src/foo.py"],
-            reviewer_verdict="BLOCK",
-            reviewer_findings_high=1,
-            reviewer_findings_critical=0,
-            artifact_dir=tmp_path,
-        )
-        assert verdict.escalate is True
-        assert "artifact" in verdict.reason.lower()
-
-    def test_passing_verdict_does_not_require_artifact(self, tmp_path: Path) -> None:
-        verdict = security_gate.evaluate_gate(
-            task_id=2402,
-            changed_files=["src/foo.py"],
-            reviewer_verdict="PASS",
-            reviewer_findings_high=0,
-            reviewer_findings_critical=0,
-            artifact_dir=tmp_path,
-        )
-        assert verdict.gating is False
-        assert verdict.escalate is False
-
-    def test_doc_only_skip_takes_precedence_over_missing_artifact(
-        self, tmp_path: Path
-    ) -> None:
-        # Even if reviewer claims BLOCK with no artifact, doc-only short-circuits.
-        verdict = security_gate.evaluate_gate(
-            task_id=2358,
-            changed_files=["docs/spec.md"],
-            reviewer_verdict="BLOCK",
-            reviewer_findings_high=1,
-            reviewer_findings_critical=0,
-            artifact_dir=tmp_path,
-        )
-        assert verdict.gating is False
-        assert verdict.escalate is False
+    A single-source-of-truth gate is the architectural contract. If a
+    re-introduction of ``evaluate_gate`` lands, this guard test fails
+    and the reviewer must explicitly choose to delete it again (or wire
+    the dispatch path through it as the only call site).
+    """
+    assert not hasattr(security_gate, "evaluate_gate"), (
+        "evaluate_gate was deleted in Phase J to avoid a duplicate "
+        "open-coded gate policy. Any re-introduction must funnel "
+        "dispatch._gated_merge_task through it as the SINGLE call site."
+    )
+    assert not hasattr(security_gate, "GateVerdict"), (
+        "GateVerdict is dead code once evaluate_gate is gone."
+    )
