@@ -192,6 +192,89 @@ def ensure_schema() -> None:
 
 # --- Record Functions ---
 
+# Match the FILES_CHANGED footer the developer/code-reviewer/security-reviewer
+# emit. Tolerant of leading whitespace and the trailing colon variants observed
+# in production agent output. Anchored to a line start so prose mid-paragraph
+# doesn't false-match (the "FILES_CHANGED is REQUIRED" instruction line in the
+# developer prompt template, for example).
+_FILES_CHANGED_BLOCK_RE = re.compile(
+    r"^[ \t]*FILES[_ ]CHANGED[ \t]*:[ \t]*(.*?)(?=^[ \t]*[A-Z][A-Z_ ]{2,}[ \t]*:|\Z)",
+    re.MULTILINE | re.DOTALL | re.IGNORECASE,
+)
+
+# Lines we should ignore inside a FILES_CHANGED block. The developer template
+# explicitly says "If you changed no files, write `FILES_CHANGED: none`" — that
+# sentinel must NOT count as a real file. Bullets / dashes are valid list
+# markers; we strip them before checking the sentinel.
+_FILES_CHANGED_NONE_SENTINELS = {"none", "n/a", "(none)", "-", ""}
+
+
+def _parse_files_changed_block(result_text: str) -> list[str]:
+    """Extract the file list from the agent's FILES_CHANGED footer.
+
+    Returns the list of distinct file paths claimed in the block. Used as a
+    fallback for runs where ``files_changed_set`` was not attached to the
+    result dict (older callers, synthesized results, retry shims).
+    """
+    if not result_text:
+        return []
+    match = _FILES_CHANGED_BLOCK_RE.search(result_text)
+    if not match:
+        return []
+    body = match.group(1)
+    files: list[str] = []
+    seen: set[str] = set()
+    for raw_line in body.splitlines():
+        line = raw_line.strip()
+        # Strip common list markers ("- foo.py", "* foo.py", "1. foo.py").
+        line = re.sub(r"^([\-\*•]|\d+\.)\s+", "", line)
+        # Drop trailing inline comments and the orchestrator's status hints
+        # like " (created)" / " (modified)" so the path key dedups cleanly.
+        line = re.sub(r"\s+\((?:created|modified|new|updated|deleted)\)\s*$",
+                      "", line, flags=re.IGNORECASE)
+        if not line or line.startswith("#"):
+            continue
+        if line.lower() in _FILES_CHANGED_NONE_SENTINELS:
+            return []
+        if line in seen:
+            continue
+        seen.add(line)
+        files.append(line)
+    return files
+
+
+def _resolve_files_changed_count(result: dict | None) -> int:
+    """Determine how many files an agent run actually changed.
+
+    Sources, in order of trust:
+      1. Explicit ``result["files_changed_count"]`` (callers may pre-compute it).
+      2. ``result["files_changed_set"]`` — populated by ``agent_runner.run_agent``
+         from observed Edit/Write/NotebookEdit tool-call inputs. This is the
+         most reliable signal available pre-merge.
+      3. ``result["files_changed"]`` — set by some loop callers from the
+         parser output.
+      4. Parsing the ``FILES_CHANGED:`` footer out of ``result_text`` — last
+         resort for runs where the structured set was lost.
+
+    Task #2314: the schema column existed but no code path populated it. The
+    vacuous-pass alert (success=1 AND files_changed_count=0) was therefore
+    100% false-positive and disabled. Use the strongest signal we have so the
+    alert becomes usable again. Returns 0 when ``result`` is missing or
+    unstructured so the column reflects "no observed work".
+    """
+    if not isinstance(result, dict):
+        return 0
+    explicit = result.get("files_changed_count")
+    if isinstance(explicit, int) and explicit >= 0:
+        return explicit
+    for key in ("files_changed_set", "files_changed"):
+        value = result.get(key)
+        if isinstance(value, (list, tuple, set)):
+            return len(value)
+    parsed = _parse_files_changed_block(result.get("result_text", "") or "")
+    return len(parsed)
+
+
 def record_agent_run(
     task: dict | int,
     result: dict | None,
@@ -248,7 +331,7 @@ def record_agent_run(
                 error_type = "loop_detected"
             else:
                 error_type = "agent_error"
-        files_changed = result.get("files_changed_count", 0) if isinstance(result, dict) else 0
+        files_changed = _resolve_files_changed_count(result)
 
         with db_conn(write=True) as conn:
             conn.execute(
