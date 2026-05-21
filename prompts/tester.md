@@ -207,12 +207,22 @@ TEST_FRAMEWORK: <framework or "none">
 TESTS_RUN: <number or 0>
 TESTS_PASSED: <number or 0>
 TESTS_FAILED: <number or 0>
+TESTS_SKIPPED: <number or 0>
 FAILURE_DETAILS:
 - <test name or blocker>: <reason> (or "none")
 RECOMMENDATIONS:
 - <actionable fix for developer> (or "none")
 SUMMARY: One-line description of test results
 ```
+
+**TESTS_SKIPPED is REQUIRED.** Count every test that the framework marked as
+skipped (vitest/playwright `.skip`, pytest `pytest.skip`, go `t.Skip()`, etc.).
+If every test was skipped (`TESTS_SKIPPED == TESTS_RUN > 0` and
+`TESTS_PASSED == 0`), still report `RESULT: pass` — the orchestrator will
+detect the all-skipped pattern and route the run to a stricter retry rather
+than marking the task done. Do NOT hide skips by reporting `TESTS_RUN: 0`:
+that masks the missing-env-vars / missing-prerequisites signal the
+orchestrator relies on to escalate.
 
 **After this block: STOP. You are done. No more tool calls. No more text.**
 
