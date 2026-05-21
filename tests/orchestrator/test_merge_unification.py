@@ -111,6 +111,68 @@ def test_no_raw_git_merge_outside_helpers():
         )
 
 
+def test_parallel_merge_loop_catches_only_security_gate_bypass():
+    """Phase K (F-04): the parallel merge loop's ``except`` MUST be the narrow
+    ``SecurityGateBypassError`` form, NOT ``except Exception``.
+
+    The attempt-2 reviewer flagged that a broad ``except Exception:`` around
+    the ``_gated_merge_task`` call in ``run_parallel_tasks`` would swallow
+    the very ``SecurityGateBypassError`` the defensive invariant raises —
+    so a faulty caller-flag-False with a code diff and a known-blocking
+    artifact would silently fall through to ``continue`` and be recorded
+    as ``merge_failed`` with no audit trail. This test walks the dispatch
+    AST and asserts that EVERY ``except`` handler in ``run_parallel_tasks``
+    that names ``_gated_merge_task`` in its try-body catches a typed
+    exception (named ``SecurityGateBypassError``), never a bare
+    ``except`` or ``except Exception``.
+    """
+    dispatch_path = EQUIPA_DIR / "dispatch.py"
+    tree = ast.parse(dispatch_path.read_text())
+
+    target_func = None
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)):
+            if node.name == "run_parallel_tasks":
+                target_func = node
+                break
+    assert target_func is not None, (
+        "run_parallel_tasks missing from dispatch.py — test obsolete"
+    )
+
+    failures: list[str] = []
+    for tnode in ast.walk(target_func):
+        if not isinstance(tnode, ast.Try):
+            continue
+        # Look only at try blocks whose body calls _gated_merge_task.
+        body_calls = {
+            _call_name(c) for c in ast.walk(ast.Module(body=tnode.body, type_ignores=[]))
+            if isinstance(c, ast.Call)
+        }
+        if "_gated_merge_task" not in body_calls:
+            continue
+        for handler in tnode.handlers:
+            if handler.type is None:
+                failures.append(
+                    f"line {handler.lineno}: bare except: around "
+                    f"_gated_merge_task — must catch SecurityGateBypassError"
+                )
+                continue
+            # Accept `except SecurityGateBypassError` (Name) or
+            # `except security_gate.SecurityGateBypassError` (Attribute).
+            caught_name = None
+            if isinstance(handler.type, ast.Name):
+                caught_name = handler.type.id
+            elif isinstance(handler.type, ast.Attribute):
+                caught_name = handler.type.attr
+            if caught_name != "SecurityGateBypassError":
+                failures.append(
+                    f"line {handler.lineno}: except {caught_name!r} — "
+                    "must narrow to SecurityGateBypassError so genuine "
+                    "errors propagate and gate-blocks stay auditable"
+                )
+    assert failures == [], "\n".join(failures)
+
+
 def test_dispatch_merge_argv_only_inside_merge_task_branch():
     """Sanity check: dispatch.py's only ``"merge"`` argv lives inside the
     documented helpers (``_merge_task_branch`` / ``_stash_uncommitted_in_worktree``).
