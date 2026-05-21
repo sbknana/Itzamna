@@ -72,6 +72,33 @@ def _git_available() -> bool:
 pytestmark = pytest.mark.skipif(not _git_available(), reason="git not available")
 
 
+# --- run_parallel_tasks worktree gate (regression) ---
+
+
+def test_run_parallel_tasks_does_not_gate_worktrees_on_task_count():
+    """Regression: `--tasks N` with a single task ID must still isolate.
+
+    The historical condition `use_worktrees = len(tasks) > 1 and ...`
+    silently dropped isolation for single-task `--tasks` dispatches, so
+    agents wrote directly to the project's working tree on master.
+    Caught 2026-05-21 on cryptotrader-v2 task #2386.
+    """
+    import inspect
+    import re
+    from equipa import dispatch
+    source = inspect.getsource(dispatch.run_parallel_tasks)
+    # Match any RHS of `use_worktrees = ...` and forbid `len(tasks)` in it.
+    # `len(tasks) > 1` is fine elsewhere (e.g. `use_flow`); only the
+    # isolation gate must be task-count-independent.
+    m = re.search(r"use_worktrees\s*=\s*([^\n]+)", source)
+    assert m is not None, "use_worktrees assignment missing from run_parallel_tasks"
+    assert "len(tasks)" not in m.group(1), (
+        "run_parallel_tasks must not gate worktree creation on task count "
+        "— single-task --tasks dispatches need isolation too. "
+        f"Got: use_worktrees = {m.group(1).strip()}"
+    )
+
+
 # --- _create_isolation_worktrees ---
 
 

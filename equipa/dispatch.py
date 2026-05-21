@@ -1622,9 +1622,13 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
             print("Aborted.")
             return
 
-    # Create per-task git worktrees for filesystem isolation
+    # Create per-task git worktrees for filesystem isolation.
+    # Always isolate when the project is a git repo — single-task --tasks
+    # dispatches need isolation just as much as multi-task fan-out; the
+    # historical `len(tasks) > 1` guard silently dropped isolation for N=1
+    # and let agents write directly to master's working tree.
     worktree_base = Path(project_dir) / ".forge-worktrees"
-    use_worktrees = len(tasks) > 1 and _is_git_repo(project_dir)
+    use_worktrees = _is_git_repo(project_dir)
     # Worktree creation issues 2-3 git commands per task. The helper is
     # natively async (uses git_run_async) so the event loop is not
     # blocked while subprocesses run.
