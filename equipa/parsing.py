@@ -616,8 +616,8 @@ def _parse_structured_output(text: str, schema: dict) -> dict:
 # Schemas for structured agent output parsing
 _TESTER_SCHEMA: dict = {
     "RESULT": str, "TEST_FRAMEWORK": str, "TESTS_RUN": int,
-    "TESTS_PASSED": int, "TESTS_FAILED": int, "SUMMARY": str,
-    "FAILURE_DETAILS": list, "RECOMMENDATIONS": list,
+    "TESTS_PASSED": int, "TESTS_FAILED": int, "TESTS_SKIPPED": int,
+    "SUMMARY": str, "FAILURE_DETAILS": list, "RECOMMENDATIONS": list,
 }
 
 _DEVELOPER_FILES_SCHEMA: dict = {"FILES_CHANGED": list}

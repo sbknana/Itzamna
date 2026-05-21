@@ -1228,6 +1228,42 @@ def _dispatch_tester_outcome(
     test_outcome = test_results["result"]
 
     if test_outcome == "pass":
+        # Task #2242: catch the "all tests skipped" loophole. A "pass" with
+        # tests_run > 0 but tests_skipped == tests_run (and tests_passed == 0)
+        # means every test was skipped (typically due to missing env vars or
+        # unmet prerequisites). The tester legitimately reports pass, but
+        # nothing was actually validated — we cannot tell real success from
+        # vacuous success. Route to a stricter retry instead of marking done.
+        tests_run = int(test_results.get("tests_run") or 0)
+        tests_skipped = int(test_results.get("tests_skipped") or 0)
+        tests_passed_count = int(test_results.get("tests_passed") or 0)
+        if (
+            tests_run > 0
+            and tests_skipped >= tests_run
+            and tests_passed_count == 0
+        ):
+            log(
+                f"  [Cycle {cycle}] Tester reported pass but ALL {tests_run} "
+                f"test(s) were skipped (0 actually ran). Treating as "
+                f"inconclusive — likely missing env vars or prerequisites.",
+                output,
+            )
+            msg_content = json.dumps({
+                "outcome": "inconclusive",
+                "reason": "all_tests_skipped",
+                "tests_run": tests_run,
+                "tests_skipped": tests_skipped,
+                "tests_passed": tests_passed_count,
+            })
+            post_agent_message(task_id, cycle, "tester", task_role,
+                               "tests_inconclusive", msg_content)
+            log(
+                f"  [Cycle {cycle}] Posted tests_inconclusive message for {task_role}",
+                output,
+            )
+            _apply_cost_totals(tester_result, total_cost, total_duration)
+            return "exit", tester_result, "tests_inconclusive"
+
         log(f"  [Cycle {cycle}] All tests passed!", output)
         msg_content = json.dumps({
             "outcome": "pass",

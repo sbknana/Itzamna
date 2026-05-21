@@ -96,6 +96,7 @@ def _print_task_summary(
         "developer_failed": "Developer agent failed",
         "tester_blocked": "Tester could not run (build error, missing deps)",
         "tester_timeout": "Tester agent timed out",
+        "tests_inconclusive": "All tests skipped — no actual validation occurred (likely missing env vars)",
         "no_progress": f"No file changes for {NO_PROGRESS_LIMIT} consecutive cycles",
         "cycles_exhausted": f"All {MAX_DEV_TEST_CYCLES} fix-test cycles used without passing",
     }
