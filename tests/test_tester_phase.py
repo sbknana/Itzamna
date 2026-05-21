@@ -103,12 +103,13 @@ def patched_msg_helpers(monkeypatch):
 
 
 def _results(outcome: str, run: int = 0, passed: int = 0, failed: int = 0,
-             details: list | None = None) -> dict:
+             skipped: int = 0, details: list | None = None) -> dict:
     return {
         "result": outcome,
         "tests_run": run,
         "tests_passed": passed,
         "tests_failed": failed,
+        "tests_skipped": skipped,
         "failure_details": details or [],
     }
 
@@ -183,6 +184,47 @@ class TestDispatchTesterOutcome:
         assert ret is None
         assert outcome is None
         assert history == ["failure ctx cycle 2"]
+
+    # Task #2242: all-tests-skipped should NOT be mapped to tests_passed —
+    # it routes to tests_inconclusive so the orchestrator does not mark the
+    # task done. Repro of the GutenForge Stage D #2236 loophole: 1 test,
+    # tests_passed=0, tests_skipped=1, tester reports "pass".
+    def test_all_skipped_pass_returns_tests_inconclusive(
+        self, patched_msg_helpers
+    ):
+        tester = {"some": "tester"}
+        dev = {"some": "dev"}
+        action, ret, outcome = _dispatch_tester_outcome(
+            _results("pass", run=1, passed=0, skipped=1),
+            tester, dev, cycle=1, task_id=1, task_role="developer",
+            total_cost=0.5, total_duration=1.0,
+            compaction_history=[],
+        )
+        assert action == "exit"
+        assert ret is tester
+        assert outcome == "tests_inconclusive"
+        # Cost totals still applied so we can audit the wasted run.
+        assert tester["cost"] == 0.5
+        # A tests_inconclusive message must be posted (not test_passed).
+        assert len(patched_msg_helpers) == 1
+        posted_args = patched_msg_helpers[0][0]
+        assert "tests_inconclusive" in posted_args
+
+    def test_partial_skip_with_real_passes_still_counts_as_pass(
+        self, patched_msg_helpers
+    ):
+        # tests_passed > 0 means at least one test actually ran and asserted
+        # — this is real validation, not the vacuous all-skipped pattern.
+        tester = {"some": "tester"}
+        dev = {"some": "dev"}
+        action, ret, outcome = _dispatch_tester_outcome(
+            _results("pass", run=10, passed=7, skipped=3),
+            tester, dev, cycle=1, task_id=1, task_role="developer",
+            total_cost=0.0, total_duration=0.0,
+            compaction_history=[],
+        )
+        assert action == "exit"
+        assert outcome == "tests_passed"
 
     def test_unknown_with_failed_tests_falls_through_to_fail(
         self, patched_msg_helpers

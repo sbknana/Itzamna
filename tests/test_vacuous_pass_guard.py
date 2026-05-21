@@ -30,9 +30,21 @@ from equipa.hooks import vacuous_pass as vp
 # ---------------------------------------------------------------------------
 
 
-def _result(outcome: str = "pass", tests_run: int = 0) -> dict[str, Any]:
+def _result(
+    outcome: str = "pass",
+    tests_run: int = 0,
+    tests_passed: int | None = None,
+    tests_skipped: int = 0,
+) -> dict[str, Any]:
     """Build a minimal tester_result payload."""
-    return {"result": outcome, "tests_run": tests_run}
+    if tests_passed is None:
+        tests_passed = tests_run
+    return {
+        "result": outcome,
+        "tests_run": tests_run,
+        "tests_passed": tests_passed,
+        "tests_skipped": tests_skipped,
+    }
 
 
 def _dev(files_changed: list[str] | str | None = None) -> dict[str, Any]:
@@ -235,3 +247,149 @@ def test_non_code_task_description_skips_docs_only_check(
         project_dir=None,
     )
     assert out["vacuous"] is False
+
+
+# ---------------------------------------------------------------------------
+# task-2242 fix — all-tests-skipped must be flagged as vacuous regardless
+# of how much code the developer wrote (GutenForge Stage D loophole)
+# ---------------------------------------------------------------------------
+
+
+def test_all_tests_skipped_is_flagged_even_with_real_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Tester reports pass but every test was skipped → vacuous.
+
+    Exact repro of task #2236 (Stage D): 982 LOC delivered, but the spec
+    is gated by ``test.skip()`` on missing env vars. Tester reports
+    "pass (0/1 passed)" with tests_skipped=1. Without this guard, the
+    orchestrator marks the task done despite zero validation occurring.
+    """
+    monkeypatch.setattr(vp, "_branch_has_real_work", lambda _pd: True)
+    out = vp.check_vacuous_pass(
+        tester_result=_result(
+            "pass", tests_run=1, tests_passed=0, tests_skipped=1
+        ),
+        dev_result=_dev(["app/feature.py", "tests/test_feature.py"]),
+        task={"description": "implement async AI generation"},
+        accumulated_files=["app/feature.py", "tests/test_feature.py"],
+        project_dir="/some/repo",
+    )
+    assert out["vacuous"] is True
+    assert out["all_skipped"] is True
+    assert "all_tests_skipped" in out["reason"]
+
+
+def test_all_skipped_with_many_tests_is_flagged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """tests_run=42 / tests_skipped=42 / tests_passed=0 → still vacuous."""
+    monkeypatch.setattr(vp, "_branch_has_real_work", lambda _pd: True)
+    out = vp.check_vacuous_pass(
+        tester_result=_result(
+            "pass", tests_run=42, tests_passed=0, tests_skipped=42
+        ),
+        dev_result=_dev(["src/main.py"]),
+        task={"description": "add caching"},
+        accumulated_files=["src/main.py"],
+        project_dir="/some/repo",
+    )
+    assert out["vacuous"] is True
+    assert out["all_skipped"] is True
+
+
+def test_partial_skip_with_some_passes_is_not_flagged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """tests_passed > 0 → at least one test ran for real, not vacuous."""
+    monkeypatch.setattr(vp, "_branch_has_real_work", lambda _pd: True)
+    out = vp.check_vacuous_pass(
+        tester_result=_result(
+            "pass", tests_run=10, tests_passed=7, tests_skipped=3
+        ),
+        dev_result=_dev(["src/main.py"]),
+        task={"description": "implement feature"},
+        accumulated_files=["src/main.py"],
+        project_dir="/some/repo",
+    )
+    assert out["vacuous"] is False
+    assert out.get("all_skipped") is False
+
+
+def test_all_skipped_overrides_branch_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """all-skipped detector fires even when branch has real commits.
+
+    The branch-has-commits escape hatch was added for the early-commit /
+    idle-later pattern (task #2079). It must NOT mask the all-skipped
+    pattern — the work being committed is exactly what task #2236 had,
+    yet no validation occurred.
+    """
+    monkeypatch.setattr(vp, "_branch_has_real_work", lambda _pd: True)
+    out = vp.check_vacuous_pass(
+        tester_result=_result(
+            "pass", tests_run=1, tests_passed=0, tests_skipped=1
+        ),
+        dev_result=_dev([]),
+        task={"description": "implement async generation"},
+        accumulated_files=["already.py"],
+        project_dir="/some/repo",
+    )
+    assert out["vacuous"] is True
+    assert out["all_skipped"] is True
+
+
+def test_zero_tests_run_with_skip_zero_is_not_all_skipped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """tests_run=0 means no tests existed — that's no-tests, not all-skipped."""
+    monkeypatch.setattr(vp, "_branch_has_real_work", lambda _pd: True)
+    out = vp.check_vacuous_pass(
+        tester_result=_result(
+            "no-tests", tests_run=0, tests_passed=0, tests_skipped=0
+        ),
+        dev_result=_dev(["src/main.py"]),
+        task={"description": "implement feature"},
+        accumulated_files=["src/main.py"],
+        project_dir="/some/repo",
+    )
+    assert out["vacuous"] is False
+    assert out.get("all_skipped") is False
+
+
+def test_missing_tests_skipped_key_defaults_to_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Legacy tester payloads without tests_skipped don't crash and don't fire."""
+    monkeypatch.setattr(vp, "_branch_has_real_work", lambda _pd: True)
+    out = vp.check_vacuous_pass(
+        tester_result={"result": "pass", "tests_run": 5, "tests_passed": 5},
+        dev_result=_dev(["src/main.py"]),
+        task={"description": "implement feature"},
+        accumulated_files=["src/main.py"],
+        project_dir="/some/repo",
+    )
+    assert out["vacuous"] is False
+
+
+def test_fail_outcome_with_skips_is_not_classified_as_skipped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failing run with skips is still a failure, not the all-skipped path."""
+    monkeypatch.setattr(vp, "_branch_has_real_work", lambda _pd: False)
+    out = vp.check_vacuous_pass(
+        tester_result={
+            "result": "fail",
+            "tests_run": 5,
+            "tests_passed": 0,
+            "tests_skipped": 5,
+        },
+        dev_result=_dev(["src/main.py"]),
+        task={"description": "implement feature"},
+        accumulated_files=["src/main.py"],
+        project_dir="/some/repo",
+    )
+    # fail outcome short-circuits before the all-skipped check; the
+    # all-skipped detector only fires on pass/no-tests.
+    assert out.get("all_skipped", False) is False
