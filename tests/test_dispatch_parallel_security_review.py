@@ -240,7 +240,10 @@ def _patch_parallel_mode(
 
     merge_calls: list[tuple[str, int, str]] = []
 
-    async def fake_merge(project_dir, task_id, branch_name):
+    async def fake_merge(project_dir, task_id, branch_name, **kwargs):
+        # Task #2451 Phase H: _merge_task_branch now accepts
+        # `expect_artifact` as a kw-only argument. Accept arbitrary kwargs
+        # so the mock survives signature evolution.
         merge_calls.append((project_dir, task_id, branch_name))
         return True
 
