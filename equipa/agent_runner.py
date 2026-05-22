@@ -477,6 +477,10 @@ async def run_agent(
                 "duration": duration,
                 "cost": None,
                 "errors": [f"Aborted before execution: {child_controller.signal.reason}"],
+                # Task #2314 Phase A: every exit path must set this so
+                # _resolve_files_changed_count never falls back to the
+                # agent-controlled FILES_CHANGED footer.
+                "files_changed_set": [],
             }
 
         try:
@@ -519,6 +523,7 @@ async def run_agent(
                     "duration": duration,
                     "cost": None,
                     "errors": [f"Process timed out after {effective_timeout} seconds"],
+                    "files_changed_set": [],
                 }
 
         except FileNotFoundError:
@@ -529,6 +534,7 @@ async def run_agent(
                 "duration": 0,
                 "cost": None,
                 "errors": ["'claude' command not found. Is Claude Code installed and on PATH?"],
+                "files_changed_set": [],
             }
 
         stdout_text = stdout_bytes.decode("utf-8", errors="replace").strip()
@@ -542,6 +548,11 @@ async def run_agent(
             "duration": time.time() - start_time,
             "cost": None,
             "errors": [],
+            # Task #2314 Phase A: non-streaming run_agent path does not observe
+            # tool calls, so the set is always empty. Setting it explicitly
+            # blocks _resolve_files_changed_count from trusting the agent's
+            # FILES_CHANGED footer for this code path.
+            "files_changed_set": [],
         }
 
         if stderr_text:
@@ -758,6 +769,7 @@ async def _run_agent_streaming_impl(
             "duration": time.time() - start_time,
             "cost": None,
             "errors": [f"Aborted before execution: {child_controller.signal.reason}"],
+            "files_changed_set": [],
         }
 
     try:
@@ -786,6 +798,7 @@ async def _run_agent_streaming_impl(
             "duration": 0,
             "cost": None,
             "errors": ["'claude' command not found. Is Claude Code installed and on PATH?"],
+            "files_changed_set": [],
         }
 
     try:
