@@ -696,6 +696,19 @@ async def _run_agent_streaming_impl(
     start_time = time.time()
     is_exempt = role in EARLY_TERM_EXEMPT_ROLES
 
+    # Task #2314 Phase A3: capture HEAD before any agent work so that the
+    # post-run git-diff cross-check measures ONLY commits this cycle made.
+    # Using HEAD~1..HEAD (the prior implementation) had three failure modes:
+    #   (a) multi-commit cycles under-counted (only last commit's files seen)
+    #   (b) non-writer roles (code-reviewer / security-reviewer) running after
+    #       the developer in the same worktree inherited the developer's diff
+    #   (c) deferred commits caused stale-HEAD overrides of fresh edits
+    # pre_head..post_head solves all three. None means "no commits yet" — the
+    # later cross-check skips the override and trusts files_changed_set.
+    pre_head: str | None = None
+    if project_dir:
+        pre_head = await _git_rev_parse_head(project_dir)
+
     # Create child abort controller if parent provided
     child_controller = (
         create_child_abort_controller(abort_controller)
@@ -1330,52 +1343,84 @@ async def _run_agent_streaming_impl(
     result["files_read"] = sorted(files_read)
     result["files_changed_set"] = sorted(files_changed)
 
-    # Task #2314 Phase D: when the agent committed inside a feature branch,
-    # cross-check the tool-call-derived files_changed_set against the actual
-    # git diff. git is the canonical source — tool-call observation misses
-    # Bash-driven writes (sed -i, tee, mv, cp, redirection). Log a warning on
-    # mismatch as a possible fabrication / blind-spot signal. The git count
-    # then takes precedence by being written into "files_changed_count".
-    if project_dir:
-        git_diff_count = await _git_diff_files_changed_count(project_dir)
-        if git_diff_count is not None:
-            tool_count = len(files_changed)
-            if git_diff_count != tool_count:
-                log(
-                    f"  [Telemetry] files_changed cross-check mismatch: "
-                    f"tool-calls={tool_count} git-diff={git_diff_count}. "
-                    f"Bash-driven writes or fabrication possible.",
-                    output,
-                )
-            # Canonical signal: git's view of what actually committed.
-            result["files_changed_count"] = git_diff_count
+    # Task #2314 Phase A3: cross-check files_changed_set against the actual
+    # git diff over the range pre_head..post_head — commits this cycle made,
+    # NOT HEAD~1..HEAD (which mis-counts multi-commit cycles and leaks the
+    # developer's diff into the reviewer's row). The override only fires when
+    # at least one commit landed during this run; non-writer roles and
+    # deferred-commit cycles see pre_head == post_head and keep the
+    # files_changed_set count (Phase A made that field authoritative on every
+    # exit path). The mismatch warning fires ONLY on real disagreement about
+    # actually-committed work — silent on roles that wrote nothing.
+    if project_dir and pre_head is not None:
+        post_head = await _git_rev_parse_head(project_dir)
+        if post_head and post_head != pre_head:
+            git_diff_count = await _git_diff_files_changed_count(
+                project_dir, pre_head, post_head,
+            )
+            if git_diff_count is not None:
+                tool_count = len(files_changed)
+                if git_diff_count != tool_count:
+                    log(
+                        f"  [Telemetry] files_changed cross-check mismatch: "
+                        f"tool-calls={tool_count} git-diff={git_diff_count} "
+                        f"(range {pre_head[:8]}..{post_head[:8]}). "
+                        f"Bash-driven writes or fabrication possible.",
+                        output,
+                    )
+                # Canonical signal: git's view of what actually committed
+                # during this cycle. Only set when commits exist; otherwise
+                # files_changed_set (already on result) is authoritative.
+                result["files_changed_count"] = git_diff_count
 
     return result
 
 
-async def _git_diff_files_changed_count(project_dir: str) -> int | None:
-    """Return the number of files changed in the most recent commit relative
-    to its parent, or ``None`` if it cannot be determined.
+async def _git_rev_parse_head(project_dir: str) -> str | None:
+    """Resolve HEAD to a commit SHA, or ``None`` if the repo has no commits
+    yet / project_dir is not a git repo / git errors. Never raises.
 
-    Used as the canonical Phase-D signal for agent_runs.files_changed_count.
-    Falls back to ``None`` (caller keeps the tool-call-derived count) when
-    HEAD has no parent yet, the directory is not a git repo, or git errors.
-    Uses ``git_run_async`` so the event loop is not blocked. Never raises.
+    Used as the bookends for the Phase-A3 pre_head..post_head diff range so
+    the cross-check measures only commits made during this agent cycle.
     """
     try:
         from equipa.git_ops import git_run_async
-        # Confirm HEAD~1 resolves before asking for the diff. A fresh repo or
-        # a feature branch whose first commit is its only commit returns
-        # nonzero here, and we fall through to the tool-call set.
-        rev = await git_run_async(["rev-parse", "--verify", "HEAD~1"], project_dir, timeout=10)
+        rev = await git_run_async(
+            ["rev-parse", "--verify", "HEAD"], project_dir, timeout=10,
+        )
         if rev.returncode != 0:
             return None
+        sha = rev.stdout.strip()
+        return sha or None
+    except Exception:
+        # Justified broad catch: best-effort telemetry probe. A git failure
+        # here must not crash the orchestrator before / after the agent runs.
+        return None
+
+
+async def _git_diff_files_changed_count(
+    project_dir: str,
+    pre_head: str,
+    post_head: str,
+) -> int | None:
+    """Return the number of unique files changed in the range
+    ``pre_head..post_head``, or ``None`` if it cannot be determined.
+
+    Canonical Phase-A3 signal for ``agent_runs.files_changed_count``. The
+    range covers every commit made during the current agent cycle, so
+    multi-commit cycles count correctly and non-writer roles (no commits)
+    never reach this code path. Uses ``git_run_async`` so the event loop is
+    not blocked. Never raises.
+    """
+    try:
+        from equipa.git_ops import git_run_async
         diff = await git_run_async(
-            ["diff", "--name-only", "HEAD~1", "HEAD"], project_dir, timeout=10,
+            ["diff", "--name-only", f"{pre_head}..{post_head}"],
+            project_dir, timeout=10,
         )
         if diff.returncode != 0:
             return None
-        files = [line for line in diff.stdout.splitlines() if line.strip()]
+        files = {line for line in diff.stdout.splitlines() if line.strip()}
         return len(files)
     except Exception:
         # Justified broad catch: this is a best-effort telemetry probe; any
