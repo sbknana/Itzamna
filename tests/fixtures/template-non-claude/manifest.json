@@ -2,8 +2,8 @@
   "exported_at": "2026-05-03T12:00:00+00:00",
   "file_sha": {
     "assets/ASSISTANT.md": "3933e235ba83fbc4cc36c34cf294fcb6686b56ab78d0858e7639ccdc0428e8c3",
-    "tables/projects.jsonl": "a782c5750fe90d4603196b6d0e29abf6ef8065449dc0cf19538b49b2e7c67af2",
-    "tables/tasks.jsonl": "6d5929f1c8da09134bdaeb2c30fcfb1202959d1f24e19ec62a44fb1629f1e7a2"
+    "tables/projects.jsonl": "d786d47d4ca2ab8aa6e0202ab27bbf84f0b08f156abb51661febb5c4b2c0d6e1",
+    "tables/tasks.jsonl": "e40a446c51ca7b346a5146d2efd065a989337791253c11e31f40abcef5ebdf03"
   },
   "id_namespace": "source",
   "row_counts": {
