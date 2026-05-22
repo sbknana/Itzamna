@@ -1,126 +1,127 @@
-# Security Review — Task #2314 (Attempt 2)
+# Security Review — Task #2314 (Attempt 3)
 
-**Topic:** `agent_runs.files_changed_count` instrumentation, re-review of attempt-1 fixes.
+**Topic:** `agent_runs.files_changed_count` instrumentation, re-review of attempt-2 fixes.
 **Scope:** `equipa/db.py`, `equipa/agent_runner.py`, `tests/test_files_changed_count.py`.
-**Outcome:** All HIGH + 3 MEDIUM findings from attempt 1 closed. No new CRITICAL or HIGH introduced.
+**Outcome:** Attempt-2 S1 HIGH + S2 MED + S3 MED all closed by Phase A3
+(unified pre_head..post_head diff range). No new CRITICAL or HIGH introduced.
 
 ## Counts
 
 - CRITICAL: 0
 - HIGH: 0
-- MEDIUM: 0 (open) / 4 (closed from attempt 1)
-- LOW: 2
-- INFO: 1
+- MEDIUM: 0
+- LOW: 2 (carried from attempt 2 — S5 narrower scope; S6 unchanged)
+- INFO: 1 (carried from attempt 2 — S7 unchanged)
 
-## Findings closed from attempt 1
+## Findings closed in attempt 3
 
-### S1 (HIGH, closed) — Footer-forgery via fallback parse
+### S1 (HIGH, closed) — Reviewer rows leaked the developer's diff
 
-The previous `_resolve_files_changed_count` fell through to
-`_parse_files_changed_block(result["result_text"])` when `files_changed_set`
-was absent. A vacuous-pass agent could emit a forged
-`FILES_CHANGED:\n- a.py\n- b.py\n- c.py\n` footer and the helper would record
-3, defeating the vacuous-pass alert.
+Attempt-2 ran `git diff --name-only HEAD~1 HEAD` unconditionally at the end
+of `_run_agent_streaming_impl` and assigned the result to
+`result["files_changed_count"]`. When a code-reviewer or security-reviewer
+agent ran after the developer in the **same worktree**, `HEAD~1..HEAD` still
+pointed at the developer's last commit — so the reviewer's `agent_runs` row
+recorded the developer's file count, even though the reviewer wrote nothing.
 
-**Fix:** `files_changed_set` is now authoritative. When present (even when
-empty), the helper returns `len(value)` and does NOT consult the footer.
-When absent, the helper logs a WARN and returns 0; the footer-parse fallback
-was removed entirely from the live trust path. Every exit path in
-`run_agent` and `_run_agent_streaming_impl` (success, error, max-turns,
-early-term, FileNotFound, abort, timeout) now sets `files_changed_set` to a
-list, so absence is now a true callsite bug rather than a normal flow.
+That is the **exact failure mode the task was filed to detect**: the vacuous-
+pass alert (`success=1 AND files_changed_count=0`) would *never* trip for
+reviewer rows, because reviewers always inherited a non-zero count from
+upstream commits in the worktree.
 
-Verified by `test_empty_files_changed_set_blocks_footer_forgery` and
-`test_footer_alone_is_not_trusted`.
+**Fix (Phase A3):** capture `pre_head` at the START of
+`_run_agent_streaming_impl`, before any agent work. At the end, capture
+`post_head`. Only override `result["files_changed_count"]` when
+`pre_head != post_head` (i.e. at least one commit landed during this run).
+Non-writer roles see `pre_head == post_head` and the override is skipped;
+their `files_changed_set` (now authoritative on every exit path by attempt-
+2 Phase A) determines the recorded count.
 
-### S2 (MEDIUM, closed) — `bool` accepted as `int`
+Verified by `test_no_commits_means_pre_head_equals_post_head` and the
+existing `test_security_reviewer_records_zero_files`.
 
-`isinstance(True, int)` is True in Python, so an explicit
-`files_changed_count=True` was silently coerced to 1.
+### S2 (MEDIUM, closed) — Multi-commit cycles under-counted
 
-**Fix:** the explicit-count branch now requires
-`isinstance(explicit, int) and not isinstance(explicit, bool)`. True and
-False both fall through.
+`HEAD~1..HEAD` only sees the LAST commit. A developer cycle that committed
+Phases A/B/C/D + tests + docs (5–6 commits is normal in this repo) showed
+only the last commit's files — chronically under-counting productive
+cycles, and inverting the vacuous-pass signal for cycles that did the most
+work.
 
-Verified by `test_explicit_true_rejected` and
-`test_explicit_false_rejected`.
+**Fix (Phase A3):** the diff range is now `pre_head..post_head`, covering
+every commit made during the cycle. The helper deduplicates filenames
+(returns `len(set(...))`) so a file edited in multiple commits is counted
+once. A 3-commit cycle touching 6 unique files now reports 6.
 
-### S3 (MEDIUM, closed) — Upper-bound sanity check
+Verified by `test_multi_commit_cycle_counts_all_unique_files` and
+`test_unique_files_across_commits_not_double_counted`.
 
-Any caller (or attacker-controlled path) could push 1e12 into the column,
-skewing alerting and quality scoring.
+### S3 (MEDIUM, closed) — Deferred-commit override of fresh edits
 
-**Fix:** all numeric branches route through `_clamp_files_changed`, which
-caps at `_FILES_CHANGED_MAX = 10_000` (well above any realistic monorepo
-diff) and logs a warning when clamping occurs. Negative inputs collapse to
-0.
+If the developer used Edit/Write but the orchestrator committed the work
+AFTER `_run_agent_streaming_impl` returned, `HEAD~1..HEAD` measured the
+PREVIOUS commit. `files_changed_set` held the real edits; the git-diff
+fallback held stale ones. Attempt-2's unconditional override preferred the
+smaller (stale) signal — inverse of Phase D's intent.
 
-Verified by `test_explicit_giant_int_is_clamped` and
-`test_clamp_applies_to_files_changed_set`.
+**Fix (Phase A3):** when no commits land during the cycle
+(`pre_head == post_head`), the override does not fire. The in-memory
+`files_changed_set` written during the cycle is recorded verbatim. When the
+orchestrator commits later, the value already in `agent_runs` reflects the
+agent's actual writes — not a stale measurement from a different cycle.
 
-### S4 (MEDIUM, closed) — Bash-driven writes invisible to tool observation
+Verified by `test_no_commits_means_pre_head_equals_post_head` (the helper
+correctly returns the same SHA when no commits land) plus the existing
+`test_developer_with_edits_records_nonzero` and
+`test_explicit_count_from_caller_takes_precedence`.
 
-`files_changed_set` is built from observed Edit/Write/NotebookEdit tool
-calls. Bash-driven writes (`sed -i`, `tee`, `mv`, `cp`, output redirection)
-were invisible to it, so a developer agent doing all its work in Bash would
-record 0 even when the agent actually committed multiple files.
+## Findings carried forward
 
-**Fix:** at the end of `_run_agent_streaming_impl`, when `project_dir` is
-known and HEAD~1 resolves, the runner shells out via `git_run_async` (not
-raw subprocess) to `git diff --name-only HEAD~1 HEAD` and writes that count
-into `result["files_changed_count"]`. The explicit branch of
-`_resolve_files_changed_count` picks it up as the canonical signal; the
-tool-call set length becomes a cross-check and a mismatch is logged as
-possible fabrication / blind-spot.
+### S5 (LOW, carried) — git cross-check yields `None` if pre_head missing
 
-Verified by `test_explicit_count_from_caller_takes_precedence`. Live
-behaviour exercised end-to-end every time the streaming runner finishes a
-cycle in a feature-branch worktree.
+The Phase-A3 helper `_git_rev_parse_head` returns `None` when the repo has
+no commits yet or the directory is not a git repo. The caller skips the
+override and trusts `files_changed_set`. This is the intended graceful
+degradation — verified by `test_rev_parse_returns_none_when_no_commits`
+and `test_rev_parse_returns_none_for_non_repo`. Recorded as LOW because the
+graceful path is exercised only on fresh worktrees and could in principle
+mask a worktree-corruption case.
 
-## New findings
+### S6 (LOW, carried) — Log injection surface in cross-check warning
 
-### S5 (LOW) — git cross-check yields `None` on first commit of a branch
+The mismatch warning now includes both abbreviated commit SHAs (8 hex
+chars, regex-safe) and integer counts. No untrusted string substitution
+occurs. No exploitable injection; flagged for re-review if the warning
+surface ever takes string input.
 
-When the feature branch has only one commit (no HEAD~1), the cross-check
-returns `None` and the caller keeps the tool-call set length. This is the
-documented and correct behaviour, but a developer cycle that commits
-exactly once and does its writes via Bash would still record 0. The number
-of such cases is small in practice (developer agents are nudged to commit
-per edit) and the warning logged at `[Telemetry] cross-check mismatch`
-catches the larger blind spot.
+### S7 (INFO, carried) — `files_changed_count` schema constraint
 
-**Recommendation:** if Bash-only cycles become a pattern, extend the
-cross-check to also compare against `git diff --name-only master..HEAD`
-when HEAD~1 is unavailable.
-
-### S6 (LOW) — Log injection surface in cross-check warning
-
-The mismatch warning includes the tool-call count and git count, both
-integers, so no untrusted string substitution occurs. The `_clamp` warning
-includes the source label, which is one of three hard-coded strings. No
-exploitable injection, but flagged for the record so any future expansion
-of the warning surface gets re-reviewed.
-
-### S7 (INFO) — `files_changed_count` not enforced as `int` on insert
-
-The Phase-D path always writes an `int`, but the schema column has no
-`CHECK` constraint. A bug that wrote `None` or a float would still land in
-the column. The existing `record_agent_run` insert binds the value with
-`?` placeholders so SQLite type-affinity will coerce, but a future
-migration could add `CHECK (files_changed_count >= 0 AND files_changed_count <= 10000)`
-as defence-in-depth.
+The Phase-A3 path always writes an `int`. The schema column still has no
+`CHECK` constraint. A future migration could add
+`CHECK (files_changed_count >= 0 AND files_changed_count <= 10000)` as
+defence-in-depth.
 
 ## Verification artifacts
 
-- 25/25 tests in `tests/test_files_changed_count.py` pass.
-- 1733/1733 tests in `tests/` pass (after deselecting two pre-existing
-  fixture-missing failures in `tests/test_cli_templates.py`:
-  `test_import_accepts_non_claude_fixture` and
-  `test_validate_accepts_non_claude_fixture`, both unrelated and reproducible
-  against master).
-- Runtime probes from the task spec all hold:
+- **31/31** tests in `tests/test_files_changed_count.py` pass (24 attempt-2 +
+  7 Phase A3).
+- **1767/1767** tests in the full suite pass (excluding the pre-existing
+  `equipa/integration_test.py` collection issue that aborts the runner at
+  import time; unrelated to this task).
+- Attempt-3 fixture probes:
+  - Multi-commit cycle: 3 commits × 2 unique files each → count == 6 (not 2).
+  - No-commit reviewer role: `pre_head == post_head` → override skipped,
+    `files_changed_count` taken from `files_changed_set` (0 for a reviewer).
+  - Bash-driven writes: 1 commit touching 2 files via Bash → count == 2.
+  - Same file in 2 commits → counted once (set dedup).
+- Attempt-2 probes still hold:
   - `_resolve_files_changed_count({"result_text": "FILES_CHANGED:\n- forged.py\n", "files_changed_set": []})` → 0
   - `_resolve_files_changed_count({"files_changed_count": True})` → 0
   - `_resolve_files_changed_count({"files_changed_count": 999_999_999_999})` → 10000
+
+## Out of scope
+
+S4 (dead-code `_parse_files_changed_block`), S5 bare-dash sentinel, S6–S8
+LOW polish — explicitly excluded by the task spec.
 
 Copyright 2026 Forgeborn.
