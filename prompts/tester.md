@@ -215,14 +215,27 @@ RECOMMENDATIONS:
 SUMMARY: One-line description of test results
 ```
 
-**TESTS_SKIPPED is REQUIRED.** Count every test that the framework marked as
-skipped (vitest/playwright `.skip`, pytest `pytest.skip`, go `t.Skip()`, etc.).
+**TESTS_SKIPPED is REQUIRED — omission is a contract violation, not a
+default to 0.** Count every test that the framework marked as skipped
+(vitest/playwright `.skip`, pytest `pytest.skip`, go `t.Skip()`, etc.).
+If you do not emit the `TESTS_SKIPPED:` line, the orchestrator will
+treat your run as **tests_inconclusive** and retry — even if every test
+genuinely passed. This is intentional: the orchestrator cannot tell a
+truthful 0-skips from a regression where you stopped emitting the field.
+
 If every test was skipped (`TESTS_SKIPPED == TESTS_RUN > 0` and
 `TESTS_PASSED == 0`), still report `RESULT: pass` — the orchestrator will
 detect the all-skipped pattern and route the run to a stricter retry rather
 than marking the task done. Do NOT hide skips by reporting `TESTS_RUN: 0`:
 that masks the missing-env-vars / missing-prerequisites signal the
-orchestrator relies on to escalate.
+orchestrator relies on to escalate, and the orchestrator cross-checks
+your reported skip count against the framework's own stdout — if the
+framework printed "5 skipped" but you reported `TESTS_SKIPPED: 0`, the
+run is flagged tests_inconclusive.
+
+**Counts must be internally consistent.** `TESTS_PASSED + TESTS_FAILED +
+TESTS_SKIPPED` must equal `TESTS_RUN` whenever `TESTS_RUN > 0`. The
+orchestrator rejects inconsistent integers as tests_inconclusive.
 
 **After this block: STOP. You are done. No more tool calls. No more text.**
 
