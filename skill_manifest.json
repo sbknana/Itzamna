@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "generated_at": "2026-05-21T22:17:47Z",
+  "generated_at": "2026-05-22T20:29:22Z",
   "description": "SHA-256 hashes of prompt and skill files for integrity verification",
   "files": {
     "prompts/_common.md": "4efe8fa5c6b7d57697fb8fd7c88d47867e6d3c39008f5bd0676f50ded4fcb606",
@@ -27,7 +27,7 @@
     "prompts/researcher.md": "e369f60bce5fb078176770cfbde9ba42b88a310498c27f3913cf6066b39ff326",
     "prompts/security-reviewer.md": "b7294e8e56d0fce51255b4d7aa412df83ffaf08521a8489ca0bd9536351aeced",
     "prompts/story-tester.md": "59f5d09c08d1321a6ac0ec5ddc7dbc45979039c6e690ce82fd2565f13902279d",
-    "prompts/tester.md": "0070772f3992b8f61ce6a31a666be6d01d5efd1fe516509975001ba62620263e",
+    "prompts/tester.md": "356d58cff95ea937846f0e4f7ec7b0582e4db7620eb4cbc679abe1e60d9583b9",
     "prompts/world-builder.md": "727138b2b23ff2d947b1032b0b4fb265da56b46fe23ecc213c38018ef62eceb8",
     "skills/code-reviewer/README.md": "736b69c6d8f9adfe3e685ba0efd4a18d14a6ed7305317147ea37ebf47b0d16f8",
     "skills/code-reviewer/skills/architecture-review/SKILL.md": "0cd0e4db05fd370521a8a039d6adf658606a11d8be5ed10daf58f3ead064c07c",
