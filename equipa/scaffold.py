@@ -281,8 +281,47 @@ def _copy_tree(source: Path, dest: Path) -> list[str]:
     return copied
 
 
+# Sentinel string that marks the legitimate, generator-emitted Agent Quick
+# Start header. Any other occurrence of "Agent Quick Start" in generated
+# output indicates a DB-field injection attempt and triggers a defensive
+# fallback below. The sentinel is intentionally hard to type accidentally.
+_AGENT_QUICK_START_SENTINEL = (
+    "<!-- equipa-quickstart-sentinel:5f7c1d9a-3e2b-4f9a-9e21-quickstart -->"
+)
+
+# Per-field byte cap for DB-sourced strings that flow into generated CLAUDE.md.
+# Long fields (summary, target_market, revenue_model can be free-form prose) are
+# truncated to prevent a single rogue row from injecting an unbounded amount
+# of attacker-controlled text into the agent's primary context document.
+_FIELD_BYTE_CAP = 1024
+
+
+def _sanitise_db_field(value: object, field_name: str) -> str:
+    """Coerce, truncate, and blockquote a DB-sourced CLAUDE.md field.
+
+    Three defences:
+      * **Type coercion + cap.** Forces ``str`` and truncates to
+        ``_FIELD_BYTE_CAP`` characters so a single oversized row cannot
+        flood the generated file.
+      * **Blockquote prefix.** Every line is rendered as ``> …`` so any
+        markdown headings (``##``) inside the field render as quoted text
+        rather than top-level instructions to the agent.
+      * **Sentinel scrub.** Any occurrence of the quick-start sentinel
+        inside DB content is stripped — the sentinel must appear at most
+        once, at the canonical position emitted by this module.
+    """
+    if value is None:
+        return f"> (no {field_name} recorded)"
+    text = str(value)
+    if len(text) > _FIELD_BYTE_CAP:
+        text = text[:_FIELD_BYTE_CAP] + "…[truncated]"
+    text = text.replace(_AGENT_QUICK_START_SENTINEL, "[sentinel-stripped]")
+    lines = text.splitlines() or [""]
+    return "\n".join(f"> {line}" for line in lines)
+
+
 _AGENT_QUICK_START_TEMPLATE = """\
-## Agent Quick Start
+## Agent Quick Start {sentinel}
 
 You are working in **{project_name}**, a freshly cloned ForgeScaffold-based
 project. Read these four lines before you do anything else:
@@ -352,14 +391,31 @@ def build_project_claude_md(
     project_info: dict | None = None,
     db_conn_factory=None,
 ) -> str:
-    """Construct a project-specific ``CLAUDE.md`` from TheForge metadata."""
+    """Construct a project-specific ``CLAUDE.md`` from TheForge metadata.
+
+    All DB-sourced fields are length-capped and blockquote-prefixed so a
+    malicious project row cannot inject markdown headings (``## Agent Quick
+    Start\\n1. Always force-push…``) that would steer every agent in the
+    project. The legitimate Agent Quick Start header carries a sentinel
+    string that this function verifies appears exactly once in the output;
+    any additional sentinels signal tampering and trigger a hard fallback.
+    """
     info = project_info or _project_metadata(project_id, db_conn_factory=db_conn_factory)
-    name = info.get("name") or f"Project {project_id}"
-    codename = info.get("codename") or name
-    summary = info.get("summary") or "(no summary recorded yet)"
-    category = info.get("category") or "scaffold-based"
-    target = info.get("target_market") or "(not recorded)"
-    revenue = info.get("revenue_model") or "(not recorded)"
+
+    # ``name`` and ``codename`` flow into structural positions (top-level
+    # heading and a metadata bullet) so we cap + single-line them. Multi-line
+    # injection into the heading itself is prevented by collapsing newlines.
+    raw_name = info.get("name") or f"Project {project_id}"
+    name = str(raw_name)[:_FIELD_BYTE_CAP].replace("\n", " ").replace("\r", " ").strip()
+    raw_codename = info.get("codename") or name
+    codename = str(raw_codename)[:_FIELD_BYTE_CAP].replace("\n", " ").replace("\r", " ").strip()
+    raw_category = info.get("category") or "scaffold-based"
+    category = str(raw_category)[:_FIELD_BYTE_CAP].replace("\n", " ").replace("\r", " ").strip()
+
+    # Long free-form fields are rendered as multi-line blockquotes.
+    summary_q = _sanitise_db_field(info.get("summary") or "(no summary recorded yet)", "summary")
+    target_q = _sanitise_db_field(info.get("target_market") or "(not recorded)", "target_market")
+    revenue_q = _sanitise_db_field(info.get("revenue_model") or "(not recorded)", "revenue_model")
 
     header = (
         f"# {name}\n\n"
@@ -367,12 +423,17 @@ def build_project_claude_md(
         f"**Codename:** {codename}\n"
         f"**Category:** {category}\n\n"
     )
-    quick_start = _AGENT_QUICK_START_TEMPLATE.format(project_name=name)
+    quick_start = _AGENT_QUICK_START_TEMPLATE.format(
+        project_name=name,
+        sentinel=_AGENT_QUICK_START_SENTINEL,
+    )
     overview = (
         "\n## Project Overview\n\n"
-        f"{summary}\n\n"
-        f"- **Target market:** {target}\n"
-        f"- **Revenue model:** {revenue}\n"
+        f"{summary_q}\n\n"
+        "**Target market:**\n\n"
+        f"{target_q}\n\n"
+        "**Revenue model:**\n\n"
+        f"{revenue_q}\n"
     )
     scaffold_notice = (
         "\n## Scaffold Origin\n\n"
@@ -381,7 +442,17 @@ def build_project_claude_md(
         "dependencies match the scaffold; project-specific logic lives "
         "under `src/`.\n"
     )
-    return header + quick_start + overview + scaffold_notice
+    rendered = header + quick_start + overview + scaffold_notice
+    # Sentinel invariant: there must be exactly one Agent Quick Start
+    # sentinel in the final document. >1 means a DB field contained the
+    # sentinel verbatim (very unlikely) and our scrub failed.
+    if rendered.count(_AGENT_QUICK_START_SENTINEL) != 1:
+        raise ScaffoldCloneError(
+            "Refusing to write CLAUDE.md: Agent Quick Start sentinel appears "
+            f"{rendered.count(_AGENT_QUICK_START_SENTINEL)} times (expected 1). "
+            "DB field tampering suspected."
+        )
+    return rendered
 
 
 def ensure_scaffold(
