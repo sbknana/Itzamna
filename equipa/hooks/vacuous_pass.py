@@ -176,13 +176,17 @@ def check_vacuous_pass(**kwargs: Any) -> dict[str, Any]:
     )
     tester_outcome = (tester_result.get("result") or "").lower()
 
-    # Task #2242 Phase A: TESTS_SKIPPED is REQUIRED in the tester contract.
-    # If the line is absent and tests_run > 0, the tester is in contract
-    # violation — drift, truncation, model regression, deliberate misreport.
-    # Classify as vacuous so the orchestrator routes to a stricter retry.
+    # Task #2242 Phase A / E3: TESTS_SKIPPED is REQUIRED in the tester
+    # contract REGARDLESS of tests_run value. The previous gate
+    # (``tests_run > 0``) made the no-tests branch (tests_run == 0 by
+    # definition) bypass Phase A entirely, which let an adversarial tester
+    # report ``RESULT: no-tests`` (or even ``RESULT: pass, TESTS_RUN: 0``)
+    # while omitting TESTS_SKIPPED and silently slip past the guard.
+    # The contract violation is the omission itself — it does not become
+    # acceptable just because the tester also claimed zero tests ran.
+    # Fail closed on absence at any tests_run value.
     if (
         tester_outcome in {"pass", "no-tests"}
-        and tests_run > 0
         and not tests_skipped_present
     ):
         return {
