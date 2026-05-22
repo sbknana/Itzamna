@@ -1,157 +1,205 @@
-# Security Review — Task #2242 (re-dispatch)
+# Security Review — Task #2242 (attempt 3)
 
-**Scope:** EQUIPA vacuous-pass loophole — re-dispatch closing all S1 HIGH /
-S2 HIGH / S3 MEDIUM / S4 MEDIUM findings from the attempt-1 review.
+**Scope:** EQUIPA vacuous-pass loophole — attempt 3 closes all 2 HIGH + 4
+MEDIUM findings raised in the attempt-2 review.
 
-**Branch:** `forge-task-2242` (built on top of `forge-task-2242-attempt1`).
-**Files changed (this dispatch, on top of attempt-1):**
-- `equipa/parsing.py`
-- `equipa/loops.py`
-- `equipa/hooks/vacuous_pass.py`
-- `prompts/tester.md`
-- `tests/test_vacuous_pass_guard.py`
-- `tests/test_tester_phase.py`
-- `tests/test_tester_parsing_2242.py` (new)
-- `skill_manifest.json` (auto-regenerated)
+**Branch:** `forge-task-2242` (built on top of `forge-task-2242-attempt2`).
 
-## Summary
+**Files changed (this dispatch, on top of attempt-2):**
+- `equipa/agent_runner.py` — Phase A3
+- `equipa/loops.py` — Phase B3 (gate drop + paired guard), Phase A3 wiring
+- `equipa/parsing.py` — Phase C3 + F3 (parser as source of truth), Phase D3 (anchored regex)
+- `equipa/hooks/vacuous_pass.py` — Phase C3/F3 (None sentinel) + Phase E3
+- `tests/test_tester_phase.py` — A3/B3 fixtures
+- `tests/test_tester_parsing_2242.py` — C3/D3/F3 fixtures
+- `tests/test_vacuous_pass_guard.py` — E3/F3 fixtures
+
+## Counts
 
 | Severity | Count | Status |
 | --- | --- | --- |
 | CRITICAL | 0 | — |
-| HIGH | 0 | All attempt-1 HIGHs resolved |
-| MEDIUM | 0 | All attempt-1 MEDIUMs resolved (in-scope items only) |
-| LOW | 0 | Out-of-scope (S5–S7) deferred per task constraints |
+| HIGH | 0 | All attempt-2 HIGHs (F1, F2) resolved |
+| MEDIUM | 0 | All attempt-2 MEDIUMs (F3, F4, F5, F6) resolved |
+| LOW | 0 | Out-of-scope items deferred (F7, F8, F9) |
 | INFO | 0 | — |
 
-The attempt-1 guard failed open on the very class of bypass it was meant
-to catch. This dispatch lands four defense-in-depth layers, each backed
-by fixtures, and tightens the canonical predicate to `==`.
+The attempt-2 fix landed Phase A/B/C/D but two HIGH gate-bypasses remained:
+Phase B was structurally blind to framework stdout, and a tester reporting
+`TESTS_RUN: 0` bypassed Phase A/C/D entirely. Attempt 3 closes both plus the
+four MEDIUM defense-in-depth findings.
 
 ## Resolved Findings
 
-### S1 HIGH (Phase A) — Mandatory TESTS_SKIPPED presence
+### F1 HIGH (Phase A3) — Phase B sees framework stdout
 
-**Original finding (attempt-1):** Tester prompt declares `TESTS_SKIPPED`
-as REQUIRED, but the parser at `_parse_structured_output` silently
-defaults missing int fields to 0. A tester that omits the line (drift,
-truncation, model regression, deliberate misreport) produced
-`tests_skipped=0`, the all-skipped predicate failed for any
-`tests_run > 0`, and the loophole reopened.
-
-**Fix:**
-- `equipa/parsing.py:parse_tester_output` now sets a new boolean key
-  `tests_skipped_present` based on whether the raw text contains a line
-  beginning with `TESTS_SKIPPED:`. Implemented via the new helper
-  `_has_marker_line`.
-- `equipa/loops.py:_dispatch_tester_outcome` reads
-  `tests_skipped_present` and routes the outcome to `tests_inconclusive`
-  when the line is absent and `tests_run > 0`.
-- `equipa/hooks/vacuous_pass.py:check_vacuous_pass` mirrors the
-  fail-closed behavior.
-- `prompts/tester.md` now states explicitly: "omission is a contract
-  violation, not a default to 0", and warns that the orchestrator will
-  retry the run as tests_inconclusive when the line is missing.
-
-**Verification:** `tests/test_tester_parsing_2242.py` covers both
-present-and-zero and absent cases. `tests/test_vacuous_pass_guard.py`
-asserts the hook flags the absent case. `tests/test_tester_phase.py`
-asserts the dispatcher posts the correct `missing_tests_skipped_field`
-reason and routes to `tests_inconclusive`.
-
-### S2 HIGH (Phase B) — TESTS_RUN=0 bypass
-
-**Original finding (attempt-1):** Both detector sites short-circuited on
-`tests_run > 0`. A tester reporting `TESTS_RUN: 0, TESTS_PASSED: 0`
-fell through to the no-tests branch, where only `_is_docs_only` could
-save us. Nothing enforced that the report agreed with reality.
+**Original finding (attempt-2):** `grep_framework_skip_counts` reads
+`result_text`, but `result_text` at `agent_runner.py:842` contains ONLY
+`block_type == "text"` blocks from assistant messages — tool_use_result
+blocks (the actual bash stdout the framework printed) were never added.
+Phase B was therefore structurally blind to framework-emitted skip counts.
 
 **Fix:**
-- New helper `equipa.parsing.grep_framework_skip_counts(result_text)`
-  scans tester stdout for framework-emitted skip signals:
-  - `\b(\d+)\s+skipped\b` (vitest, playwright, generic)
-  - `\b(\d+)\s+todo\b` (jest)
-  - `=\s*(\d+)\s+skipped[\s=]` (pytest footer)
-  - `^---\s+SKIP:\s+\S+` per-line count (go test)
-  Returns the max count observed across patterns.
-- `_dispatch_tester_outcome` compares the framework count against the
-  tester's reported `tests_skipped`. Disagreement (framework > tester)
-  routes to `tests_inconclusive` with reason
-  `framework_skip_count_disagrees` and the observed count attached.
+- `equipa/agent_runner.py` now accumulates `tool_output_text_chunks` from
+  every `tool_result` content block in the user-message stream, joins
+  them (size-capped at 200 KiB to keep callers cheap), and exposes the
+  result on the agent's result dict as `tool_output_text`.
+- `equipa/loops.py` Phase B feeds **both** `result_text` and
+  `tool_output_text` into `grep_framework_skip_counts`.
 
-**Verification:** `tests/test_tester_parsing_2242.py` parametrizes
-vitest, jest, pytest, playwright, and go output; `tests/test_tester_phase.py`
-covers the dispatcher's disagreement-detection path end-to-end.
+**Verification:**
+`tests/test_tester_phase.py::test_tool_output_skip_disagreement_routes_inconclusive`
+asserts that a tester emitting a clean structured block but a
+`tool_output_text` containing a pytest footer `"5 skipped"` routes to
+`tests_inconclusive` with reason `framework_skip_count_disagrees`.
 
-### S3 MEDIUM (Phase C) — Internal-consistency check
+### F2 HIGH (Phase B3) — Drop tests_run>0 gate on Phase A; paired guard
 
-**Original finding (attempt-1):** The four reported integers were
-accepted independently. `tests_run=10, passed=0, failed=0, skipped=3`
-is internally inconsistent (7 tests unaccounted for) but currently
-passed both guards.
+**Original finding (attempt-2):** `loops.py:1282` (Phase A), `:1304`
+(Phase C), `:1312` (Phase D) all required `tests_run > 0`. A tester
+reporting `RESULT: pass, TESTS_RUN: 0` bypassed all three.
 
 **Fix:**
-- `_dispatch_tester_outcome` now requires
-  `tests_passed + tests_failed + tests_skipped == tests_run` whenever
-  `tests_run > 0`. Inconsistency routes to `tests_inconclusive` with
-  reason `counts_inconsistent` and both `expected_sum` and
-  `actual_sum` attached to the message payload.
-- `vacuous_pass.check_vacuous_pass` mirrors the consistency guard
-  (without the message payload — the hook is pure).
-- `prompts/tester.md` documents the requirement under the OUTPUT FORMAT
-  block.
+- `equipa/loops.py` drops the `tests_run > 0` gate on Phase A — the
+  contract violation is the omission itself, regardless of `tests_run`.
+- A paired guard fires immediately after Phase A: when
+  `tester_outcome == "pass"` and `tests_run == 0`, the outcome routes to
+  `tests_inconclusive` (reason: `pass_with_zero_tests`). "Pass with zero
+  tests" is itself a contract violation.
+- Phase C and Phase D continue to gate on `tests_run > 0` (the
+  consistency check needs a positive denominator; the predicate
+  references `tests_run`).
 
-**Verification:** Both the hook and the dispatcher have explicit
-fixtures (`test_counts_inconsistent_is_flagged`,
-`test_counts_inconsistent_routes_inconclusive`) plus regressions
-asserting consistent partial-skip still passes.
+**Verification:**
+- `test_pass_with_zero_tests_run_routes_inconclusive` — RESULT: pass +
+  TESTS_RUN: 0 → `tests_inconclusive` with reason `pass_with_zero_tests`.
+- `test_missing_skipped_with_zero_tests_run_routes_inconclusive` — same
+  path with TESTS_SKIPPED also omitted → Phase A wins
+  (`missing_tests_skipped_field`).
 
-### S4 MEDIUM (Phase D) — Predicate spec drift
+### F3 MEDIUM (Phase C3) — Parser as the source of truth
 
-**Original finding (attempt-1):** Code used `>=` (vacuous_pass.py:167,
-loops.py:1242); docstring + prompt + tests all said `==`. Both
-descriptions match on consistent input but `>=` is strictly broader on
-inconsistent input.
+**Original finding (attempt-2):** The implementation used a side-channel
+boolean `tests_skipped_present` while keeping `tests_skipped` defaulted
+to 0. Any future caller using the existing `.get("tests_skipped", 0)`
+pattern silently saw 0 on omission — the contract had to be re-enforced
+at every call site.
 
 **Fix:**
-- With Phase C rejecting inconsistent input upstream, equality is now
-  the canonical statement. The predicate at both call sites is now
-  `tests_skipped == tests_run` (and `tests_passed == 0`).
-- Docstring in `equipa/hooks/vacuous_pass.py` updated to match.
-- `prompts/tester.md` already used `==`; reaffirmed in the new
-  contract-violation paragraph.
+- `equipa/parsing.py:parse_tester_output` now treats TESTS_SKIPPED as
+  REQUIRED. The new helper `_required_int(text, marker)` returns the
+  parsed int on a clean marker line, and `None` on absence OR on an
+  unparseable value (this folds F6 into the same code path). The parser
+  attaches `tests_skipped=None` to its return dict on contract violation.
+- The legacy `tests_skipped_present` payload key is removed; the canonical
+  sentinel is `tests_skipped is None`.
+- Both call sites (`equipa/loops.py` and
+  `equipa/hooks/vacuous_pass.py`) derive `tests_skipped_present` locally
+  from `tests_skipped is None` and never coerce `None` to 0 with `or 0`.
 
-**Verification:** `test_phase_d_equality_predicate` asserts the path
-fires on `skipped == run`. The Phase C guard above forbids
-`skipped > run` from ever reaching this path.
+**Verification:**
+- `test_tests_skipped_is_int_when_line_emitted_cleanly` — clean line → int.
+- `test_tests_skipped_is_none_when_line_omitted` — absent → None.
+- `test_tests_skipped_is_none_on_empty_text` — empty text → None.
+- All A/B/C/D fixtures continue to pass with the new sentinel.
 
-## Out of Scope
+### F4 MEDIUM (Phase D3) — Anchored regex avoids prose false positives
 
-Per task constraints:
-- S5 (negative integer rejection) — not addressed; would require Zod-
-  style schema validation at parse time.
-- S6 (hook-path detector unused) — not addressed.
-- S7 (`_branch_has_real_work` git shell-out review) — not addressed.
+**Original finding (attempt-2):** Patterns at `parsing.py:672-680`
+(`\b(\d+)\s+skipped\b` etc.) matched anywhere in `result_text` including
+tester prose. A SUMMARY line "2 tests were skipped earlier in dev"
+pushed the count to 2 spuriously and produced false-positive
+`tests_inconclusive` routings.
 
-## Test Posture
+**Fix:**
+- Each pattern in `_FRAMEWORK_SKIP_PATTERNS` is now anchored to the
+  framework-specific line shape:
+  - **pytest** footer: `(?m)^={3,}.*?\b(\d+)\s+skipped\b` — line must
+    begin with ≥3 `=` signs (the footer rule).
+  - **vitest / jest**: `(?m)^\s*Tests?:?\s+.*?\b(\d+)\s+skipped\b` —
+    line must begin with `Tests`/`Test`.
+  - **playwright (split footer)**: `(?m)^\s*\d+\s+passed.*?\b(\d+)\s+skipped\b`
+    — line begins with `N passed`.
+  - **generic anchored skip line**: `(?m)^\s*(\d+)\s+skipped\b` —
+    catches playwright's "  4 skipped" variant and bare `N Skipped`.
+  - **go**: `^---\s+SKIP:` (unchanged — already anchored).
 
-| Suite | Result |
-| --- | --- |
-| `tests/test_tester_parsing_2242.py` (new, 14 cases) | 14 pass |
-| `tests/test_vacuous_pass_guard.py` (5 new + 17 updated) | 22 pass |
-| `tests/test_tester_phase.py` (4 new + 15 existing) | 19 pass |
-| `tests/test_single_agent_vacuous_pass.py` (unchanged) | 11 pass |
-| `tests/test_compaction_detection.py` (unchanged) | 28 pass |
+**Verification:**
+- `test_grep_ignores_prose_mentioning_skipped` — SUMMARY containing
+  "2 tests were skipped earlier in dev" returns 0.
+- `test_grep_ignores_embedded_skipped_in_log_line` — mid-line prose
+  like "the 7 skipped runs" returns 0.
+- All framework-specific fixtures (pytest/vitest/jest/playwright/go)
+  still pass.
 
-`tests/test_cli_templates.py::test_import_accepts_non_claude_fixture`
-fails on this branch AND on master (pre-existing fixture issue:
-`tables/projects.jsonl` is referenced but not present in the test
-manifest). Not caused by this dispatch.
+### F5 MEDIUM (Phase E3) — Hook predicate fixes no-tests blind spot
 
-## Counts
+**Original finding (attempt-2):** `vacuous_pass.check_vacuous_pass` gated
+Phase A on `tester_outcome in {"pass", "no-tests"} AND tests_run > 0`.
+The "no-tests" branch carries `tests_run == 0` by definition, so Phase A
+never engaged on no-tests — an adversarial tester could report
+`RESULT: no-tests` while omitting TESTS_SKIPPED and silently bypass the
+hook.
 
-CRITICAL: 0
-HIGH: 0
-MEDIUM: 0
-LOW: 0
-INFO: 0
+**Fix:**
+- `equipa/hooks/vacuous_pass.py` drops the `tests_run > 0` gate on Phase
+  A (consistent with the Phase-B3 change at the dispatch site). The
+  contract violation is the omission itself; it does not become
+  acceptable just because the tester also claimed zero tests ran.
+- Phase C and Phase D in the hook retain the `tests_run > 0` gate (same
+  rationale as at the dispatch site).
+
+**Verification:**
+- `test_no_tests_outcome_with_missing_skip_field_is_flagged` — RESULT:
+  no-tests + omitted TESTS_SKIPPED → vacuous=True with reason
+  `missing_tests_skipped_field`.
+
+### F6 MEDIUM (Phase F3) — Presence requires parseable int
+
+**Original finding (attempt-2):** `_has_marker_line` accepted any
+`TESTS_SKIPPED:` line regardless of value parseability. A line
+`TESTS_SKIPPED: (see comment)` satisfied presence while the value
+coerced to 0 — same outcome as outright omission, but the contract
+check said "present".
+
+**Fix:**
+- Folded into the F3 fix. `_required_int` returns `None` on a present
+  marker whose value does not parse as `int`, so the hook and the
+  dispatcher treat unparseable identically to absent.
+
+**Verification:**
+- `test_tests_skipped_is_none_when_value_unparseable` — parser returns
+  `None` for `TESTS_SKIPPED: (see comment)`.
+- `test_unparseable_tests_skipped_value_is_flagged` — hook flags the
+  payload as vacuous with reason `missing_tests_skipped_field`.
+
+## Out of scope (deferred per task constraints)
+
+- **F7** — decisions audit row for drift telemetry.
+- **F8** — playwright reporter coverage beyond split-footer.
+- **F9** — formatting / style / INFO.
+
+## Test summary
+
+- `tests/test_tester_parsing_2242.py` — 17 cases (was 13).
+- `tests/test_tester_phase.py` — 22 cases (was 19; 3 new A3/B3 fixtures).
+- `tests/test_vacuous_pass_guard.py` — 24 cases (was 22; 2 new E3/F3 fixtures).
+- `tests/test_single_agent_vacuous_pass.py` — 10 cases (unchanged).
+- **Full pytest suite:** 1776 passed in 118.54s. Exit code 0.
+
+## Architectural invariant
+
+After this dispatch the contract is:
+
+> ``parse_tester_output`` is the **single source of truth** for tester
+> contract violations. The tester field ``tests_skipped`` is either a
+> parseable integer (clean) or ``None`` (omission or unparseable). Every
+> downstream call site — the dispatcher and the hook — derives the
+> contract-violation signal from ``tests_skipped is None`` and routes the
+> outcome to ``tests_inconclusive`` on violation. There is no shadow
+> sentinel; there is no default-to-0; there is no per-callsite
+> reinforcement of the contract.
+
+Combined with the Phase D3 anchored regex (no prose false positives) and
+the Phase A3 tool_output_text channel (no structural blindness), the
+2236-class loophole is closed at every entry point.
