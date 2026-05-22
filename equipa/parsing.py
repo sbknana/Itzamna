@@ -734,6 +734,13 @@ _FRAMEWORK_SKIP_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(
         r"(?m)^\s*\d+\s+passed.*?\b(\d+)\s+skipped\b", re.IGNORECASE,
     ),
+    # generic anchored "N skipped" line — line BEGINS with optional
+    # whitespace, then the int, then 'skipped'. This catches the playwright
+    # variant that prints "  4 skipped" on its own line AND a bare
+    # "4 Skipped". Anchoring to line start prevents matching tester prose
+    # such as "the 7 skipped runs were due to env vars" because that line
+    # does not begin with the count token.
+    re.compile(r"(?m)^\s*(\d+)\s+skipped\b", re.IGNORECASE),
     # go test "--- SKIP: TestFoo" is counted via _GO_SKIP_PATTERN below.
 )
 

@@ -40,10 +40,12 @@ def _result(
 ) -> dict[str, Any]:
     """Build a minimal tester_result payload.
 
-    Task #2242 Phase A: ``tests_skipped_present`` defaults to True so the
-    common case (tester emitted the field) is the default. Tests that
-    exercise the contract-violation path set ``tests_skipped_present=False``
-    explicitly, or omit the key entirely.
+    Task #2242 Phase C3/F3: ``parse_tester_output`` emits
+    ``tests_skipped=None`` when the TESTS_SKIPPED line is absent or its
+    value is unparseable. The builder-flag ``tests_skipped_present=False``
+    matches that contract by setting the payload's ``tests_skipped`` to
+    ``None`` (NOT 0). The legacy ``tests_skipped_present`` payload key is
+    no longer emitted; the hook reads the sentinel value directly.
     """
     if tests_passed is None:
         tests_passed = tests_run
@@ -52,10 +54,8 @@ def _result(
         "tests_run": tests_run,
         "tests_passed": tests_passed,
         "tests_failed": tests_failed,
-        "tests_skipped": tests_skipped,
+        "tests_skipped": tests_skipped if tests_skipped_present else None,
     }
-    if tests_skipped_present:
-        payload["tests_skipped_present"] = True
     return payload
 
 
@@ -468,6 +468,59 @@ def test_phase_d_equality_predicate(
     assert out["vacuous"] is True
     assert out["all_skipped"] is True
     assert "all_tests_skipped" in out["reason"]
+
+
+def test_no_tests_outcome_with_missing_skip_field_is_flagged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Task #2242 Phase E3: drop the tests_run gate on Phase A in the hook.
+
+    A tester reporting RESULT: no-tests (tests_run==0 by definition) that
+    OMITS the TESTS_SKIPPED line previously bypassed Phase A entirely
+    (the old gate required tests_run > 0). Now the absence is itself the
+    contract violation — Phase A fires at any tests_run value.
+    """
+    monkeypatch.setattr(vp, "_branch_has_real_work", lambda _pd: True)
+    out = vp.check_vacuous_pass(
+        tester_result=_result(
+            "no-tests", tests_run=0, tests_passed=0,
+            tests_skipped_present=False,
+        ),
+        dev_result=_dev(["src/main.py"]),
+        task={"description": "implement feature"},
+        accumulated_files=["src/main.py"],
+        project_dir="/some/repo",
+    )
+    assert out["vacuous"] is True
+    assert "missing_tests_skipped_field" in out["reason"]
+
+
+def test_unparseable_tests_skipped_value_is_flagged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Task #2242 Phase F3: presence requires a parseable int.
+
+    A payload from a parser that received ``TESTS_SKIPPED: (see comment)``
+    arrives with ``tests_skipped=None`` — the same sentinel as outright
+    omission. The hook treats it identically: contract violation.
+    """
+    monkeypatch.setattr(vp, "_branch_has_real_work", lambda _pd: True)
+    out = vp.check_vacuous_pass(
+        # Direct dict simulating parser output on an unparseable value.
+        tester_result={
+            "result": "pass",
+            "tests_run": 5,
+            "tests_passed": 5,
+            "tests_failed": 0,
+            "tests_skipped": None,
+        },
+        dev_result=_dev(["src/main.py"]),
+        task={"description": "implement feature"},
+        accumulated_files=["src/main.py"],
+        project_dir="/some/repo",
+    )
+    assert out["vacuous"] is True
+    assert "missing_tests_skipped_field" in out["reason"]
 
 
 def test_fail_outcome_with_skips_is_not_classified_as_skipped(

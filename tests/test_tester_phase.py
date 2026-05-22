@@ -107,20 +107,21 @@ def _results(outcome: str, run: int = 0, passed: int = 0, failed: int = 0,
              tests_skipped_present: bool = True) -> dict:
     """Build a parsed-tester payload.
 
-    Task #2242 Phase A: ``tests_skipped_present`` defaults to True so the
-    common case (well-formed tester output) is the default. Tests that
-    exercise the contract-violation path pass ``tests_skipped_present=False``.
+    Task #2242 Phase C3/F3: the parser now emits ``tests_skipped=None`` to
+    signal "TESTS_SKIPPED line absent or unparseable". ``tests_skipped_present``
+    here is a builder-side flag — when False, the payload's ``tests_skipped``
+    is set to ``None`` (matching what the parser would emit). The legacy
+    ``tests_skipped_present`` payload key is no longer set; callers must
+    read the contract violation off the sentinel value.
     """
     payload: dict[str, Any] = {
         "result": outcome,
         "tests_run": run,
         "tests_passed": passed,
         "tests_failed": failed,
-        "tests_skipped": skipped,
+        "tests_skipped": skipped if tests_skipped_present else None,
         "failure_details": details or [],
     }
-    if tests_skipped_present:
-        payload["tests_skipped_present"] = True
     return payload
 
 
@@ -351,3 +352,85 @@ class TestDispatchTesterOutcome:
         )
         assert action == "exit"
         assert outcome == "tests_passed"
+
+    # --- Task #2242 attempt-3 fixtures (Phase A3 / B3 / D3) -----------------
+
+    def test_tool_output_skip_disagreement_routes_inconclusive(
+        self, patched_msg_helpers
+    ):
+        """Phase A3: framework stdout in ``tool_output_text`` triggers Phase B.
+
+        Tester emits a clean structured block (consistent counts, all zero)
+        but the bash/test ``tool_result`` stdout the agent observed
+        contains a pytest footer "5 skipped". Before A3 the disagreement
+        was invisible because result_text only carried assistant TEXT
+        blocks. With A3 we read ``tool_output_text`` too.
+        """
+        tester = {
+            "some": "tester",
+            "result_text": "RESULT: pass\nTESTS_RUN: 1\nTESTS_PASSED: 1\n",
+            "tool_output_text": (
+                "================ 5 skipped in 0.10s ================\n"
+            ),
+        }
+        dev = {"some": "dev"}
+        action, ret, outcome = _dispatch_tester_outcome(
+            _results("pass", run=1, passed=1, skipped=0),
+            tester, dev, cycle=1, task_id=1, task_role="developer",
+            total_cost=0.0, total_duration=0.0,
+            compaction_history=[],
+        )
+        assert action == "exit"
+        assert outcome == "tests_inconclusive"
+        import json
+        payload = json.loads(patched_msg_helpers[0][0][-1])
+        assert payload["reason"] == "framework_skip_count_disagrees"
+        assert payload["framework_skips"] >= 5
+
+    def test_pass_with_zero_tests_run_routes_inconclusive(
+        self, patched_msg_helpers
+    ):
+        """Phase B3 paired guard: RESULT: pass + TESTS_RUN: 0 -> inconclusive.
+
+        A tester asserting success with zero tests is itself a contract
+        violation. Before B3, ``tests_run > 0`` gated Phase A and the
+        zero-tests bypass slipped through to tests_passed.
+        """
+        tester = {"some": "tester", "result_text": "RESULT: pass\n"}
+        dev = {"some": "dev"}
+        action, ret, outcome = _dispatch_tester_outcome(
+            _results("pass", run=0, passed=0, skipped=0),
+            tester, dev, cycle=1, task_id=1, task_role="developer",
+            total_cost=0.0, total_duration=0.0,
+            compaction_history=[],
+        )
+        assert action == "exit"
+        assert outcome == "tests_inconclusive"
+        import json
+        payload = json.loads(patched_msg_helpers[0][0][-1])
+        assert payload["reason"] == "pass_with_zero_tests"
+
+    def test_missing_skipped_with_zero_tests_run_routes_inconclusive(
+        self, patched_msg_helpers
+    ):
+        """Phase B3: dropping the tests_run gate makes Phase A fire on TESTS_RUN: 0.
+
+        Before B3, a tester reporting TESTS_RUN: 0 and omitting
+        TESTS_SKIPPED bypassed Phase A entirely. With the gate dropped,
+        the omission is detected even at zero — Phase A wins before B3's
+        paired guard because absence is the stronger contract violation.
+        """
+        tester = {"some": "tester", "result_text": "RESULT: pass\n"}
+        dev = {"some": "dev"}
+        action, ret, outcome = _dispatch_tester_outcome(
+            _results("pass", run=0, passed=0, skipped=0,
+                     tests_skipped_present=False),
+            tester, dev, cycle=1, task_id=1, task_role="developer",
+            total_cost=0.0, total_duration=0.0,
+            compaction_history=[],
+        )
+        assert action == "exit"
+        assert outcome == "tests_inconclusive"
+        import json
+        payload = json.loads(patched_msg_helpers[0][0][-1])
+        assert payload["reason"] == "missing_tests_skipped_field"
