@@ -1330,7 +1330,57 @@ async def _run_agent_streaming_impl(
     result["files_read"] = sorted(files_read)
     result["files_changed_set"] = sorted(files_changed)
 
+    # Task #2314 Phase D: when the agent committed inside a feature branch,
+    # cross-check the tool-call-derived files_changed_set against the actual
+    # git diff. git is the canonical source — tool-call observation misses
+    # Bash-driven writes (sed -i, tee, mv, cp, redirection). Log a warning on
+    # mismatch as a possible fabrication / blind-spot signal. The git count
+    # then takes precedence by being written into "files_changed_count".
+    if project_dir:
+        git_diff_count = await _git_diff_files_changed_count(project_dir)
+        if git_diff_count is not None:
+            tool_count = len(files_changed)
+            if git_diff_count != tool_count:
+                log(
+                    f"  [Telemetry] files_changed cross-check mismatch: "
+                    f"tool-calls={tool_count} git-diff={git_diff_count}. "
+                    f"Bash-driven writes or fabrication possible.",
+                    output,
+                )
+            # Canonical signal: git's view of what actually committed.
+            result["files_changed_count"] = git_diff_count
+
     return result
+
+
+async def _git_diff_files_changed_count(project_dir: str) -> int | None:
+    """Return the number of files changed in the most recent commit relative
+    to its parent, or ``None`` if it cannot be determined.
+
+    Used as the canonical Phase-D signal for agent_runs.files_changed_count.
+    Falls back to ``None`` (caller keeps the tool-call-derived count) when
+    HEAD has no parent yet, the directory is not a git repo, or git errors.
+    Uses ``git_run_async`` so the event loop is not blocked. Never raises.
+    """
+    try:
+        from equipa.git_ops import git_run_async
+        # Confirm HEAD~1 resolves before asking for the diff. A fresh repo or
+        # a feature branch whose first commit is its only commit returns
+        # nonzero here, and we fall through to the tool-call set.
+        rev = await git_run_async(["rev-parse", "--verify", "HEAD~1"], project_dir, timeout=10)
+        if rev.returncode != 0:
+            return None
+        diff = await git_run_async(
+            ["diff", "--name-only", "HEAD~1", "HEAD"], project_dir, timeout=10,
+        )
+        if diff.returncode != 0:
+            return None
+        files = [line for line in diff.stdout.splitlines() if line.strip()]
+        return len(files)
+    except Exception:
+        # Justified broad catch: this is a best-effort telemetry probe; any
+        # git error must NOT crash the orchestrator post-cycle.
+        return None
 
 
 async def run_agent_with_retries(
