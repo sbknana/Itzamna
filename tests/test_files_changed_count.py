@@ -26,7 +26,11 @@ from unittest.mock import patch
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from equipa.db import _parse_files_changed_block, _resolve_files_changed_count
+from equipa.db import (
+    _FILES_CHANGED_MAX,
+    _parse_files_changed_block,
+    _resolve_files_changed_count,
+)
 
 
 class TestResolveFilesChangedCount(unittest.TestCase):
@@ -72,7 +76,10 @@ class TestResolveFilesChangedCount(unittest.TestCase):
         result = {"files_changed_set": {"a.py", "b.py", "c.py"}}
         self.assertEqual(_resolve_files_changed_count(result), 3)
 
-    def test_parses_footer_when_no_structured_signal(self):
+    def test_footer_alone_is_not_trusted(self):
+        # Security re-review (#2314 Phase A): the FILES_CHANGED footer is
+        # agent-controlled. When files_changed_set is absent, the helper logs
+        # a callsite warning and returns 0 rather than trusting the footer.
         result_text = (
             "RESULT: success\n"
             "SUMMARY: did the work\n"
@@ -82,28 +89,18 @@ class TestResolveFilesChangedCount(unittest.TestCase):
             "DECISIONS: none\n"
             "BLOCKERS: none\n"
         )
-        self.assertEqual(_resolve_files_changed_count({"result_text": result_text}), 2)
-
-    def test_footer_none_sentinel_means_zero(self):
-        result_text = (
-            "RESULT: success\n"
-            "FILES_CHANGED: none\n"
-            "DECISIONS: none\n"
-        )
         self.assertEqual(_resolve_files_changed_count({"result_text": result_text}), 0)
 
-    def test_footer_inline_single_file(self):
-        result_text = "FILES_CHANGED: equipa/db.py\nDECISIONS: none\n"
-        self.assertEqual(_resolve_files_changed_count({"result_text": result_text}), 1)
-
-    def test_footer_dedups_repeated_paths(self):
-        result_text = (
-            "FILES_CHANGED:\n"
-            "- equipa/db.py\n"
-            "- equipa/db.py (modified)\n"
-            "DECISIONS: none\n"
-        )
-        self.assertEqual(_resolve_files_changed_count({"result_text": result_text}), 1)
+    def test_empty_files_changed_set_blocks_footer_forgery(self):
+        # Phase-A verification probe from the task spec:
+        #   {"result_text": "FILES_CHANGED:\n- forged.py\n", "files_changed_set": []}
+        # MUST return 0, NOT 1. A vacuous-pass agent could otherwise forge a
+        # footer to claim it landed work it never actually did.
+        result = {
+            "result_text": "FILES_CHANGED:\n- forged.py\n",
+            "files_changed_set": [],
+        }
+        self.assertEqual(_resolve_files_changed_count(result), 0)
 
     def test_files_changed_set_overrides_footer(self):
         # Structured signal from agent_runner is more trustworthy than a
@@ -116,6 +113,42 @@ class TestResolveFilesChangedCount(unittest.TestCase):
 
     def test_empty_result_dict_is_zero(self):
         self.assertEqual(_resolve_files_changed_count({}), 0)
+
+    # --- Phase B: bool must be rejected -------------------------------------
+
+    def test_explicit_true_rejected(self):
+        # Phase-B verification probe: isinstance(True, int) is True in Python,
+        # so a naive int-check would silently coerce True into 1. The helper
+        # must reject bools and fall through.
+        result = {"files_changed_count": True, "files_changed_set": []}
+        self.assertEqual(_resolve_files_changed_count(result), 0)
+
+    def test_explicit_false_rejected(self):
+        result = {"files_changed_count": False, "files_changed_set": ["a.py"]}
+        # files_changed_count rejected → falls through to files_changed_set.
+        self.assertEqual(_resolve_files_changed_count(result), 1)
+
+    # --- Phase C: upper-bound clamp -----------------------------------------
+
+    def test_explicit_giant_int_is_clamped(self):
+        # Phase-C verification probe: implausible counts get clamped to
+        # _FILES_CHANGED_MAX so downstream alerting/quality-scoring is not
+        # skewed by fabricated or runaway values.
+        result = {"files_changed_count": 999_999_999_999}
+        self.assertEqual(_resolve_files_changed_count(result), _FILES_CHANGED_MAX)
+
+    def test_clamp_applies_to_files_changed_set(self):
+        result = {"files_changed_set": [f"f{i}.py" for i in range(_FILES_CHANGED_MAX + 5)]}
+        self.assertEqual(_resolve_files_changed_count(result), _FILES_CHANGED_MAX)
+
+    def test_malformed_files_changed_set_is_zero(self):
+        # If files_changed_set is present but the wrong type, treat as 0; do
+        # NOT silently fall through to the footer.
+        result = {
+            "files_changed_set": "not-a-list",
+            "result_text": "FILES_CHANGED:\n- a.py\n- b.py\n",
+        }
+        self.assertEqual(_resolve_files_changed_count(result), 0)
 
 
 class TestParseFilesChangedBlock(unittest.TestCase):
@@ -301,8 +334,14 @@ class TestRecordAgentRunEndToEnd(unittest.TestCase):
         self.assertEqual(rows[0]["role"], "security-reviewer")
         self.assertEqual(rows[0]["files_changed_count"], 0)
 
-    def test_footer_only_result_populates_count(self):
-        """A result with only result_text (no files_changed_set) still works."""
+    def test_footer_only_result_does_not_inflate_count(self):
+        """Result with no structured signal records 0, even with a footer.
+
+        Security re-review (#2314 Phase A): agent-emitted footers are no longer
+        a fallback. A run that reaches record_agent_run without
+        ``files_changed_set`` is treated as a callsite bug — the count is 0,
+        not whatever the agent typed in the footer.
+        """
         from equipa.db import record_agent_run
 
         task = {"id": 9004, "project_id": 23, "title": "x", "description": "y"}
@@ -325,7 +364,35 @@ class TestRecordAgentRunEndToEnd(unittest.TestCase):
             )
 
         rows = self._read_back()
-        self.assertEqual(rows[0]["files_changed_count"], 2)
+        self.assertEqual(rows[0]["files_changed_count"], 0)
+
+    def test_explicit_count_from_caller_takes_precedence(self):
+        """Phase-D path: when the streaming runner wrote a canonical
+        ``files_changed_count`` (derived from git diff HEAD~1), the DB row
+        uses that value rather than the tool-call-derived set length.
+        """
+        from equipa.db import record_agent_run
+
+        task = {"id": 9005, "project_id": 23, "title": "x", "description": "y"}
+        with patch("equipa.tasks.get_task_complexity", return_value="medium"):
+            record_agent_run(
+                task,
+                result={
+                    "num_turns": 9,
+                    "duration": 70.0,
+                    # tool-call observation under-counted (Bash-driven writes
+                    # are invisible to it) — git diff is authoritative.
+                    "files_changed_set": ["a.py"],
+                    "files_changed_count": 4,
+                },
+                outcome="tests_passed",
+                role="developer",
+                model="opus",
+                max_turns=25,
+            )
+
+        rows = self._read_back()
+        self.assertEqual(rows[0]["files_changed_count"], 4)
 
 
 if __name__ == "__main__":
