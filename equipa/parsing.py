@@ -706,17 +706,35 @@ def _has_marker_line(text: str, marker: str) -> bool:
 # TESTS_SKIPPED count. If the framework's own output disagrees with what
 # the tester reported, the tester's numbers are suspect — fail closed.
 #
-# Patterns are intentionally narrow (anchored on word boundaries and the
-# specific count-bearing token) to keep false positives low. Each pattern
-# captures the integer count via group 1.
+# Task #2242 Phase D3: each pattern is ANCHORED to a framework-specific
+# footer/header line. The previous unanchored patterns (e.g. "\b\d+\s+
+# skipped\b") matched anywhere — including tester prose like
+# "2 tests were skipped earlier in dev", which spuriously inflated the
+# disagreement count and produced false-positive ``tests_inconclusive``
+# routings. Anchoring requires the match to start at a line beginning that
+# the test framework actually emits.
+#
+# Each pattern captures the integer skip count via group 1.
 _FRAMEWORK_SKIP_PATTERNS: tuple[re.Pattern[str], ...] = (
-    # vitest / jest: "5 skipped" / "2 todo"
-    re.compile(r"\b(\d+)\s+skipped\b", re.IGNORECASE),
-    re.compile(r"\b(\d+)\s+todo\b", re.IGNORECASE),
-    # pytest footer: "= 3 skipped =" / "3 skipped in 0.12s"
-    re.compile(r"=\s*(\d+)\s+skipped[\s=]", re.IGNORECASE),
-    # playwright: covered by the generic "N skipped" above
-    # go test "--- SKIP: TestFoo" is counted via _GO_SKIP_PATTERN below
+    # pytest summary footer: "==== 3 passed, 1 skipped in 0.12s ===="
+    # Anchored on a line that begins with at least 3 '=' (the footer rule).
+    re.compile(r"(?m)^={3,}.*?\b(\d+)\s+skipped\b", re.IGNORECASE),
+    # vitest / jest "Tests:" summary header — line MUST start with Tests/Test
+    #   vitest: " Tests  10 passed | 2 skipped (12)"
+    #   jest:   "Tests:       1 skipped, 4 passed, 5 total"
+    re.compile(
+        r"(?m)^\s*Tests?:?\s+.*?\b(\d+)\s+skipped\b", re.IGNORECASE,
+    ),
+    # vitest / jest "N todo" on the same anchored Tests: header line.
+    re.compile(
+        r"(?m)^\s*Tests?:?\s+.*?\b(\d+)\s+todo\b", re.IGNORECASE,
+    ),
+    # playwright list/summary: "5 passed (1m), 2 skipped" — line begins with
+    # an int + 'passed' which is the format playwright's reporter prints.
+    re.compile(
+        r"(?m)^\s*\d+\s+passed.*?\b(\d+)\s+skipped\b", re.IGNORECASE,
+    ),
+    # go test "--- SKIP: TestFoo" is counted via _GO_SKIP_PATTERN below.
 )
 
 _GO_SKIP_PATTERN: re.Pattern[str] = re.compile(
