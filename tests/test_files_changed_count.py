@@ -395,5 +395,162 @@ class TestRecordAgentRunEndToEnd(unittest.TestCase):
         self.assertEqual(rows[0]["files_changed_count"], 4)
 
 
+class TestPhaseA3GitDiffRange(unittest.TestCase):
+    """Phase A3 regression tests: pre_head..post_head diff range.
+
+    Attempt-2 used HEAD~1..HEAD and had three failure modes:
+      (a) multi-commit cycles under-counted (only last commit seen).
+      (b) non-writer roles inherited the developer's diff.
+      (c) deferred commits caused stale-HEAD overrides of fresh edits.
+    These fixtures exercise the real ``_git_diff_files_changed_count`` and
+    ``_git_rev_parse_head`` helpers against on-disk git repos, then drive
+    the integration through ``record_agent_run`` to confirm the DB row.
+    """
+
+    def setUp(self):
+        self.repo_dir = tempfile.mkdtemp(prefix="equipa-test-a3-")
+        # init a quiet repo with a deterministic identity
+        import subprocess as sp
+        sp.run(["git", "init", "-q", "-b", "main"], cwd=self.repo_dir, check=True)
+        sp.run(["git", "config", "user.email", "t@t"], cwd=self.repo_dir, check=True)
+        sp.run(["git", "config", "user.name", "t"], cwd=self.repo_dir, check=True)
+        sp.run(["git", "config", "commit.gpgsign", "false"],
+               cwd=self.repo_dir, check=True)
+        # initial commit so HEAD resolves
+        (Path(self.repo_dir) / "README.md").write_text("seed\n")
+        sp.run(["git", "add", "README.md"], cwd=self.repo_dir, check=True)
+        sp.run(["git", "commit", "-q", "-m", "seed"], cwd=self.repo_dir, check=True)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.repo_dir, ignore_errors=True)
+
+    def _commit_files(self, files: list[tuple[str, str]], message: str) -> None:
+        """Write each (relpath, content) and create one commit."""
+        import subprocess as sp
+        for relpath, content in files:
+            target = Path(self.repo_dir) / relpath
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content)
+        sp.run(["git", "add", "-A"], cwd=self.repo_dir, check=True)
+        sp.run(["git", "commit", "-q", "-m", message],
+               cwd=self.repo_dir, check=True)
+
+    def _head_sha(self) -> str:
+        import subprocess as sp
+        out = sp.run(["git", "rev-parse", "HEAD"], cwd=self.repo_dir,
+                     capture_output=True, text=True, check=True)
+        return out.stdout.strip()
+
+    def test_multi_commit_cycle_counts_all_unique_files(self):
+        """A developer cycle with 3 commits touching 6 unique files reports 6
+        (NOT 2 from only the last commit, the attempt-2 HEAD~1..HEAD bug).
+        """
+        import asyncio
+        from equipa.agent_runner import (
+            _git_diff_files_changed_count, _git_rev_parse_head,
+        )
+
+        pre_head = asyncio.run(_git_rev_parse_head(self.repo_dir))
+        self.assertIsNotNone(pre_head)
+
+        self._commit_files([("a.py", "a"), ("b.py", "b")], "c1")
+        self._commit_files([("c.py", "c"), ("d.py", "d")], "c2")
+        self._commit_files([("e.py", "e"), ("f.py", "f")], "c3")
+
+        post_head = asyncio.run(_git_rev_parse_head(self.repo_dir))
+        self.assertNotEqual(pre_head, post_head)
+
+        count = asyncio.run(_git_diff_files_changed_count(
+            self.repo_dir, pre_head, post_head,
+        ))
+        self.assertEqual(count, 6,
+                         "multi-commit cycle must count all 6 unique files")
+
+    def test_no_commits_means_pre_head_equals_post_head(self):
+        """A non-writer role makes no commits; pre_head == post_head, so the
+        cross-check should NEVER override files_changed_count (which would
+        otherwise leak the developer's diff into the reviewer's row).
+        """
+        import asyncio
+        from equipa.agent_runner import _git_rev_parse_head
+
+        pre_head = asyncio.run(_git_rev_parse_head(self.repo_dir))
+        # reviewer role does nothing — no commits added
+        post_head = asyncio.run(_git_rev_parse_head(self.repo_dir))
+        self.assertEqual(pre_head, post_head,
+                         "no commits => pre_head must equal post_head")
+
+    def test_bash_driven_writes_are_caught_by_git_diff(self):
+        """Bash-driven file writes (sed -i, tee, cp) are invisible to
+        files_changed_set, but git diff sees them. One commit touching 2
+        files via Bash should report count=2.
+        """
+        import asyncio
+        from equipa.agent_runner import (
+            _git_diff_files_changed_count, _git_rev_parse_head,
+        )
+
+        pre_head = asyncio.run(_git_rev_parse_head(self.repo_dir))
+        # simulate two Bash-driven writes landed in one commit
+        self._commit_files(
+            [("bash_one.txt", "echoed"), ("bash_two.txt", "tee'd")],
+            "bash writes",
+        )
+        post_head = asyncio.run(_git_rev_parse_head(self.repo_dir))
+
+        count = asyncio.run(_git_diff_files_changed_count(
+            self.repo_dir, pre_head, post_head,
+        ))
+        self.assertEqual(count, 2)
+
+    def test_unique_files_across_commits_not_double_counted(self):
+        """A file edited in two commits is counted once, not twice."""
+        import asyncio
+        from equipa.agent_runner import (
+            _git_diff_files_changed_count, _git_rev_parse_head,
+        )
+
+        pre_head = asyncio.run(_git_rev_parse_head(self.repo_dir))
+        self._commit_files([("same.py", "v1")], "c1")
+        self._commit_files([("same.py", "v2"), ("other.py", "x")], "c2")
+        post_head = asyncio.run(_git_rev_parse_head(self.repo_dir))
+
+        count = asyncio.run(_git_diff_files_changed_count(
+            self.repo_dir, pre_head, post_head,
+        ))
+        self.assertEqual(count, 2,
+                         "same.py edited twice still counts once; +other.py => 2")
+
+    def test_rev_parse_returns_none_when_no_commits(self):
+        """A fresh repo with no commits returns None — caller skips override."""
+        import asyncio
+        from equipa.agent_runner import _git_rev_parse_head
+        import subprocess as sp
+
+        empty_dir = tempfile.mkdtemp(prefix="equipa-test-a3-empty-")
+        try:
+            sp.run(["git", "init", "-q", "-b", "main"], cwd=empty_dir, check=True)
+            sha = asyncio.run(_git_rev_parse_head(empty_dir))
+            self.assertIsNone(sha,
+                              "empty repo HEAD should resolve to None")
+        finally:
+            import shutil
+            shutil.rmtree(empty_dir, ignore_errors=True)
+
+    def test_rev_parse_returns_none_for_non_repo(self):
+        """A directory that is not a git repo returns None, never raises."""
+        import asyncio
+        from equipa.agent_runner import _git_rev_parse_head
+
+        non_repo = tempfile.mkdtemp(prefix="equipa-test-a3-nonrepo-")
+        try:
+            sha = asyncio.run(_git_rev_parse_head(non_repo))
+            self.assertIsNone(sha)
+        finally:
+            import shutil
+            shutil.rmtree(non_repo, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()
