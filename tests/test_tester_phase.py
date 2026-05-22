@@ -103,8 +103,15 @@ def patched_msg_helpers(monkeypatch):
 
 
 def _results(outcome: str, run: int = 0, passed: int = 0, failed: int = 0,
-             skipped: int = 0, details: list | None = None) -> dict:
-    return {
+             skipped: int = 0, details: list | None = None,
+             tests_skipped_present: bool = True) -> dict:
+    """Build a parsed-tester payload.
+
+    Task #2242 Phase A: ``tests_skipped_present`` defaults to True so the
+    common case (well-formed tester output) is the default. Tests that
+    exercise the contract-violation path pass ``tests_skipped_present=False``.
+    """
+    payload: dict[str, Any] = {
         "result": outcome,
         "tests_run": run,
         "tests_passed": passed,
@@ -112,6 +119,9 @@ def _results(outcome: str, run: int = 0, passed: int = 0, failed: int = 0,
         "tests_skipped": skipped,
         "failure_details": details or [],
     }
+    if tests_skipped_present:
+        payload["tests_skipped_present"] = True
+    return payload
 
 
 class TestDispatchTesterOutcome:
@@ -242,3 +252,102 @@ class TestDispatchTesterOutcome:
         )
         assert action == "continue_loop"
         assert history == ["failure ctx cycle 3"]
+
+    # --- Task #2242 re-dispatch: defense-in-depth fixtures -------------------
+
+    def test_missing_tests_skipped_line_routes_inconclusive(
+        self, patched_msg_helpers
+    ):
+        """Phase A: tester output without TESTS_SKIPPED line -> inconclusive.
+
+        Even when tests_run > 0 and tests_passed == tests_run (looks like a
+        clean pass), the absence of TESTS_SKIPPED is a contract violation —
+        the tester may have drifted/truncated and the skip count cannot be
+        trusted. Fail closed.
+        """
+        tester = {"some": "tester", "result_text": "RESULT: pass\nTESTS_RUN: 5\nTESTS_PASSED: 5"}
+        dev = {"some": "dev"}
+        action, ret, outcome = _dispatch_tester_outcome(
+            _results("pass", run=5, passed=5, tests_skipped_present=False),
+            tester, dev, cycle=1, task_id=1, task_role="developer",
+            total_cost=0.0, total_duration=0.0,
+            compaction_history=[],
+        )
+        assert action == "exit"
+        assert outcome == "tests_inconclusive"
+        # The posted message must carry the Phase A reason.
+        posted_args = patched_msg_helpers[0][0]
+        assert "tests_inconclusive" in posted_args
+        # Last positional arg is the JSON payload — must include the reason.
+        import json
+        payload = json.loads(posted_args[-1])
+        assert payload["reason"] == "missing_tests_skipped_field"
+
+    def test_framework_skip_disagreement_routes_inconclusive(
+        self, patched_msg_helpers
+    ):
+        """Phase B: raw stdout says '5 skipped' but tester reported 0 -> inconclusive.
+
+        The hardest variant of the loophole: tester reports TESTS_RUN: 0,
+        TESTS_PASSED: 0, TESTS_SKIPPED: 0 (all zeros, internally consistent,
+        skip-line present). But the raw framework stdout shows '5 skipped'.
+        Phase B cross-checks and flags the disagreement.
+        """
+        raw = """
+        Running tests...
+        Test Files  1 passed, 1 skipped (2)
+             Tests  0 passed, 5 skipped (5)
+        """
+        tester = {"some": "tester", "result_text": raw}
+        dev = {"some": "dev"}
+        # Note: we use run=1 so the Phase A guard doesn't fire; the disagreement
+        # is what Phase B catches.
+        action, ret, outcome = _dispatch_tester_outcome(
+            _results("pass", run=1, passed=1, skipped=0),
+            tester, dev, cycle=1, task_id=1, task_role="developer",
+            total_cost=0.0, total_duration=0.0,
+            compaction_history=[],
+        )
+        assert action == "exit"
+        assert outcome == "tests_inconclusive"
+        import json
+        payload = json.loads(patched_msg_helpers[0][0][-1])
+        assert payload["reason"] == "framework_skip_count_disagrees"
+        assert payload["framework_skips"] >= 5
+
+    def test_counts_inconsistent_routes_inconclusive(self, patched_msg_helpers):
+        """Phase C: passed + failed + skipped != tests_run -> inconclusive.
+
+        Catches both adversarial misreport and benign tester bugs without
+        any agent-protocol change.
+        """
+        tester = {"some": "tester", "result_text": "RESULT: pass\n"}
+        dev = {"some": "dev"}
+        # 10 run, 0 passed, 0 failed, 3 skipped — 7 unaccounted for
+        action, ret, outcome = _dispatch_tester_outcome(
+            _results("pass", run=10, passed=0, failed=0, skipped=3),
+            tester, dev, cycle=1, task_id=1, task_role="developer",
+            total_cost=0.0, total_duration=0.0,
+            compaction_history=[],
+        )
+        assert action == "exit"
+        assert outcome == "tests_inconclusive"
+        import json
+        payload = json.loads(patched_msg_helpers[0][0][-1])
+        assert payload["reason"] == "counts_inconsistent"
+        assert payload["expected_sum"] == 10
+        assert payload["actual_sum"] == 3
+
+    def test_consistent_counts_with_passes_is_pass(self, patched_msg_helpers):
+        """Phase C: consistent partial-skip with real passes is tests_passed."""
+        tester = {"some": "tester", "result_text": "RESULT: pass\n"}
+        dev = {"some": "dev"}
+        # 10 run, 7 passed, 0 failed, 3 skipped — sums to 10
+        action, ret, outcome = _dispatch_tester_outcome(
+            _results("pass", run=10, passed=7, failed=0, skipped=3),
+            tester, dev, cycle=1, task_id=1, task_role="developer",
+            total_cost=0.0, total_duration=0.0,
+            compaction_history=[],
+        )
+        assert action == "exit"
+        assert outcome == "tests_passed"

@@ -34,17 +34,29 @@ def _result(
     outcome: str = "pass",
     tests_run: int = 0,
     tests_passed: int | None = None,
+    tests_failed: int = 0,
     tests_skipped: int = 0,
+    tests_skipped_present: bool = True,
 ) -> dict[str, Any]:
-    """Build a minimal tester_result payload."""
+    """Build a minimal tester_result payload.
+
+    Task #2242 Phase A: ``tests_skipped_present`` defaults to True so the
+    common case (tester emitted the field) is the default. Tests that
+    exercise the contract-violation path set ``tests_skipped_present=False``
+    explicitly, or omit the key entirely.
+    """
     if tests_passed is None:
         tests_passed = tests_run
-    return {
+    payload: dict[str, Any] = {
         "result": outcome,
         "tests_run": tests_run,
         "tests_passed": tests_passed,
+        "tests_failed": tests_failed,
         "tests_skipped": tests_skipped,
     }
+    if tests_skipped_present:
+        payload["tests_skipped_present"] = True
+    return payload
 
 
 def _dev(files_changed: list[str] | str | None = None) -> dict[str, Any]:
@@ -358,19 +370,104 @@ def test_zero_tests_run_with_skip_zero_is_not_all_skipped(
     assert out.get("all_skipped") is False
 
 
-def test_missing_tests_skipped_key_defaults_to_zero(
+def test_missing_tests_skipped_field_is_flagged(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Legacy tester payloads without tests_skipped don't crash and don't fire."""
+    """Task #2242 Phase A: omitting TESTS_SKIPPED is a contract violation.
+
+    A tester that reports pass with tests_run > 0 but does NOT emit the
+    TESTS_SKIPPED line cannot be trusted — the field is REQUIRED. Without
+    this fail-closed behavior the loophole reopens silently on tester
+    drift / truncation / regression. We must not default the field to 0.
+    """
     monkeypatch.setattr(vp, "_branch_has_real_work", lambda _pd: True)
     out = vp.check_vacuous_pass(
+        # NOTE: no tests_skipped_present key — simulates legacy / drifted tester
         tester_result={"result": "pass", "tests_run": 5, "tests_passed": 5},
         dev_result=_dev(["src/main.py"]),
         task={"description": "implement feature"},
         accumulated_files=["src/main.py"],
         project_dir="/some/repo",
     )
+    assert out["vacuous"] is True
+    assert "missing_tests_skipped_field" in out["reason"]
+
+
+def test_tests_skipped_present_false_is_flagged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit tests_skipped_present=False is treated as contract violation."""
+    monkeypatch.setattr(vp, "_branch_has_real_work", lambda _pd: True)
+    out = vp.check_vacuous_pass(
+        tester_result=_result(
+            "pass", tests_run=5, tests_passed=5, tests_skipped_present=False
+        ),
+        dev_result=_dev(["src/main.py"]),
+        task={"description": "implement feature"},
+        accumulated_files=["src/main.py"],
+        project_dir="/some/repo",
+    )
+    assert out["vacuous"] is True
+    assert "missing_tests_skipped_field" in out["reason"]
+
+
+def test_counts_inconsistent_is_flagged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Task #2242 Phase C: passed+failed+skipped != tests_run -> vacuous."""
+    monkeypatch.setattr(vp, "_branch_has_real_work", lambda _pd: True)
+    out = vp.check_vacuous_pass(
+        tester_result=_result(
+            "pass", tests_run=10, tests_passed=0, tests_failed=0, tests_skipped=3,
+        ),
+        dev_result=_dev(["src/main.py"]),
+        task={"description": "implement feature"},
+        accumulated_files=["src/main.py"],
+        project_dir="/some/repo",
+    )
+    assert out["vacuous"] is True
+    assert "counts_inconsistent" in out["reason"]
+
+
+def test_counts_consistent_partial_skip_is_ok(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Task #2242 Phase C: consistent partial skip is not vacuous."""
+    monkeypatch.setattr(vp, "_branch_has_real_work", lambda _pd: True)
+    out = vp.check_vacuous_pass(
+        tester_result=_result(
+            "pass", tests_run=10, tests_passed=7, tests_failed=0, tests_skipped=3,
+        ),
+        dev_result=_dev(["src/main.py"]),
+        task={"description": "implement feature"},
+        accumulated_files=["src/main.py"],
+        project_dir="/some/repo",
+    )
     assert out["vacuous"] is False
+
+
+def test_phase_d_equality_predicate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Task #2242 Phase D: predicate is tests_skipped == tests_run (not >=).
+
+    A run with skipped > run is internally inconsistent and is caught by
+    Phase C upstream, but the all_skipped path itself uses strict equality
+    to match the docstring, prompt, and external contract.
+    """
+    monkeypatch.setattr(vp, "_branch_has_real_work", lambda _pd: True)
+    out = vp.check_vacuous_pass(
+        tester_result=_result(
+            "pass", tests_run=5, tests_passed=0, tests_skipped=5,
+        ),
+        dev_result=_dev(["src/main.py"]),
+        task={"description": "implement feature"},
+        accumulated_files=["src/main.py"],
+        project_dir="/some/repo",
+    )
+    assert out["vacuous"] is True
+    assert out["all_skipped"] is True
+    assert "all_tests_skipped" in out["reason"]
 
 
 def test_fail_outcome_with_skips_is_not_classified_as_skipped(
