@@ -240,11 +240,67 @@ def is_scaffold_project(project_id: int, db_conn_factory=None) -> bool:
     return "scaffold" in haystack or "forgescaffold" in haystack
 
 
+# Case-folded view of _EXCLUDED_NAMES. Case-insensitive filesystems (Samba
+# mounts in particular — the team uses them) make ``Node_Modules`` or
+# ``.GIT`` indistinguishable from the canonical names; comparing only
+# against the lowercase set lets such variants slip through and a foreign
+# ``.git/`` directory would then leak across projects.
+_EXCLUDED_NAMES_LOWER: frozenset[str] = frozenset(
+    name.lower() for name in _EXCLUDED_NAMES
+)
+
+
+def _is_excluded_name(name: str) -> bool:
+    """Return True if ``name`` matches an excluded entry, case-insensitively."""
+    return name.lower() in _EXCLUDED_NAMES_LOWER
+
+
+def _ignore_excluded(_dir: str, names: list[str]) -> list[str]:
+    """``shutil.copytree`` ignore callback: drop case-insensitive matches."""
+    return [n for n in names if _is_excluded_name(n)]
+
+
 def _iter_copyable_entries(source: Path) -> Iterable[Path]:
     for entry in source.iterdir():
-        if entry.name in _EXCLUDED_NAMES:
+        if _is_excluded_name(entry.name):
             continue
         yield entry
+
+
+def _assert_no_escaping_symlinks(root: Path) -> None:
+    """Walk ``root`` and refuse if any symlink resolves outside of it.
+
+    ``shutil.copytree`` with ``symlinks=True`` preserves symlinks as links
+    (without following them), so a malicious symlink inside the scaffold
+    pointing at ``/etc/shadow`` or ``~/.ssh/id_ed25519`` is NOT materialised
+    in the destination — but the link itself would still be copied, which is
+    a footgun if the destination is later archived or rsynced. We therefore
+    pre-walk and reject any symlink whose ``readlink().resolve()`` escapes
+    the scaffold root.
+    """
+    root_resolved = root.resolve(strict=False)
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        # Skip excluded directories at every depth.
+        dirnames[:] = [d for d in dirnames if not _is_excluded_name(d)]
+        for name in dirnames + filenames:
+            if _is_excluded_name(name):
+                continue
+            entry = Path(dirpath) / name
+            if not entry.is_symlink():
+                continue
+            try:
+                target = (entry.parent / os.readlink(entry)).resolve(strict=False)
+            except OSError as exc:
+                raise ScaffoldCloneError(
+                    f"Refusing scaffold clone: cannot read symlink {entry}: {exc}"
+                ) from exc
+            try:
+                target.relative_to(root_resolved)
+            except ValueError:
+                raise ScaffoldCloneError(
+                    f"Refusing scaffold clone: symlink {entry} -> {target} "
+                    f"escapes scaffold root {root_resolved}"
+                )
 
 
 def _copy_tree(source: Path, dest: Path) -> list[str]:
@@ -253,21 +309,33 @@ def _copy_tree(source: Path, dest: Path) -> list[str]:
     Returns the list of top-level entry names that were copied. Raises
     :class:`ScaffoldCloneError` if any individual copy fails (callers will
     surface the error to the orchestrator log).
+
+    Symlinks are PRESERVED (``symlinks=True``) rather than dereferenced —
+    the misleading ``symlinks=False`` would have ``shutil`` chase a symlink
+    to ``/etc/shadow`` and materialise its contents in the destination.
+    Before copying, the scaffold tree is pre-walked to refuse any symlink
+    whose target lies outside the scaffold root (defence-in-depth).
     """
+    _assert_no_escaping_symlinks(source)
+
     copied: list[str] = []
     for entry in _iter_copyable_entries(source):
         target = dest / entry.name
         try:
-            if entry.is_dir():
+            if entry.is_dir() and not entry.is_symlink():
                 shutil.copytree(
                     entry,
                     target,
-                    ignore=shutil.ignore_patterns(*_EXCLUDED_NAMES),
+                    ignore=_ignore_excluded,
                     dirs_exist_ok=False,
-                    symlinks=False,
+                    symlinks=True,  # preserve, do NOT dereference
                 )
+            elif entry.is_symlink():
+                # Preserve top-level symlinks as links, do not follow.
+                link_target = os.readlink(entry)
+                os.symlink(link_target, target)
             else:
-                shutil.copy2(entry, target)
+                shutil.copy2(entry, target, follow_symlinks=False)
         except FileExistsError:
             # A retry partially copied — re-raise so the caller can decide.
             raise ScaffoldCloneError(
