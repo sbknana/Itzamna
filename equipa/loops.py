@@ -1277,10 +1277,21 @@ def _dispatch_tester_outcome(
             return "exit", tester_result, "tests_inconclusive"
 
         # Phase A: TESTS_SKIPPED line absent from tester output.
-        # Only fire when tests_run > 0 — a tester that legitimately found
-        # no tests (no-tests path) doesn't need to emit a skip count.
-        if tests_run > 0 and not tests_skipped_present:
+        # Task #2242 Phase B3: dropped the legacy ``tests_run > 0`` gate. The
+        # contract violation is the omission itself — a tester that omits the
+        # required marker while reporting RESULT: pass cannot be trusted at
+        # any tests_run value. The previous gate let a tester reporting
+        # TESTS_RUN: 0 bypass Phase A entirely.
+        if not tests_skipped_present:
             return _route_inconclusive("missing_tests_skipped_field")
+
+        # Task #2242 Phase B3 paired guard: RESULT: pass with TESTS_RUN: 0 is
+        # itself a contract violation. The tester is asserting success without
+        # having run anything — either it never invoked the framework, or it
+        # is misreporting. Route to tests_inconclusive (NOT tests_passed).
+        # This must come BEFORE Phase B/C/D which gate on tests_run > 0.
+        if tests_run == 0:
+            return _route_inconclusive("pass_with_zero_tests")
 
         # Phase B: framework stdout disagrees with the tester's claim.
         # Task #2242 Phase A3: include tool_output_text so the actual bash/test
