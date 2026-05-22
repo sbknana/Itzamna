@@ -1283,8 +1283,16 @@ def _dispatch_tester_outcome(
             return _route_inconclusive("missing_tests_skipped_field")
 
         # Phase B: framework stdout disagrees with the tester's claim.
+        # Task #2242 Phase A3: include tool_output_text so the actual bash/test
+        # stdout the agent observed (where pytest/vitest print their skip
+        # footers) is part of the scan input. result_text only carries the
+        # tester's prose summary — framework footers usually only appear in
+        # tool_result blocks.
         raw_text = tester_result.get("result_text", "") or ""
-        framework_skips = grep_framework_skip_counts(raw_text)
+        tool_output = tester_result.get("tool_output_text", "") or ""
+        framework_skips = grep_framework_skip_counts(
+            raw_text + "\n" + tool_output
+        )
         if framework_skips > tests_skipped:
             return _route_inconclusive(
                 "framework_skip_count_disagrees",

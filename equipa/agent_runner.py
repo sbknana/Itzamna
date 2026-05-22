@@ -730,6 +730,13 @@ async def _run_agent_streaming_impl(
     consecutive_text_only_turns = 0
     monologue_warning_injected = False
     all_text_chunks: list[str] = []
+    # Task #2242 Phase A3: accumulate framework stdout printed by bash/test
+    # tool_result events so the downstream Phase-B grep can see what the
+    # actual test runner reported (e.g. pytest's "= 3 skipped =" footer).
+    # all_text_chunks only captures assistant TEXT blocks; tool stdout
+    # never lands there, which previously made Phase B structurally blind
+    # to framework-emitted skip counts.
+    tool_output_text_chunks: list[str] = []
     result_data: dict | None = None
     warning_injected = False
     final_warning_injected = False
@@ -1222,6 +1229,19 @@ async def _run_agent_streaming_impl(
                         is_error = block.get("is_error", False)
                         content = block.get("content", "")
 
+                        # Task #2242 Phase A3: capture the raw stdout of tool
+                        # results (bash, etc.) so Phase B can grep framework
+                        # skip counts that never appear in assistant text.
+                        if isinstance(content, str):
+                            if content:
+                                tool_output_text_chunks.append(content)
+                        elif isinstance(content, list):
+                            for _c in content:
+                                if isinstance(_c, dict) and _c.get("type") == "text":
+                                    _t = _c.get("text", "")
+                                    if _t:
+                                        tool_output_text_chunks.append(_t)
+
                         error_text = None
                         if is_error:
                             if isinstance(content, str):
@@ -1316,6 +1336,17 @@ async def _run_agent_streaming_impl(
     result["compaction_signals"] = compaction_signals_all
     result["files_read"] = sorted(files_read)
     result["files_changed_set"] = sorted(files_changed)
+
+    # Task #2242 Phase A3: expose the raw tool_result stdout/stderr that the
+    # agent saw. The Phase-B framework-skip-count grep in loops.py reads this
+    # alongside result_text — without it, framework-emitted skip footers
+    # (pytest, vitest, etc.) are invisible to the cross-check and the
+    # 2236-class loophole reopens silently. Bound the size to keep callers
+    # cheap; the patterns we grep for are short and at the tail of the run.
+    _tool_output_joined = "\n".join(tool_output_text_chunks)
+    if len(_tool_output_joined) > 200_000:
+        _tool_output_joined = _tool_output_joined[-200_000:]
+    result["tool_output_text"] = _tool_output_joined
 
     return result
 
