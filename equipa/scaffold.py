@@ -62,8 +62,17 @@ _EXCLUDED_NAMES: frozenset[str] = frozenset(
 # Files that, when present in isolation, do NOT count as "real" project
 # content. The orchestrator typically drops a stub CLAUDE.md into the
 # project directory when registering a new project — that stub must not
-# block auto-cloning.
+# block auto-cloning. Stored case-folded so case-insensitive mounts
+# (Samba — the team uses it) match ``claude.md``, ``CLAUDE.MD``, etc.
 _PLACEHOLDER_FILENAMES: frozenset[str] = frozenset({"CLAUDE.md", ".gitkeep"})
+_PLACEHOLDER_FILENAMES_LOWER: frozenset[str] = frozenset(
+    n.lower() for n in _PLACEHOLDER_FILENAMES
+)
+
+
+def _is_placeholder_name(name: str) -> bool:
+    """Return True if ``name`` matches a known placeholder filename."""
+    return name.lower() in _PLACEHOLDER_FILENAMES_LOWER
 
 _FALLBACK_SCAFFOLD_DIR = Path("/srv/forge-share/AI_Stuff/ForgeScaffold")
 
@@ -174,7 +183,7 @@ def is_uninitialized(project_dir: str | Path) -> bool:
     if not entries:
         return True
     return all(
-        entry.is_file() and entry.name in _PLACEHOLDER_FILENAMES
+        entry.is_file() and _is_placeholder_name(entry.name)
         for entry in entries
     )
 
@@ -572,7 +581,7 @@ def ensure_scaffold(
     dest.mkdir(parents=True, exist_ok=True)
     # Remove any placeholder files so copytree does not collide.
     for entry in list(dest.iterdir()):
-        if entry.is_file() and entry.name in _PLACEHOLDER_FILENAMES:
+        if entry.is_file() and _is_placeholder_name(entry.name):
             try:
                 entry.unlink()
             except OSError as exc:
