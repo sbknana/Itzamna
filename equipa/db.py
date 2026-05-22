@@ -243,36 +243,97 @@ def _parse_files_changed_block(result_text: str) -> list[str]:
     return files
 
 
+# Upper bound for files_changed_count to defend the alerting/quality-scoring
+# pipeline against absurd values (forged or accidentally inflated). Picked well
+# above any plausible single-diff size in a monorepo.
+_FILES_CHANGED_MAX = 10_000
+
+
+def _clamp_files_changed(value: int, source: str) -> int:
+    """Clamp a non-negative file count to ``_FILES_CHANGED_MAX``.
+
+    Logs a warning when clamping occurs so downstream investigators can spot
+    fabricated or runaway values. Negative inputs collapse to 0.
+    """
+    if value < 0:
+        return 0
+    if value > _FILES_CHANGED_MAX:
+        try:
+            from equipa.output import log
+            log(
+                f"[telemetry] files_changed_count from {source}={value} exceeds "
+                f"max {_FILES_CHANGED_MAX}; clamping. Possible fabrication."
+            )
+        except Exception:
+            pass
+        return _FILES_CHANGED_MAX
+    return value
+
+
 def _resolve_files_changed_count(result: dict | None) -> int:
     """Determine how many files an agent run actually changed.
 
-    Sources, in order of trust:
-      1. Explicit ``result["files_changed_count"]`` (callers may pre-compute it).
+    Trust model (post-#2314 security re-review):
+      1. Explicit ``result["files_changed_count"]`` — caller pre-computed it
+         (e.g., from a git diff). Must be a real int (``bool`` rejected).
       2. ``result["files_changed_set"]`` — populated by ``agent_runner.run_agent``
-         from observed Edit/Write/NotebookEdit tool-call inputs. This is the
-         most reliable signal available pre-merge.
-      3. ``result["files_changed"]`` — set by some loop callers from the
-         parser output.
-      4. Parsing the ``FILES_CHANGED:`` footer out of ``result_text`` — last
-         resort for runs where the structured set was lost.
+         from observed Edit/Write/NotebookEdit tool-call inputs. AUTHORITATIVE
+         when present, even when empty. Agent-emitted ``FILES_CHANGED:`` footers
+         are never trusted as a fallback once this key is set, because a vacuous
+         run could forge it. Callers MUST always populate this key.
+      3. ``result["files_changed"]`` — legacy alias used by some loop callers.
+      4. ``FILES_CHANGED:`` footer in ``result_text`` — last resort, agent
+         self-report, lowest trust. Only used when neither structured key is
+         present.
 
-    Task #2314: the schema column existed but no code path populated it. The
-    vacuous-pass alert (success=1 AND files_changed_count=0) was therefore
-    100% false-positive and disabled. Use the strongest signal we have so the
-    alert becomes usable again. Returns 0 when ``result`` is missing or
-    unstructured so the column reflects "no observed work".
+    Missing ``files_changed_set`` is treated as a callsite bug, logged at WARN,
+    and the function returns 0 rather than trusting the agent footer. All
+    branches clamp to ``_FILES_CHANGED_MAX``.
     """
     if not isinstance(result, dict):
         return 0
+
+    # Phase B: reject bool — isinstance(True, int) is True in Python and would
+    # otherwise silently coerce True/False into 1/0 in the column.
     explicit = result.get("files_changed_count")
-    if isinstance(explicit, int) and explicit >= 0:
-        return explicit
-    for key in ("files_changed_set", "files_changed"):
-        value = result.get(key)
+    if isinstance(explicit, int) and not isinstance(explicit, bool) and explicit >= 0:
+        return _clamp_files_changed(explicit, "explicit")
+
+    # Phase A: files_changed_set is authoritative when present. Do NOT fall
+    # through to the agent-controlled footer parse, even when the set is empty.
+    if "files_changed_set" in result:
+        value = result["files_changed_set"]
         if isinstance(value, (list, tuple, set)):
-            return len(value)
-    parsed = _parse_files_changed_block(result.get("result_text", "") or "")
-    return len(parsed)
+            return _clamp_files_changed(len(value), "files_changed_set")
+        # Key present but malformed — log and treat as 0 (do NOT trust footer).
+        try:
+            from equipa.output import log
+            log(
+                "[telemetry] files_changed_set present but not a "
+                f"list/tuple/set (got {type(value).__name__}); treating as 0."
+            )
+        except Exception:
+            pass
+        return 0
+
+    # files_changed_set absent → callsite bug. Warn and return 0; do NOT
+    # silently fall through to the agent footer.
+    try:
+        from equipa.output import log
+        log(
+            "[telemetry] WARN: result missing 'files_changed_set' in "
+            "_resolve_files_changed_count; agent_runner.run_agent must set "
+            "this on every exit path. Returning 0 (footer parse skipped)."
+        )
+    except Exception:
+        pass
+
+    # Legacy alias still trusted (set by trusted loop callers, not the agent).
+    legacy = result.get("files_changed")
+    if isinstance(legacy, (list, tuple, set)):
+        return _clamp_files_changed(len(legacy), "files_changed")
+
+    return 0
 
 
 def record_agent_run(
