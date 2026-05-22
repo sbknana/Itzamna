@@ -626,30 +626,71 @@ _DEVELOPER_FILES_SCHEMA: dict = {"FILES_CHANGED": list}
 def parse_tester_output(result_text: str) -> dict:
     """Parse structured output from the Tester agent.
 
-    Task #2242 Phase A: TESTS_SKIPPED is mandatory in the tester contract.
-    The generic parser silently defaults missing int fields to 0, which lets
-    a drift/truncation/regression in the tester output bypass the all-skipped
-    guard (a tester that omits the line produces tests_skipped=0, the
-    predicate ``tests_skipped == tests_run`` fails for any tests_run > 0,
-    and the loophole reopens). We record whether the line was actually
-    present so callers can fail closed on absence.
+    Task #2242 Phase A/C3/F3: TESTS_SKIPPED is REQUIRED in the tester
+    contract. The generic parser silently defaults missing int fields to 0,
+    which lets drift / truncation / regression / adversarial misreport bypass
+    the all-skipped guard (a tester that omits the line produces
+    tests_skipped=0, the predicate ``tests_skipped == tests_run`` fails for
+    any tests_run > 0, and the 2236-class loophole reopens).
+
+    The parser is now the single source of truth: ``tests_skipped`` is the
+    parsed integer when the line is present AND its value parses as int;
+    otherwise it is ``None`` (the contract-violation sentinel). Call sites
+    MUST treat ``None`` as "fail closed → tests_inconclusive" and MUST NOT
+    coerce it to 0 with ``or 0``. The legacy ``tests_skipped_present``
+    sidechannel is removed — ``tests_skipped is None`` is the canonical
+    signal.
+
+    Phase F3: presence is not sufficient — the value must also be a
+    parseable int. A line ``TESTS_SKIPPED: (see comment)`` is treated as a
+    contract violation (returns ``None``), not as 0.
     """
     parsed = _parse_structured_output(result_text, _TESTER_SCHEMA)
     # Backward compat: default test_framework to "none"
     if not parsed.get("test_framework"):
         parsed["test_framework"] = "none"
-    # Task #2242 Phase A: detect whether the tester actually emitted the
-    # TESTS_SKIPPED line. Absence is a contract violation, not a default.
-    parsed["tests_skipped_present"] = _has_marker_line(result_text, "TESTS_SKIPPED")
+    # Phase C3/F3: parser is the source of truth. None on absent OR
+    # unparseable value; the int on a clean marker line.
+    parsed["tests_skipped"] = _required_int(result_text, "TESTS_SKIPPED")
     return parsed
+
+
+def _required_int(text: str, marker: str) -> int | None:
+    """Return the int value of ``MARKER: <int>`` or ``None`` on contract violation.
+
+    Task #2242 Phase C3/F3: the single canonical "is this marker present
+    AND parseable?" check. Used by ``parse_tester_output`` to flag a
+    REQUIRED int field as missing-or-bogus so callers can fail closed.
+
+    Contract:
+        * marker absent           -> ``None``
+        * marker present, value parses as ``int`` -> the int
+        * marker present, value does NOT parse   -> ``None``
+
+    Matches the same line shape ``_parse_structured_output`` accepts (the
+    marker must start the stripped line, followed by a colon).
+    """
+    if not text:
+        return None
+    prefix = f"{marker}:"
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(prefix):
+            value = stripped.split(":", 1)[1].strip()
+            try:
+                return int(value)
+            except ValueError:
+                return None
+    return None
 
 
 def _has_marker_line(text: str, marker: str) -> bool:
     """True if ``text`` contains a line that begins with ``{marker}:``.
 
     Matches the same shape ``_parse_structured_output`` accepts (the marker
-    must start the stripped line, followed by a colon). Used to detect
-    contract violations where a required marker is omitted entirely.
+    must start the stripped line, followed by a colon). Retained for the
+    benefit of other callers; the tester-contract path now uses
+    ``_required_int`` directly so presence-AND-parseable is a single check.
     """
     if not text:
         return False

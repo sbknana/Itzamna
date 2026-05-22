@@ -1243,10 +1243,19 @@ def _dispatch_tester_outcome(
         #   (was >=). Phase C now rejects inconsistent input upstream, so the
         #   stricter predicate is safe and matches the docstring + tests.
         tests_run = int(test_results.get("tests_run") or 0)
-        tests_skipped = int(test_results.get("tests_skipped") or 0)
+        # Task #2242 Phase C3/F3: tests_skipped is now ``None`` from the
+        # parser when the TESTS_SKIPPED line is absent OR has an unparseable
+        # value (contract violation). DO NOT coerce to 0 with ``or 0`` — the
+        # whole point of the Phase-A guard is to NOT silently default. Keep
+        # the raw value here and use a separate int view (tests_skipped_int)
+        # for arithmetic. tests_skipped_present is derived from the sentinel.
+        tests_skipped_raw = test_results.get("tests_skipped")
+        tests_skipped_present = tests_skipped_raw is not None
+        tests_skipped = (
+            int(tests_skipped_raw) if isinstance(tests_skipped_raw, int) else 0
+        )
         tests_passed_count = int(test_results.get("tests_passed") or 0)
         tests_failed_count = int(test_results.get("tests_failed") or 0)
-        tests_skipped_present = bool(test_results.get("tests_skipped_present"))
 
         def _route_inconclusive(reason: str, **extra: Any) -> tuple[str, dict[str, Any], str]:
             log(

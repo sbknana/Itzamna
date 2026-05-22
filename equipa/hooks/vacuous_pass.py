@@ -163,12 +163,17 @@ def check_vacuous_pass(**kwargs: Any) -> dict[str, Any]:
     tests_run = int(tester_result.get("tests_run") or 0)
     tests_passed = int(tester_result.get("tests_passed") or 0)
     tests_failed = int(tester_result.get("tests_failed") or 0)
-    tests_skipped = int(tester_result.get("tests_skipped") or 0)
-    # Task #2242 Phase A: ``tests_skipped_present`` is the sentinel set by
-    # ``parse_tester_output`` indicating the TESTS_SKIPPED line was actually
-    # present in tester output. Missing the line is a contract violation,
-    # not a default-to-zero. Fail closed.
-    tests_skipped_present = bool(tester_result.get("tests_skipped_present"))
+    # Task #2242 Phase C3/F3: ``parse_tester_output`` now returns ``None``
+    # for tests_skipped when the TESTS_SKIPPED line is absent OR its value
+    # is unparseable. ``tests_skipped is None`` is the canonical
+    # contract-violation sentinel; the legacy ``tests_skipped_present`` key
+    # is no longer set by the parser. Fail closed on None — do NOT default
+    # to 0 with ``or 0``.
+    tests_skipped_raw = tester_result.get("tests_skipped")
+    tests_skipped_present = tests_skipped_raw is not None
+    tests_skipped = (
+        int(tests_skipped_raw) if isinstance(tests_skipped_raw, int) else 0
+    )
     tester_outcome = (tester_result.get("result") or "").lower()
 
     # Task #2242 Phase A: TESTS_SKIPPED is REQUIRED in the tester contract.
