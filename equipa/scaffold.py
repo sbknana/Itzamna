@@ -554,14 +554,11 @@ def ensure_scaffold(
     if project_dir is None:
         return False
 
-    # Containment check BEFORE we touch the filesystem. A crafted
-    # ``local_path`` like ``/srv/forge-share/AI_Stuff/../../etc/evil`` would
-    # otherwise reach ``dest.mkdir(parents=True, exist_ok=True)`` below and
-    # silently create directories outside the share. ``assert_contained_path``
-    # rejects ``..`` segments and verifies the resolved path lies inside an
-    # allowlisted root.
-    dest = assert_contained_path(project_dir)
+    dest = Path(project_dir)
 
+    # Cheap early-returns first so populated / non-scaffold directories
+    # don't trip the containment check (which is only meaningful when we
+    # are about to mkdir + copy).
     if not force:
         if not is_uninitialized(dest):
             return False
@@ -569,6 +566,14 @@ def ensure_scaffold(
             project_id, db_conn_factory=db_conn_factory
         ):
             return False
+
+    # Containment check BEFORE we touch the filesystem. A crafted
+    # ``local_path`` like ``/srv/forge-share/AI_Stuff/../../etc/evil`` would
+    # otherwise reach ``dest.mkdir(parents=True, exist_ok=True)`` below and
+    # silently create directories outside the share. ``assert_contained_path``
+    # rejects ``..`` segments and verifies the resolved path lies inside an
+    # allowlisted root.
+    dest = assert_contained_path(dest)
 
     source = resolve_scaffold_source(config)
     if not source.exists() or not source.is_dir():
