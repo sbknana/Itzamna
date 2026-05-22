@@ -192,6 +192,150 @@ def ensure_schema() -> None:
 
 # --- Record Functions ---
 
+# Match the FILES_CHANGED footer the developer/code-reviewer/security-reviewer
+# emit. Tolerant of leading whitespace and the trailing colon variants observed
+# in production agent output. Anchored to a line start so prose mid-paragraph
+# doesn't false-match (the "FILES_CHANGED is REQUIRED" instruction line in the
+# developer prompt template, for example).
+_FILES_CHANGED_BLOCK_RE = re.compile(
+    r"^[ \t]*FILES[_ ]CHANGED[ \t]*:[ \t]*(.*?)(?=^[ \t]*[A-Z][A-Z_ ]{2,}[ \t]*:|\Z)",
+    re.MULTILINE | re.DOTALL | re.IGNORECASE,
+)
+
+# Lines we should ignore inside a FILES_CHANGED block. The developer template
+# explicitly says "If you changed no files, write `FILES_CHANGED: none`" — that
+# sentinel must NOT count as a real file. Bullets / dashes are valid list
+# markers; we strip them before checking the sentinel.
+_FILES_CHANGED_NONE_SENTINELS = {"none", "n/a", "(none)", "-", ""}
+
+
+def _parse_files_changed_block(result_text: str) -> list[str]:
+    """Extract the file list from the agent's FILES_CHANGED footer.
+
+    Returns the list of distinct file paths claimed in the block. Used as a
+    fallback for runs where ``files_changed_set`` was not attached to the
+    result dict (older callers, synthesized results, retry shims).
+    """
+    if not result_text:
+        return []
+    match = _FILES_CHANGED_BLOCK_RE.search(result_text)
+    if not match:
+        return []
+    body = match.group(1)
+    files: list[str] = []
+    seen: set[str] = set()
+    for raw_line in body.splitlines():
+        line = raw_line.strip()
+        # Strip common list markers ("- foo.py", "* foo.py", "1. foo.py").
+        line = re.sub(r"^([\-\*•]|\d+\.)\s+", "", line)
+        # Drop trailing inline comments and the orchestrator's status hints
+        # like " (created)" / " (modified)" so the path key dedups cleanly.
+        line = re.sub(r"\s+\((?:created|modified|new|updated|deleted)\)\s*$",
+                      "", line, flags=re.IGNORECASE)
+        if not line or line.startswith("#"):
+            continue
+        if line.lower() in _FILES_CHANGED_NONE_SENTINELS:
+            return []
+        if line in seen:
+            continue
+        seen.add(line)
+        files.append(line)
+    return files
+
+
+# Upper bound for files_changed_count to defend the alerting/quality-scoring
+# pipeline against absurd values (forged or accidentally inflated). Picked well
+# above any plausible single-diff size in a monorepo.
+_FILES_CHANGED_MAX = 10_000
+
+
+def _clamp_files_changed(value: int, source: str) -> int:
+    """Clamp a non-negative file count to ``_FILES_CHANGED_MAX``.
+
+    Logs a warning when clamping occurs so downstream investigators can spot
+    fabricated or runaway values. Negative inputs collapse to 0.
+    """
+    if value < 0:
+        return 0
+    if value > _FILES_CHANGED_MAX:
+        try:
+            from equipa.output import log
+            log(
+                f"[telemetry] files_changed_count from {source}={value} exceeds "
+                f"max {_FILES_CHANGED_MAX}; clamping. Possible fabrication."
+            )
+        except Exception:
+            pass
+        return _FILES_CHANGED_MAX
+    return value
+
+
+def _resolve_files_changed_count(result: dict | None) -> int:
+    """Determine how many files an agent run actually changed.
+
+    Trust model (post-#2314 security re-review):
+      1. Explicit ``result["files_changed_count"]`` — caller pre-computed it
+         (e.g., from a git diff). Must be a real int (``bool`` rejected).
+      2. ``result["files_changed_set"]`` — populated by ``agent_runner.run_agent``
+         from observed Edit/Write/NotebookEdit tool-call inputs. AUTHORITATIVE
+         when present, even when empty. Agent-emitted ``FILES_CHANGED:`` footers
+         are never trusted as a fallback once this key is set, because a vacuous
+         run could forge it. Callers MUST always populate this key.
+      3. ``result["files_changed"]`` — legacy alias used by some loop callers.
+      4. ``FILES_CHANGED:`` footer in ``result_text`` — last resort, agent
+         self-report, lowest trust. Only used when neither structured key is
+         present.
+
+    Missing ``files_changed_set`` is treated as a callsite bug, logged at WARN,
+    and the function returns 0 rather than trusting the agent footer. All
+    branches clamp to ``_FILES_CHANGED_MAX``.
+    """
+    if not isinstance(result, dict):
+        return 0
+
+    # Phase B: reject bool — isinstance(True, int) is True in Python and would
+    # otherwise silently coerce True/False into 1/0 in the column.
+    explicit = result.get("files_changed_count")
+    if isinstance(explicit, int) and not isinstance(explicit, bool) and explicit >= 0:
+        return _clamp_files_changed(explicit, "explicit")
+
+    # Phase A: files_changed_set is authoritative when present. Do NOT fall
+    # through to the agent-controlled footer parse, even when the set is empty.
+    if "files_changed_set" in result:
+        value = result["files_changed_set"]
+        if isinstance(value, (list, tuple, set)):
+            return _clamp_files_changed(len(value), "files_changed_set")
+        # Key present but malformed — log and treat as 0 (do NOT trust footer).
+        try:
+            from equipa.output import log
+            log(
+                "[telemetry] files_changed_set present but not a "
+                f"list/tuple/set (got {type(value).__name__}); treating as 0."
+            )
+        except Exception:
+            pass
+        return 0
+
+    # files_changed_set absent → callsite bug. Warn and return 0; do NOT
+    # silently fall through to the agent footer.
+    try:
+        from equipa.output import log
+        log(
+            "[telemetry] WARN: result missing 'files_changed_set' in "
+            "_resolve_files_changed_count; agent_runner.run_agent must set "
+            "this on every exit path. Returning 0 (footer parse skipped)."
+        )
+    except Exception:
+        pass
+
+    # Legacy alias still trusted (set by trusted loop callers, not the agent).
+    legacy = result.get("files_changed")
+    if isinstance(legacy, (list, tuple, set)):
+        return _clamp_files_changed(len(legacy), "files_changed")
+
+    return 0
+
+
 def record_agent_run(
     task: dict | int,
     result: dict | None,
@@ -248,7 +392,7 @@ def record_agent_run(
                 error_type = "loop_detected"
             else:
                 error_type = "agent_error"
-        files_changed = result.get("files_changed_count", 0) if isinstance(result, dict) else 0
+        files_changed = _resolve_files_changed_count(result)
 
         with db_conn(write=True) as conn:
             conn.execute(
