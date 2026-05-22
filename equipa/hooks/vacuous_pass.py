@@ -29,6 +29,19 @@ The classification dict carries ``all_skipped=True`` so callers can
 route the outcome to a stricter retry (or escalate to an operator)
 rather than marking the task done.
 
+Task #2242 (re-dispatch) closes the security-review HIGH findings:
+
+    * Phase A — TESTS_SKIPPED line absence is treated as a contract
+      violation (fail closed), not a default-to-zero. Without this,
+      tester drift / truncation / regression silently reopens the
+      vacuous-pass loophole.
+    * Phase C — internal-consistency check: tests_passed + tests_failed
+      + tests_skipped must equal tests_run when tests_run > 0. Catches
+      adversarial misreport and benign tester bugs.
+    * Phase D — the all-skipped predicate is now ``==`` (was ``>=``).
+      Phase C rejects inconsistent input upstream so equality is the
+      single canonical statement, matching the docstring and tests.
+
 Task #2079: the per-cycle ``dev_result.files_changed`` view is too
 narrow. Agents legitimately commit all their work in cycles 1-2 and
 then idle in cycles 3-5; the guard would fire on the late idle cycles
@@ -149,8 +162,54 @@ def check_vacuous_pass(**kwargs: Any) -> dict[str, Any]:
 
     tests_run = int(tester_result.get("tests_run") or 0)
     tests_passed = int(tester_result.get("tests_passed") or 0)
+    tests_failed = int(tester_result.get("tests_failed") or 0)
     tests_skipped = int(tester_result.get("tests_skipped") or 0)
+    # Task #2242 Phase A: ``tests_skipped_present`` is the sentinel set by
+    # ``parse_tester_output`` indicating the TESTS_SKIPPED line was actually
+    # present in tester output. Missing the line is a contract violation,
+    # not a default-to-zero. Fail closed.
+    tests_skipped_present = bool(tester_result.get("tests_skipped_present"))
     tester_outcome = (tester_result.get("result") or "").lower()
+
+    # Task #2242 Phase A: TESTS_SKIPPED is REQUIRED in the tester contract.
+    # If the line is absent and tests_run > 0, the tester is in contract
+    # violation — drift, truncation, model regression, deliberate misreport.
+    # Classify as vacuous so the orchestrator routes to a stricter retry.
+    if (
+        tester_outcome in {"pass", "no-tests"}
+        and tests_run > 0
+        and not tests_skipped_present
+    ):
+        return {
+            "vacuous": True,
+            "all_skipped": False,
+            "reason": (
+                f"missing_tests_skipped_field: tester={tester_outcome} "
+                f"tests_run={tests_run} — TESTS_SKIPPED line absent from "
+                f"tester output (REQUIRED by contract); cannot trust the "
+                f"reported pass without an explicit skip count"
+            ),
+        }
+
+    # Task #2242 Phase C: internal-consistency check. tests_run > 0 with
+    # tests_passed + tests_failed + tests_skipped != tests_run means the
+    # tester is reporting inconsistent integers (adversarial OR benign bug).
+    # Reject upstream so the Phase-D `==` predicate below is unambiguous.
+    if (
+        tester_outcome in {"pass", "no-tests"}
+        and tests_run > 0
+        and (tests_passed + tests_failed + tests_skipped) != tests_run
+    ):
+        return {
+            "vacuous": True,
+            "all_skipped": False,
+            "reason": (
+                f"counts_inconsistent: tester={tester_outcome} "
+                f"tests_run={tests_run} passed={tests_passed} "
+                f"failed={tests_failed} skipped={tests_skipped} — "
+                f"counts do not sum to tests_run"
+            ),
+        }
 
     # Task #2242: all-tests-skipped detector. If the tester ran a non-zero
     # number of tests but every one of them was skipped (no real assertions
@@ -161,10 +220,14 @@ def check_vacuous_pass(**kwargs: Any) -> dict[str, Any]:
     # attempt as inconclusive — neither pass nor fail — and surface
     # ``all_skipped=True`` so the orchestrator can route to a stricter
     # retry instead of marking the task done.
+    #
+    # Phase D: predicate is ``tests_skipped == tests_run`` (was ``>=``).
+    # Phase C above rejects inconsistent input, so equality is the single
+    # canonical statement that matches the docstring, prompt, and tests.
     if (
         tester_outcome in {"pass", "no-tests"}
         and tests_run > 0
-        and tests_skipped >= tests_run
+        and tests_skipped == tests_run
         and tests_passed == 0
     ):
         return {
