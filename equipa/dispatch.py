@@ -141,11 +141,26 @@ def _bootstrap_scaffold_if_needed(task: dict, project_id: int | None) -> str | N
             "/srv/forge-share/AI_Stuff"
             + candidate[len("Z:\\AI_Stuff"):].replace("\\", "/")
         )
+    # Containment check: a DB-supplied ``local_path`` is untrusted input.
+    # Without this, a value like ``Z:\AI_Stuff\..\..\etc\evil`` translates to
+    # ``/srv/forge-share/AI_Stuff/../../etc/evil`` and ``mkdir(parents=True)``
+    # would silently create ``/etc/evil``. Reject ``..`` segments and require
+    # the resolved path to live inside an allowlisted root.
     try:
-        Path(candidate).mkdir(parents=True, exist_ok=True)
+        from equipa.scaffold import assert_contained_path, ScaffoldCloneError
+        safe_path = assert_contained_path(candidate)
+    except Exception as exc:  # ScaffoldCloneError or import failure
+        logger.warning(
+            "scaffold bootstrap: refusing unsafe local_path %r: %s",
+            candidate,
+            exc,
+        )
+        return None
+    try:
+        safe_path.mkdir(parents=True, exist_ok=True)
     except OSError:
         return None
-    return candidate
+    return str(safe_path)
 
 
 # --- Cross-Attempt Memory Helpers ---

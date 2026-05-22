@@ -67,9 +67,69 @@ _PLACEHOLDER_FILENAMES: frozenset[str] = frozenset({"CLAUDE.md", ".gitkeep"})
 
 _FALLBACK_SCAFFOLD_DIR = Path("/srv/forge-share/AI_Stuff/ForgeScaffold")
 
+# Allowlisted roots inside which scaffold project directories may be created.
+# A ``projects.local_path`` value (after Windows -> POSIX translation) must
+# resolve to a path contained by one of these roots, otherwise the clone is
+# refused. This prevents a malicious or corrupted DB row of the form
+# ``Z:\AI_Stuff\..\..\etc\evil`` from coaxing ``mkdir(parents=True)`` into
+# materialising ``/etc/evil``. The list is intentionally short; override
+# only via the ``EQUIPA_SCAFFOLD_ALLOWED_ROOTS`` env var (colon-separated).
+_DEFAULT_ALLOWED_ROOTS: tuple[Path, ...] = (
+    Path("/srv/forge-share/AI_Stuff"),
+)
+
 
 class ScaffoldCloneError(RuntimeError):
     """Raised when auto-clone is attempted but cannot complete safely."""
+
+
+def _allowed_roots() -> tuple[Path, ...]:
+    """Return the configured allowlisted roots for scaffold destinations."""
+    env_roots = os.environ.get("EQUIPA_SCAFFOLD_ALLOWED_ROOTS", "")
+    if env_roots:
+        parsed = tuple(
+            Path(item).expanduser().resolve(strict=False)
+            for item in env_roots.split(":")
+            if item.strip()
+        )
+        if parsed:
+            return parsed
+    return tuple(root.resolve(strict=False) for root in _DEFAULT_ALLOWED_ROOTS)
+
+
+def assert_contained_path(candidate: str | Path) -> Path:
+    """Return a resolved Path for ``candidate`` after containment check.
+
+    Raises :class:`ScaffoldCloneError` if the candidate contains ``..``
+    segments before resolution (defence-in-depth) OR if the resolved
+    absolute path does not lie inside one of the allowlisted roots.
+
+    The check intentionally happens BEFORE any ``mkdir`` so a malicious
+    ``local_path`` cannot create directories outside the share.
+    """
+    if candidate is None or candidate == "":
+        raise ScaffoldCloneError("Refusing scaffold clone: empty path candidate")
+    raw = str(candidate)
+    # Defence-in-depth: reject any traversal token before resolution. POSIX
+    # ``..`` and Windows ``..`` both render as the literal segment after the
+    # Windows->POSIX translation in dispatch._bootstrap_scaffold_if_needed.
+    posix_parts = raw.replace("\\", "/").split("/")
+    if any(part == ".." for part in posix_parts):
+        raise ScaffoldCloneError(
+            f"Refusing scaffold clone: path contains traversal segment ({raw!r})"
+        )
+    resolved = Path(raw).resolve(strict=False)
+    roots = _allowed_roots()
+    for root in roots:
+        try:
+            resolved.relative_to(root)
+            return resolved
+        except ValueError:
+            continue
+    raise ScaffoldCloneError(
+        f"Refusing scaffold clone: resolved path {resolved} is not inside "
+        f"any allowlisted root ({', '.join(str(r) for r in roots)})"
+    )
 
 
 def resolve_scaffold_source(config: dict | None = None) -> Path:
@@ -346,7 +406,13 @@ def ensure_scaffold(
     if project_dir is None:
         return False
 
-    dest = Path(project_dir)
+    # Containment check BEFORE we touch the filesystem. A crafted
+    # ``local_path`` like ``/srv/forge-share/AI_Stuff/../../etc/evil`` would
+    # otherwise reach ``dest.mkdir(parents=True, exist_ok=True)`` below and
+    # silently create directories outside the share. ``assert_contained_path``
+    # rejects ``..`` segments and verifies the resolved path lies inside an
+    # allowlisted root.
+    dest = assert_contained_path(project_dir)
 
     if not force:
         if not is_uninitialized(dest):
