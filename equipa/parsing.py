@@ -624,12 +624,93 @@ _DEVELOPER_FILES_SCHEMA: dict = {"FILES_CHANGED": list}
 
 
 def parse_tester_output(result_text: str) -> dict:
-    """Parse structured output from the Tester agent."""
+    """Parse structured output from the Tester agent.
+
+    Task #2242 Phase A: TESTS_SKIPPED is mandatory in the tester contract.
+    The generic parser silently defaults missing int fields to 0, which lets
+    a drift/truncation/regression in the tester output bypass the all-skipped
+    guard (a tester that omits the line produces tests_skipped=0, the
+    predicate ``tests_skipped == tests_run`` fails for any tests_run > 0,
+    and the loophole reopens). We record whether the line was actually
+    present so callers can fail closed on absence.
+    """
     parsed = _parse_structured_output(result_text, _TESTER_SCHEMA)
     # Backward compat: default test_framework to "none"
     if not parsed.get("test_framework"):
         parsed["test_framework"] = "none"
+    # Task #2242 Phase A: detect whether the tester actually emitted the
+    # TESTS_SKIPPED line. Absence is a contract violation, not a default.
+    parsed["tests_skipped_present"] = _has_marker_line(result_text, "TESTS_SKIPPED")
     return parsed
+
+
+def _has_marker_line(text: str, marker: str) -> bool:
+    """True if ``text`` contains a line that begins with ``{marker}:``.
+
+    Matches the same shape ``_parse_structured_output`` accepts (the marker
+    must start the stripped line, followed by a colon). Used to detect
+    contract violations where a required marker is omitted entirely.
+    """
+    if not text:
+        return False
+    prefix = f"{marker}:"
+    for line in text.splitlines():
+        if line.strip().startswith(prefix):
+            return True
+    return False
+
+
+# Framework-emitted skip patterns (Task #2242 Phase B). We grep the raw
+# tester stdout/result_text for these to cross-check the tester's reported
+# TESTS_SKIPPED count. If the framework's own output disagrees with what
+# the tester reported, the tester's numbers are suspect — fail closed.
+#
+# Patterns are intentionally narrow (anchored on word boundaries and the
+# specific count-bearing token) to keep false positives low. Each pattern
+# captures the integer count via group 1.
+_FRAMEWORK_SKIP_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # vitest / jest: "5 skipped" / "2 todo"
+    re.compile(r"\b(\d+)\s+skipped\b", re.IGNORECASE),
+    re.compile(r"\b(\d+)\s+todo\b", re.IGNORECASE),
+    # pytest footer: "= 3 skipped =" / "3 skipped in 0.12s"
+    re.compile(r"=\s*(\d+)\s+skipped[\s=]", re.IGNORECASE),
+    # playwright: covered by the generic "N skipped" above
+    # go test "--- SKIP: TestFoo" is counted via _GO_SKIP_PATTERN below
+)
+
+_GO_SKIP_PATTERN: re.Pattern[str] = re.compile(
+    r"^---\s+SKIP:\s+\S+", re.MULTILINE,
+)
+
+
+def grep_framework_skip_counts(result_text: str) -> int:
+    """Return the max skip count observed in framework-emitted output.
+
+    Task #2242 Phase B: cross-check the tester's TESTS_SKIPPED claim against
+    what the actual test framework printed. If the framework's footer says
+    "5 skipped" but the tester reported TESTS_SKIPPED: 0 (or omitted the
+    line), the tester is misreporting — route to ``tests_inconclusive``.
+
+    Returns the maximum count seen across all known patterns. Returns 0
+    when no framework skip signal is found (which is the correct default:
+    "no evidence of disagreement").
+    """
+    if not result_text:
+        return 0
+    max_count = 0
+    for pattern in _FRAMEWORK_SKIP_PATTERNS:
+        for match in pattern.finditer(result_text):
+            try:
+                count = int(match.group(1))
+            except (ValueError, IndexError):
+                continue
+            if count > max_count:
+                max_count = count
+    # go test prints one "--- SKIP:" line per skipped test
+    go_skips = len(_GO_SKIP_PATTERN.findall(result_text))
+    if go_skips > max_count:
+        max_count = go_skips
+    return max_count
 
 
 def parse_developer_output(result_text: str) -> list[str]:
