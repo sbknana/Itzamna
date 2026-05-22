@@ -71,6 +71,7 @@ from equipa.git_ops import git_run_async
 from equipa.parsing import (
     build_compaction_summary,
     build_test_failure_context,
+    grep_framework_skip_counts,
     parse_developer_output,
     parse_tester_output,
 )
@@ -1228,18 +1229,83 @@ def _dispatch_tester_outcome(
     test_outcome = test_results["result"]
 
     if test_outcome == "pass":
-        # Task #2242: catch the "all tests skipped" loophole. A "pass" with
-        # tests_run > 0 but tests_skipped == tests_run (and tests_passed == 0)
-        # means every test was skipped (typically due to missing env vars or
-        # unmet prerequisites). The tester legitimately reports pass, but
-        # nothing was actually validated — we cannot tell real success from
-        # vacuous success. Route to a stricter retry instead of marking done.
+        # Task #2242: defense-in-depth against the "vacuous pass" loophole.
+        # Phase A — TESTS_SKIPPED is a REQUIRED field. Absence means the
+        #   tester is in contract violation (drift, truncation, regression,
+        #   adversarial). Fail closed: tests_inconclusive, do NOT default to 0.
+        # Phase B — cross-check the tester's TESTS_SKIPPED claim against
+        #   framework-emitted skip counts in the raw stdout. If the framework
+        #   reports more skips than the tester admitted, the tester is
+        #   misreporting (e.g. TESTS_RUN: 0 paired with raw "5 skipped").
+        # Phase C — internal consistency: tests_passed + tests_failed +
+        #   tests_skipped must equal tests_run when tests_run > 0.
+        # Phase D — tightened all-skipped predicate: tests_skipped == tests_run
+        #   (was >=). Phase C now rejects inconsistent input upstream, so the
+        #   stricter predicate is safe and matches the docstring + tests.
         tests_run = int(test_results.get("tests_run") or 0)
         tests_skipped = int(test_results.get("tests_skipped") or 0)
         tests_passed_count = int(test_results.get("tests_passed") or 0)
+        tests_failed_count = int(test_results.get("tests_failed") or 0)
+        tests_skipped_present = bool(test_results.get("tests_skipped_present"))
+
+        def _route_inconclusive(reason: str, **extra: Any) -> tuple[str, dict[str, Any], str]:
+            log(
+                f"  [Cycle {cycle}] tests_inconclusive ({reason}): "
+                f"tests_run={tests_run} passed={tests_passed_count} "
+                f"failed={tests_failed_count} skipped={tests_skipped} "
+                f"skipped_present={tests_skipped_present}",
+                output,
+            )
+            payload = {
+                "outcome": "inconclusive",
+                "reason": reason,
+                "tests_run": tests_run,
+                "tests_passed": tests_passed_count,
+                "tests_failed": tests_failed_count,
+                "tests_skipped": tests_skipped,
+                "tests_skipped_present": tests_skipped_present,
+                **extra,
+            }
+            msg_content = json.dumps(payload)
+            post_agent_message(task_id, cycle, "tester", task_role,
+                               "tests_inconclusive", msg_content)
+            log(
+                f"  [Cycle {cycle}] Posted tests_inconclusive ({reason}) for {task_role}",
+                output,
+            )
+            _apply_cost_totals(tester_result, total_cost, total_duration)
+            return "exit", tester_result, "tests_inconclusive"
+
+        # Phase A: TESTS_SKIPPED line absent from tester output.
+        # Only fire when tests_run > 0 — a tester that legitimately found
+        # no tests (no-tests path) doesn't need to emit a skip count.
+        if tests_run > 0 and not tests_skipped_present:
+            return _route_inconclusive("missing_tests_skipped_field")
+
+        # Phase B: framework stdout disagrees with the tester's claim.
+        raw_text = tester_result.get("result_text", "") or ""
+        framework_skips = grep_framework_skip_counts(raw_text)
+        if framework_skips > tests_skipped:
+            return _route_inconclusive(
+                "framework_skip_count_disagrees",
+                framework_skips=framework_skips,
+            )
+
+        # Phase C: internal counts must add up. Adversarial misreport AND
+        # benign tester bugs both produce inconsistent integers.
+        if tests_run > 0 and (
+            tests_passed_count + tests_failed_count + tests_skipped
+        ) != tests_run:
+            return _route_inconclusive(
+                "counts_inconsistent",
+                expected_sum=tests_run,
+                actual_sum=tests_passed_count + tests_failed_count + tests_skipped,
+            )
+
+        # Phase D: all-tests-skipped — tightened from `>=` to `==`.
         if (
             tests_run > 0
-            and tests_skipped >= tests_run
+            and tests_skipped == tests_run
             and tests_passed_count == 0
         ):
             log(
@@ -1248,21 +1314,7 @@ def _dispatch_tester_outcome(
                 f"inconclusive — likely missing env vars or prerequisites.",
                 output,
             )
-            msg_content = json.dumps({
-                "outcome": "inconclusive",
-                "reason": "all_tests_skipped",
-                "tests_run": tests_run,
-                "tests_skipped": tests_skipped,
-                "tests_passed": tests_passed_count,
-            })
-            post_agent_message(task_id, cycle, "tester", task_role,
-                               "tests_inconclusive", msg_content)
-            log(
-                f"  [Cycle {cycle}] Posted tests_inconclusive message for {task_role}",
-                output,
-            )
-            _apply_cost_totals(tester_result, total_cost, total_duration)
-            return "exit", tester_result, "tests_inconclusive"
+            return _route_inconclusive("all_tests_skipped")
 
         log(f"  [Cycle {cycle}] All tests passed!", output)
         msg_content = json.dumps({
