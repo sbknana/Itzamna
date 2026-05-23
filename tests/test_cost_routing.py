@@ -266,8 +266,14 @@ def test_get_role_model_ignores_auto_routing_when_flag_off():
     )
 
 
-def test_circuit_breaker_fallback_in_auto_select_model():
-    """Test: auto_select_model falls back to next tier when circuit is open."""
+def test_circuit_breaker_fallback_never_escalates_cost():
+    """RT-02: auto_select_model MUST NOT escalate cost when circuit is open.
+
+    Old behavior (haiku open -> sonnet) was a financial-DoS vector: an
+    attacker who tripped Haiku's rate-limit-driven breaker forced every
+    subsequent call onto a more expensive model. Fix: fallback walks DOWN
+    the tier ladder; the cheapest tier fails closed (returns None).
+    """
     # Open haiku circuit
     for _ in range(5):
         record_model_outcome("haiku", success=False)
@@ -279,10 +285,11 @@ def test_circuit_breaker_fallback_in_auto_select_model():
         "title": "Fix typo",
     }
 
-    # Should fallback to sonnet (next tier up)
     result = auto_select_model(task, config=None)
-    assert result == "sonnet", (
-        f"Expected circuit breaker to fallback haiku->sonnet, got {result}"
+    assert result is None, (
+        f"RT-02 violation: haiku breaker open must fail closed (None), "
+        f"got {result!r}. Falling UP to a more expensive tier on failure "
+        f"enables financial DoS via rate-limit-triggered escalation."
     )
 
 

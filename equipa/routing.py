@@ -88,13 +88,20 @@ PRIORITY_MIN_TIER: dict[str, int] = {
     "low": 0,
 }
 
-# RT-01(b): cap how much the LOW-keyword bucket can shift the score.
-# Without this cap, an attacker can stuff 20x "simple/trivial/typo" into a
-# description and drag a genuinely complex task's semantic score toward 0.
-# We treat the LOW bucket as a SINGLE boolean signal regardless of count.
-MAX_LOW_KEYWORD_WEIGHT = 0.1
-MAX_MEDIUM_KEYWORD_WEIGHT = 0.5
-MAX_HIGH_KEYWORD_WEIGHT = 1.0
+# RT-01(b): per-bucket caps on the LOW and MEDIUM buckets only. Without
+# these caps an attacker can stuff a description with every distinct word
+# in LOW_KEYWORDS (15 hits) and drag a genuinely complex task's semantic
+# score toward 0. We count DISTINCT keyword hits ("typo typo typo" -> 1)
+# and cap the cheap buckets so they cannot outvote the HIGH bucket by
+# sheer numbers. The HIGH bucket is INTENTIONALLY uncapped — escalating
+# upward on additional HIGH evidence is the safe direction.
+LOW_BUCKET_CAP = 2
+MED_BUCKET_CAP = 3
+
+# Per-bucket weights used in the weighted-mean numerator.
+HIGH_BUCKET_WEIGHT = 1.0
+MED_BUCKET_WEIGHT = 0.5
+LOW_BUCKET_WEIGHT = 0.1
 
 # --- Circuit Breaker Settings ---
 
@@ -140,36 +147,34 @@ def _lexical_complexity(text: str) -> float:
 
 
 def _semantic_depth(text: str) -> float:
-    """Compute semantic depth via UNIQUE keyword presence (RT-01 hardened).
+    """Compute semantic depth via DISTINCT keyword counts (RT-01 hardened).
 
-    Returns weighted score 0.0-1.0 based on which buckets fire. Each bucket
-    contributes at most its cap regardless of how many times its keywords
-    appear, so keyword stuffing (e.g. 20x "simple/trivial") cannot drag the
-    score down past the cap. A description that fires the HIGH bucket
-    therefore *always* contributes >= MAX_HIGH_KEYWORD_WEIGHT to the
-    bucket-mean numerator even if LOW keywords are spammed alongside it.
+    Each bucket contributes ``min(distinct_count, BUCKET_CAP)``. Counting
+    distinct hits (not raw occurrences) means "typo typo typo" stuffing is
+    a no-op. Capping the distinct count per bucket means even an attacker
+    that spams every keyword in LOW_KEYWORDS (15 distinct hits) can only
+    contribute LOW_BUCKET_CAP of weight — so a single HIGH keyword can
+    never be drowned out.
+
+    Returns a weighted mean in 0.0-1.0; 0.5 when no bucket fires.
     """
     text_lower = text.lower()
 
-    # Boolean presence per bucket — duplicates do not stack.
-    high_hit = any(kw in text_lower for kw in HIGH_KEYWORDS)
-    medium_hit = any(kw in text_lower for kw in MEDIUM_KEYWORDS)
-    low_hit = any(kw in text_lower for kw in LOW_KEYWORDS)
+    # HIGH bucket is uncapped: more HIGH evidence -> higher score is safe.
+    high = sum(1 for kw in HIGH_KEYWORDS if kw in text_lower)
+    med = min(sum(1 for kw in MEDIUM_KEYWORDS if kw in text_lower), MED_BUCKET_CAP)
+    low = min(sum(1 for kw in LOW_KEYWORDS if kw in text_lower), LOW_BUCKET_CAP)
 
-    contributions: list[float] = []
-    if high_hit:
-        contributions.append(MAX_HIGH_KEYWORD_WEIGHT)
-    if medium_hit:
-        contributions.append(MAX_MEDIUM_KEYWORD_WEIGHT)
-    if low_hit:
-        contributions.append(MAX_LOW_KEYWORD_WEIGHT)
-
-    if not contributions:
+    total = high + med + low
+    if total == 0:
         return 0.5  # neutral default
 
-    # Mean of bucket weights -> a description firing HIGH+LOW averages to
-    # (1.0 + 0.1)/2 = 0.55, still well above haiku threshold.
-    return min(sum(contributions) / len(contributions), 1.0)
+    weighted = (
+        high * HIGH_BUCKET_WEIGHT
+        + med * MED_BUCKET_WEIGHT
+        + low * LOW_BUCKET_WEIGHT
+    )
+    return min(weighted / total, 1.0)
 
 
 def _task_scope(text: str) -> float:
