@@ -8,6 +8,13 @@ Implements:
 - MCP initialization handshake
 - 7 tools: dispatch, task_status, task_create, lessons, agent_logs, project_context, session_notes
 
+Hardening (SECURITY-REVIEW-1728, task 2452):
+- MCP-01: equipa_dispatch requires EQUIPA_MCP_TOKEN auth, is rate-limited
+  (token bucket), gated by a 24-hour cost cap, and rejects unknown roles/models.
+- MCP-02: equipa_task_create validates project existence + status, caps
+  description size, is rate-limited, and honours EQUIPA_MCP_PROJECT_IDS allowlist.
+- MCP-03: All query handlers clamp caller-supplied ``limit`` to MAX_QUERY_LIMIT.
+
 Stderr is used for logging only. Stdout is reserved for JSON-RPC messages.
 
 Copyright 2026 Forgeborn
@@ -16,24 +23,66 @@ Copyright 2026 Forgeborn
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import subprocess
 import sys
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
 # Import constants and DB helper
 try:
-    from equipa.constants import THEFORGE_DB
+    from equipa.constants import (
+        DEFAULT_ROLE_MODELS,
+        DEFAULT_ROLE_TURNS,
+        ROLE_PROMPTS,
+        THEFORGE_DB,
+    )
     from equipa.tasks import fetch_project_context
 except ImportError:
     # Fallback if running as standalone
     THEFORGE_DB = Path(__file__).parent.parent / "theforge.db"
+    DEFAULT_ROLE_MODELS = {}
+    DEFAULT_ROLE_TURNS = {}
+    ROLE_PROMPTS = {}
 
     def fetch_project_context(project_id: int) -> dict:
         """Minimal fallback for fetch_project_context."""
         return {"error": "fetch_project_context not available in standalone mode"}
+
+
+# --- Hardening limits / allowlists ---
+
+# Maximum rows any query tool will return, no matter what the client asks for.
+# Clamping is logged so callers can see when their requested limit was reduced.
+MAX_QUERY_LIMIT = 500
+
+# Maximum bytes accepted in equipa_task_create description payload (UTF-8 encoded).
+MAX_DESCRIPTION_BYTES = 32 * 1024  # 32 KB
+
+# Token-bucket rate limits (refills continuously up to capacity).
+DISPATCH_RATE_CAPACITY = 10          # 10 dispatches
+DISPATCH_RATE_REFILL_SECONDS = 3600  # ...per hour per token
+TASK_CREATE_RATE_CAPACITY = 100
+TASK_CREATE_RATE_REFILL_SECONDS = 3600
+
+# Project statuses allowed as task_create targets.
+ALLOWED_PROJECT_STATUSES = {"active", "planning"}
+
+# Role + model allowlists for equipa_dispatch. Built from orchestrator constants
+# where possible; the fallbacks ensure the MCP server still refuses unknown
+# values even if constants import failed (standalone mode).
+ALLOWED_ROLES = (
+    set(ROLE_PROMPTS.keys())
+    | set(DEFAULT_ROLE_TURNS.keys())
+    | set(DEFAULT_ROLE_MODELS.keys())
+    or {"developer", "tester", "security-reviewer", "planner", "evaluator",
+        "code-reviewer", "debugger", "frontend-designer", "integration-tester",
+        "qa-tester"}
+)
+ALLOWED_MODELS = {"opus", "sonnet", "haiku"}
 
 
 def _log(msg: str) -> None:
@@ -91,27 +140,221 @@ def _db_conn(write: bool = False) -> Iterator[sqlite3.Connection]:
             pass
 
 
+# --- Auth + rate limiting ---
+
+
+class _TokenBucket:
+    """Simple in-memory token bucket.
+
+    Refills at ``capacity / refill_seconds`` tokens per second up to ``capacity``.
+    ``try_consume`` returns (allowed, retry_after_seconds). Buckets are keyed by
+    caller token so two tokens cannot starve each other.
+
+    State is process-local. The EQUIPA MCP server is a single stdio process per
+    client, so this is sufficient; a multi-tenant deployment would need a
+    shared store (Redis, etc.).
+    """
+
+    def __init__(self, capacity: int, refill_seconds: float) -> None:
+        self.capacity = float(capacity)
+        self.refill_rate = float(capacity) / float(refill_seconds)
+        self._buckets: dict[str, tuple[float, float]] = {}
+
+    def _refill(self, key: str, now: float) -> float:
+        tokens, last = self._buckets.get(key, (self.capacity, now))
+        elapsed = max(0.0, now - last)
+        tokens = min(self.capacity, tokens + elapsed * self.refill_rate)
+        self._buckets[key] = (tokens, now)
+        return tokens
+
+    def try_consume(self, key: str, cost: float = 1.0) -> tuple[bool, float]:
+        now = time.monotonic()
+        tokens = self._refill(key, now)
+        if tokens >= cost:
+            self._buckets[key] = (tokens - cost, now)
+            return True, 0.0
+        deficit = cost - tokens
+        retry_after = deficit / self.refill_rate if self.refill_rate > 0 else float("inf")
+        return False, retry_after
+
+
+_DISPATCH_BUCKET = _TokenBucket(DISPATCH_RATE_CAPACITY, DISPATCH_RATE_REFILL_SECONDS)
+_TASK_CREATE_BUCKET = _TokenBucket(TASK_CREATE_RATE_CAPACITY, TASK_CREATE_RATE_REFILL_SECONDS)
+
+
+def _expected_token() -> str | None:
+    """Return the configured server token, or None if auth is unconfigured."""
+    token = os.environ.get("EQUIPA_MCP_TOKEN")
+    if not token:
+        return None
+    return token
+
+
+def _check_auth(args: dict) -> tuple[bool, dict | None]:
+    """Validate the caller-supplied auth_token against EQUIPA_MCP_TOKEN.
+
+    Returns (ok, error_payload). Fails closed if the server has no token
+    configured — operators must explicitly set EQUIPA_MCP_TOKEN to enable
+    privileged tool calls. ``auth_token`` is removed from ``args`` on success
+    so individual handlers never see it.
+    """
+    expected = _expected_token()
+    if expected is None:
+        return False, {
+            "error": "EQUIPA_MCP_TOKEN not configured on server; refusing call",
+            "auth": "unconfigured",
+        }
+    supplied = args.pop("auth_token", None)
+    if not supplied or supplied != expected:
+        return False, {
+            "error": "Invalid or missing auth_token",
+            "auth": "rejected",
+        }
+    return True, None
+
+
+def _clamp_limit(requested: Any, tool: str) -> int:
+    """Clamp caller-supplied ``limit`` to [1, MAX_QUERY_LIMIT].
+
+    Non-integer or non-positive inputs fall back to MAX_QUERY_LIMIT. Logs when
+    clamping reduces the requested value so operators can see overlarge probes.
+    """
+    try:
+        value = int(requested)
+    except (TypeError, ValueError):
+        value = MAX_QUERY_LIMIT
+    if value <= 0:
+        value = MAX_QUERY_LIMIT
+    if value > MAX_QUERY_LIMIT:
+        _log(f"{tool}: clamping limit {requested} -> {MAX_QUERY_LIMIT}")
+        value = MAX_QUERY_LIMIT
+    return value
+
+
+def _project_id_allowlist() -> set[int] | None:
+    """Parse EQUIPA_MCP_PROJECT_IDS into a set of allowed project IDs.
+
+    Empty / unset means "no restriction beyond status check". Malformed entries
+    are skipped with a warning rather than failing closed, because the
+    allowlist is an optional second layer on top of the existence+status check.
+    """
+    raw = os.environ.get("EQUIPA_MCP_PROJECT_IDS", "").strip()
+    if not raw:
+        return None
+    ids: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            ids.add(int(part))
+        except ValueError:
+            _log(f"EQUIPA_MCP_PROJECT_IDS: ignoring malformed entry {part!r}")
+    return ids or None
+
+
+def _recent_dispatch_cost_usd(window_seconds: int = 86400) -> float:
+    """Sum cost_usd across agent_runs in the last ``window_seconds``.
+
+    Returns 0.0 if the table or column is unavailable so that an unprovisioned
+    deployment is not falsely cost-capped.
+    """
+    try:
+        with _db_conn() as conn:
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(agent_runs)").fetchall()}
+            if "cost_usd" not in cols:
+                return 0.0
+            if "created_at" in cols:
+                row = conn.execute(
+                    "SELECT COALESCE(SUM(cost_usd), 0) AS s "
+                    "FROM agent_runs WHERE created_at >= datetime('now', ?)",
+                    (f"-{window_seconds} seconds",),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT COALESCE(SUM(cost_usd), 0) AS s FROM agent_runs"
+                ).fetchone()
+            return float(row["s"] or 0.0)
+    except (sqlite3.Error, FileNotFoundError) as exc:
+        _log(f"cost-cap query failed: {exc}; defaulting to 0.0")
+        return 0.0
+
+
+def _dispatch_cost_cap_usd() -> float | None:
+    """Parse EQUIPA_MCP_COST_CAP_USD. Return None to disable the cap."""
+    raw = os.environ.get("EQUIPA_MCP_COST_CAP_USD", "").strip()
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        _log(f"EQUIPA_MCP_COST_CAP_USD: malformed value {raw!r}; cap disabled")
+        return None
+    return value if value > 0 else None
+
+
 # --- MCP Tool Handlers ---
 
 def _handle_equipa_dispatch(args: dict) -> dict:
     """Spawn orchestrator subprocess for a task.
 
     Args:
+        auth_token (str): Required. Must match EQUIPA_MCP_TOKEN env var.
         task_id (int): Task ID to dispatch
-        role (str, optional): Agent role (default: developer)
+        role (str, optional): Agent role (default: developer; must be in allowlist)
         max_turns (int, optional): Max turns
-        model (str, optional): Model override
+        model (str, optional): Model override (must be in allowlist)
 
     Returns:
-        dict: {"status": "spawned", "pid": int}
+        dict: {"status": "spawned", "pid": int} on success, otherwise {"error": ...}.
     """
+    ok, err = _check_auth(args)
+    if not ok:
+        return err
+
+    token = _expected_token() or "anonymous"
+    allowed, retry_after = _DISPATCH_BUCKET.try_consume(token)
+    if not allowed:
+        return {
+            "error": "Rate limit exceeded for equipa_dispatch",
+            "retry_after_seconds": round(retry_after, 2),
+            "limit": f"{DISPATCH_RATE_CAPACITY}/{DISPATCH_RATE_REFILL_SECONDS}s",
+        }
+
+    cost_cap = _dispatch_cost_cap_usd()
+    if cost_cap is not None:
+        spent = _recent_dispatch_cost_usd()
+        if spent >= cost_cap:
+            return {
+                "error": "Daily dispatch cost cap reached; refusing dispatch",
+                "spent_usd": round(spent, 4),
+                "cap_usd": cost_cap,
+            }
+
     task_id = args.get("task_id")
     if not task_id:
         return {"error": "task_id required"}
+    if not isinstance(task_id, int) or task_id <= 0:
+        return {"error": "task_id must be a positive integer"}
 
     role = args.get("role", "developer")
-    max_turns = args.get("max_turns")
+    if not isinstance(role, str) or role not in ALLOWED_ROLES:
+        return {
+            "error": f"role {role!r} not in allowlist",
+            "allowed_roles": sorted(ALLOWED_ROLES),
+        }
+
     model = args.get("model")
+    if model is not None and (not isinstance(model, str) or model not in ALLOWED_MODELS):
+        return {
+            "error": f"model {model!r} not in allowlist",
+            "allowed_models": sorted(ALLOWED_MODELS),
+        }
+
+    max_turns = args.get("max_turns")
+    if max_turns is not None:
+        if not isinstance(max_turns, int) or max_turns <= 0 or max_turns > 500:
+            return {"error": "max_turns must be a positive integer <= 500"}
 
     # Build command
     cmd = [sys.executable, "-m", "equipa.cli", "--task", str(task_id), "--role", role, "--yes"]
@@ -173,14 +416,28 @@ def _handle_equipa_task_create(args: dict) -> dict:
     """Create a new task in TheForge.
 
     Args:
-        project_id (int): Project ID
+        auth_token (str): Required. Must match EQUIPA_MCP_TOKEN env var.
+        project_id (int): Project ID — must exist and be {active, planning}.
         title (str): Task title
-        description (str): Task description
+        description (str): Task description (<= MAX_DESCRIPTION_BYTES)
         priority (str, optional): Task priority (default: medium)
 
     Returns:
-        dict: {"task_id": int, "status": "created"}
+        dict: {"task_id": int, "status": "created"} or {"error": ...}.
     """
+    ok, err = _check_auth(args)
+    if not ok:
+        return err
+
+    token = _expected_token() or "anonymous"
+    allowed, retry_after = _TASK_CREATE_BUCKET.try_consume(token)
+    if not allowed:
+        return {
+            "error": "Rate limit exceeded for equipa_task_create",
+            "retry_after_seconds": round(retry_after, 2),
+            "limit": f"{TASK_CREATE_RATE_CAPACITY}/{TASK_CREATE_RATE_REFILL_SECONDS}s",
+        }
+
     project_id = args.get("project_id")
     title = args.get("title")
     description = args.get("description", "")
@@ -188,8 +445,38 @@ def _handle_equipa_task_create(args: dict) -> dict:
 
     if not project_id or not title:
         return {"error": "project_id and title required"}
+    if not isinstance(project_id, int) or project_id <= 0:
+        return {"error": "project_id must be a positive integer"}
+
+    allowlist = _project_id_allowlist()
+    if allowlist is not None and project_id not in allowlist:
+        return {
+            "error": f"project_id {project_id} not in EQUIPA_MCP_PROJECT_IDS allowlist",
+        }
+
+    if not isinstance(description, str):
+        return {"error": "description must be a string"}
+    if len(description.encode("utf-8")) > MAX_DESCRIPTION_BYTES:
+        return {
+            "error": f"description exceeds {MAX_DESCRIPTION_BYTES}-byte cap",
+        }
 
     with _db_conn(write=True) as conn:
+        proj = conn.execute(
+            "SELECT id, status FROM projects WHERE id = ?",
+            (project_id,),
+        ).fetchone()
+        if proj is None:
+            return {"error": f"project_id {project_id} does not exist"}
+        status = (proj["status"] or "").lower()
+        if status not in ALLOWED_PROJECT_STATUSES:
+            return {
+                "error": (
+                    f"project_id {project_id} has status {status!r}; "
+                    f"expected one of {sorted(ALLOWED_PROJECT_STATUSES)}"
+                ),
+            }
+
         cursor = conn.execute(
             """
             INSERT INTO tasks (project_id, title, description, priority, status)
@@ -211,13 +498,13 @@ def _handle_equipa_lessons(args: dict) -> dict:
     """Query lessons_learned table.
 
     Args:
-        limit (int, optional): Max lessons to return (default: 20)
+        limit (int, optional): Max lessons to return (default: 20, clamped to MAX_QUERY_LIMIT)
         error_type (str, optional): Filter by error type
 
     Returns:
         dict: {"lessons": [{"lesson": str, "error_type": str, ...}, ...]}
     """
-    limit = args.get("limit", 20)
+    limit = _clamp_limit(args.get("limit", 20), "equipa_lessons")
     error_type = args.get("error_type")
 
     with _db_conn() as conn:
@@ -246,6 +533,7 @@ def _handle_equipa_lessons(args: dict) -> dict:
         return {
             "lessons": [dict(r) for r in rows],
             "count": len(rows),
+            "limit": limit,
         }
 
 
@@ -254,20 +542,20 @@ def _handle_equipa_agent_logs(args: dict) -> dict:
 
     Args:
         task_id (int, optional): Filter by task ID
-        limit (int, optional): Max runs to return (default: 10)
+        limit (int, optional): Max runs to return (default: 10, clamped to MAX_QUERY_LIMIT)
 
     Returns:
         dict: {"runs": [{"task_id": int, "role": str, "outcome": str, ...}, ...]}
     """
     task_id = args.get("task_id")
-    limit = args.get("limit", 10)
+    limit = _clamp_limit(args.get("limit", 10), "equipa_agent_logs")
 
     with _db_conn() as conn:
         # Detect available columns — schema may have duration_s (db_migrate)
         # or duration_seconds (newer schema), and created_at may be absent.
         col_info = conn.execute("PRAGMA table_info(agent_runs)").fetchall()
         if not col_info:
-            return {"runs": [], "count": 0}
+            return {"runs": [], "count": 0, "limit": limit}
         col_names = {row["name"] for row in col_info}
 
         duration_col = "duration_seconds" if "duration_seconds" in col_names else "duration_s"
@@ -294,6 +582,7 @@ def _handle_equipa_agent_logs(args: dict) -> dict:
         return {
             "runs": [dict(r) for r in rows],
             "count": len(rows),
+            "limit": limit,
         }
 
 
@@ -322,13 +611,13 @@ def _handle_equipa_session_notes(args: dict) -> dict:
 
     Args:
         project_id (int, optional): Filter by project ID
-        limit (int, optional): Max notes to return (default: 5)
+        limit (int, optional): Max notes to return (default: 5, clamped to MAX_QUERY_LIMIT)
 
     Returns:
         dict: {"notes": [{"project_id": int, "summary": str, ...}, ...]}
     """
     project_id = args.get("project_id")
-    limit = args.get("limit", 5)
+    limit = _clamp_limit(args.get("limit", 5), "equipa_session_notes")
 
     with _db_conn() as conn:
         if project_id:
@@ -356,6 +645,7 @@ def _handle_equipa_session_notes(args: dict) -> dict:
         return {
             "notes": [dict(r) for r in rows],
             "count": len(rows),
+            "limit": limit,
         }
 
 
@@ -363,16 +653,17 @@ def _handle_equipa_session_notes(args: dict) -> dict:
 
 TOOLS = {
     "equipa_dispatch": {
-        "description": "Spawn EQUIPA orchestrator subprocess for a task",
+        "description": "Spawn EQUIPA orchestrator subprocess for a task (requires auth_token)",
         "inputSchema": {
             "type": "object",
             "properties": {
+                "auth_token": {"type": "string", "description": "Server token (matches EQUIPA_MCP_TOKEN)"},
                 "task_id": {"type": "integer", "description": "Task ID to dispatch"},
                 "role": {"type": "string", "description": "Agent role (default: developer)", "default": "developer"},
                 "max_turns": {"type": "integer", "description": "Max turns"},
-                "model": {"type": "string", "description": "Model override"},
+                "model": {"type": "string", "description": "Model override (opus/sonnet/haiku)"},
             },
-            "required": ["task_id"],
+            "required": ["auth_token", "task_id"],
         },
         "handler": _handle_equipa_dispatch,
     },
@@ -388,16 +679,17 @@ TOOLS = {
         "handler": _handle_equipa_task_status,
     },
     "equipa_task_create": {
-        "description": "Create a new task in TheForge",
+        "description": "Create a new task in TheForge (requires auth_token)",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "project_id": {"type": "integer", "description": "Project ID"},
+                "auth_token": {"type": "string", "description": "Server token (matches EQUIPA_MCP_TOKEN)"},
+                "project_id": {"type": "integer", "description": "Project ID (must exist, status active/planning)"},
                 "title": {"type": "string", "description": "Task title"},
-                "description": {"type": "string", "description": "Task description"},
+                "description": {"type": "string", "description": f"Task description (max {MAX_DESCRIPTION_BYTES} bytes)"},
                 "priority": {"type": "string", "description": "Priority (default: medium)", "default": "medium"},
             },
-            "required": ["project_id", "title"],
+            "required": ["auth_token", "project_id", "title"],
         },
         "handler": _handle_equipa_task_create,
     },
@@ -406,7 +698,7 @@ TOOLS = {
         "inputSchema": {
             "type": "object",
             "properties": {
-                "limit": {"type": "integer", "description": "Max lessons (default: 20)", "default": 20},
+                "limit": {"type": "integer", "description": f"Max lessons (default 20, clamped to {MAX_QUERY_LIMIT})", "default": 20},
                 "error_type": {"type": "string", "description": "Filter by error type"},
             },
         },
@@ -418,7 +710,7 @@ TOOLS = {
             "type": "object",
             "properties": {
                 "task_id": {"type": "integer", "description": "Filter by task ID"},
-                "limit": {"type": "integer", "description": "Max runs (default: 10)", "default": 10},
+                "limit": {"type": "integer", "description": f"Max runs (default 10, clamped to {MAX_QUERY_LIMIT})", "default": 10},
             },
         },
         "handler": _handle_equipa_agent_logs,
@@ -440,7 +732,7 @@ TOOLS = {
             "type": "object",
             "properties": {
                 "project_id": {"type": "integer", "description": "Filter by project ID"},
-                "limit": {"type": "integer", "description": "Max notes (default: 5)", "default": 5},
+                "limit": {"type": "integer", "description": f"Max notes (default 5, clamped to {MAX_QUERY_LIMIT})", "default": 5},
             },
         },
         "handler": _handle_equipa_session_notes,
@@ -503,7 +795,9 @@ def _handle_tools_call(params: dict, request_id: int | str) -> None:
     tool_name = params.get("name")
     args = params.get("arguments", {})
 
-    _log(f"Received tools/call: {tool_name} with args {args}")
+    # Avoid logging the auth_token verbatim.
+    redacted = {k: ("***" if k == "auth_token" else v) for k, v in args.items()}
+    _log(f"Received tools/call: {tool_name} with args {redacted}")
 
     if tool_name not in TOOLS:
         _send_error(request_id, -32601, f"Unknown tool: {tool_name}")
@@ -511,7 +805,9 @@ def _handle_tools_call(params: dict, request_id: int | str) -> None:
 
     try:
         handler = TOOLS[tool_name]["handler"]
-        result = handler(args)
+        # Pass a shallow copy so auth_token pop in handlers does not mutate
+        # the caller-provided params (matters for replay/tests).
+        result = handler(dict(args))
 
         _send_response({
             "jsonrpc": "2.0",
@@ -535,6 +831,11 @@ def _handle_tools_call(params: dict, request_id: int | str) -> None:
 def run_server() -> None:
     """Main MCP server loop — read JSON-RPC from stdin, respond on stdout."""
     _log("EQUIPA MCP Server starting...")
+    if _expected_token() is None:
+        _log(
+            "WARNING: EQUIPA_MCP_TOKEN is not set; privileged tool calls "
+            "(dispatch, task_create) will be rejected until it is configured."
+        )
 
     for line in sys.stdin:
         line = line.strip()
