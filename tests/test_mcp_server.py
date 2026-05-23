@@ -144,16 +144,28 @@ def isolated_db(tmp_path: Path) -> Path:
     return db_path
 
 
-@pytest.fixture
-def mcp_server(isolated_db: Path):
-    """Spawn MCP server subprocess for testing, pinned to an isolated DB.
+TEST_TOKEN = "test-token-abc123"
 
-    THEFORGE_DB must be set in the subprocess env BEFORE Popen — the MCP
-    server resolves the DB path once at import time via equipa.constants.
-    """
+
+def _spawn_server(db_path: Path, *, token: str | None = TEST_TOKEN,
+                  cost_cap_usd: str | None = None,
+                  project_allowlist: str | None = None) -> subprocess.Popen:
+    """Spawn the MCP server subprocess with a controlled environment."""
     env = os.environ.copy()
-    env["THEFORGE_DB"] = str(isolated_db)
-    proc = subprocess.Popen(
+    env["THEFORGE_DB"] = str(db_path)
+    if token is None:
+        env.pop("EQUIPA_MCP_TOKEN", None)
+    else:
+        env["EQUIPA_MCP_TOKEN"] = token
+    if cost_cap_usd is None:
+        env.pop("EQUIPA_MCP_COST_CAP_USD", None)
+    else:
+        env["EQUIPA_MCP_COST_CAP_USD"] = cost_cap_usd
+    if project_allowlist is None:
+        env.pop("EQUIPA_MCP_PROJECT_IDS", None)
+    else:
+        env["EQUIPA_MCP_PROJECT_IDS"] = project_allowlist
+    return subprocess.Popen(
         [sys.executable, "-m", "equipa.mcp_server"],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
@@ -162,13 +174,28 @@ def mcp_server(isolated_db: Path):
         bufsize=1,
         env=env,
     )
-    yield proc
+
+
+def _stop_server(proc: subprocess.Popen) -> None:
     proc.terminate()
     try:
         proc.wait(timeout=2)
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait(timeout=2)
+
+
+@pytest.fixture
+def mcp_server(isolated_db: Path):
+    """Spawn MCP server subprocess for testing, pinned to an isolated DB.
+
+    THEFORGE_DB must be set in the subprocess env BEFORE Popen — the MCP
+    server resolves the DB path once at import time via equipa.constants.
+    A test EQUIPA_MCP_TOKEN is also set so privileged tools can be exercised.
+    """
+    proc = _spawn_server(isolated_db)
+    yield proc
+    _stop_server(proc)
 
 
 def test_initialize(mcp_server):
@@ -356,6 +383,7 @@ def test_task_create_success(mcp_server, isolated_db):
     response = _send_request(mcp_server, "tools/call", {
         "name": "equipa_task_create",
         "arguments": {
+            "auth_token": TEST_TOKEN,
             "project_id": 23,  # EQUIPA project
             "title": "MCP Test Task",
             "description": "Created by test_mcp_server.py",
@@ -432,10 +460,10 @@ def test_no_test_rows_in_production_db():
 
 
 def test_dispatch_missing_arg(mcp_server):
-    """Test equipa_dispatch with missing task_id."""
+    """Test equipa_dispatch with valid auth but missing task_id."""
     response = _send_request(mcp_server, "tools/call", {
         "name": "equipa_dispatch",
-        "arguments": {},
+        "arguments": {"auth_token": TEST_TOKEN},
     })
 
     assert response["jsonrpc"] == "2.0"
@@ -443,6 +471,314 @@ def test_dispatch_missing_arg(mcp_server):
     content = json.loads(response["result"]["content"][0]["text"])
     assert "error" in content
     assert "task_id required" in content["error"]
+
+
+# --- MCP-01: authentication + rate limit + role/model allowlist ---
+
+
+def test_dispatch_rejects_missing_token(mcp_server):
+    """equipa_dispatch refuses calls that omit the auth_token argument."""
+    response = _send_request(mcp_server, "tools/call", {
+        "name": "equipa_dispatch",
+        "arguments": {"task_id": 1},
+    })
+    content = json.loads(response["result"]["content"][0]["text"])
+    assert "error" in content
+    assert "auth_token" in content["error"].lower()
+
+
+def test_dispatch_rejects_bad_token(mcp_server):
+    """equipa_dispatch refuses calls with a wrong auth_token."""
+    response = _send_request(mcp_server, "tools/call", {
+        "name": "equipa_dispatch",
+        "arguments": {"auth_token": "wrong-token", "task_id": 1},
+    })
+    content = json.loads(response["result"]["content"][0]["text"])
+    assert "error" in content
+    assert "auth_token" in content["error"].lower()
+
+
+def test_dispatch_rejects_unconfigured_token(isolated_db):
+    """Server without EQUIPA_MCP_TOKEN env fails closed on privileged calls."""
+    proc = _spawn_server(isolated_db, token=None)
+    try:
+        response = _send_request(proc, "tools/call", {
+            "name": "equipa_dispatch",
+            "arguments": {"auth_token": "anything", "task_id": 1},
+        })
+        content = json.loads(response["result"]["content"][0]["text"])
+        assert content.get("auth") == "unconfigured"
+    finally:
+        _stop_server(proc)
+
+
+def test_dispatch_rejects_unknown_role(mcp_server):
+    """Roles outside the orchestrator allowlist are rejected before subprocess spawn."""
+    response = _send_request(mcp_server, "tools/call", {
+        "name": "equipa_dispatch",
+        "arguments": {
+            "auth_token": TEST_TOKEN,
+            "task_id": 1,
+            "role": "nonsense-role",
+        },
+    })
+    content = json.loads(response["result"]["content"][0]["text"])
+    assert "allowed_roles" in content
+    assert "not in allowlist" in content["error"]
+
+
+def test_dispatch_rejects_unknown_model(mcp_server):
+    """Models outside {opus, sonnet, haiku} are rejected before subprocess spawn."""
+    response = _send_request(mcp_server, "tools/call", {
+        "name": "equipa_dispatch",
+        "arguments": {
+            "auth_token": TEST_TOKEN,
+            "task_id": 1,
+            "role": "developer",
+            "model": "gpt-4",
+        },
+    })
+    content = json.loads(response["result"]["content"][0]["text"])
+    assert "allowed_models" in content
+    assert "not in allowlist" in content["error"]
+
+
+def test_dispatch_rate_limit_fires(monkeypatch):
+    """Token bucket exhausts after DISPATCH_RATE_CAPACITY direct handler calls."""
+    from equipa import mcp_server as srv
+
+    # Use a fresh bucket so prior tests don't bleed state.
+    monkeypatch.setattr(srv, "_DISPATCH_BUCKET",
+                        srv._TokenBucket(srv.DISPATCH_RATE_CAPACITY,
+                                         srv.DISPATCH_RATE_REFILL_SECONDS))
+    monkeypatch.setenv("EQUIPA_MCP_TOKEN", TEST_TOKEN)
+
+    # Skip the actual subprocess spawn — we only need to exhaust the bucket.
+    class _FakeProc:
+        pid = 0
+
+    monkeypatch.setattr(srv.subprocess, "Popen", lambda *a, **kw: _FakeProc())
+
+    base_args = {"auth_token": TEST_TOKEN, "task_id": 1, "role": "developer"}
+
+    for _ in range(srv.DISPATCH_RATE_CAPACITY):
+        result = srv._handle_equipa_dispatch(dict(base_args))
+        assert result.get("status") == "spawned", result
+
+    # Next call must be rate-limited.
+    blocked = srv._handle_equipa_dispatch(dict(base_args))
+    assert "Rate limit exceeded" in blocked.get("error", "")
+    assert "retry_after_seconds" in blocked
+
+
+def test_dispatch_cost_cap_blocks(monkeypatch, isolated_db):
+    """When recent spend exceeds the cap, dispatch is refused before spawn."""
+    proc = _spawn_server(isolated_db, cost_cap_usd="0.01")
+    try:
+        # Insert a costly run to push past the 0.01 USD cap.
+        conn = sqlite3.connect(str(isolated_db))
+        try:
+            conn.execute("ALTER TABLE agent_runs ADD COLUMN cost_usd REAL DEFAULT 0")
+            conn.execute(
+                "INSERT INTO agent_runs (task_id, role, outcome, duration_seconds, cost_usd) "
+                "VALUES (1, 'developer', 'success', 1.0, 5.0)"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        response = _send_request(proc, "tools/call", {
+            "name": "equipa_dispatch",
+            "arguments": {
+                "auth_token": TEST_TOKEN,
+                "task_id": 1,
+                "role": "developer",
+            },
+        })
+        content = json.loads(response["result"]["content"][0]["text"])
+        assert "cost cap" in content.get("error", "").lower()
+        assert content.get("cap_usd") == 0.01
+    finally:
+        _stop_server(proc)
+
+
+# --- MCP-02: task_create validation + project allowlist ---
+
+
+def test_task_create_rejects_missing_token(mcp_server):
+    """equipa_task_create requires auth_token."""
+    response = _send_request(mcp_server, "tools/call", {
+        "name": "equipa_task_create",
+        "arguments": {"project_id": 23, "title": "x"},
+    })
+    content = json.loads(response["result"]["content"][0]["text"])
+    assert "error" in content
+    assert "auth_token" in content["error"].lower()
+
+
+def test_task_create_rejects_nonexistent_project(mcp_server):
+    """equipa_task_create refuses project_ids not present in projects table."""
+    response = _send_request(mcp_server, "tools/call", {
+        "name": "equipa_task_create",
+        "arguments": {
+            "auth_token": TEST_TOKEN,
+            "project_id": 9999,
+            "title": "should fail",
+        },
+    })
+    content = json.loads(response["result"]["content"][0]["text"])
+    assert "does not exist" in content.get("error", "")
+
+
+def test_task_create_rejects_inactive_project(isolated_db):
+    """A project with status='completed' is not a valid task_create target."""
+    conn = sqlite3.connect(str(isolated_db))
+    try:
+        conn.execute(
+            "INSERT INTO projects (id, name, codename, status) "
+            "VALUES (77, 'Archive', 'arc', 'completed')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    proc = _spawn_server(isolated_db)
+    try:
+        response = _send_request(proc, "tools/call", {
+            "name": "equipa_task_create",
+            "arguments": {
+                "auth_token": TEST_TOKEN,
+                "project_id": 77,
+                "title": "should fail",
+            },
+        })
+        content = json.loads(response["result"]["content"][0]["text"])
+        assert "expected one of" in content.get("error", "")
+    finally:
+        _stop_server(proc)
+
+
+def test_task_create_rejects_oversize_description(mcp_server):
+    """description payloads beyond MAX_DESCRIPTION_BYTES are refused."""
+    from equipa.mcp_server import MAX_DESCRIPTION_BYTES
+
+    payload = "x" * (MAX_DESCRIPTION_BYTES + 1)
+    response = _send_request(mcp_server, "tools/call", {
+        "name": "equipa_task_create",
+        "arguments": {
+            "auth_token": TEST_TOKEN,
+            "project_id": 23,
+            "title": "too big",
+            "description": payload,
+        },
+    })
+    content = json.loads(response["result"]["content"][0]["text"])
+    assert "exceeds" in content.get("error", "")
+
+
+def test_task_create_respects_project_allowlist(isolated_db):
+    """When EQUIPA_MCP_PROJECT_IDS is set, projects outside are refused."""
+    proc = _spawn_server(isolated_db, project_allowlist="99,100")
+    try:
+        response = _send_request(proc, "tools/call", {
+            "name": "equipa_task_create",
+            "arguments": {
+                "auth_token": TEST_TOKEN,
+                "project_id": 23,
+                "title": "blocked by allowlist",
+            },
+        })
+        content = json.loads(response["result"]["content"][0]["text"])
+        assert "allowlist" in content.get("error", "").lower()
+    finally:
+        _stop_server(proc)
+
+
+def test_task_create_rate_limit_fires(monkeypatch):
+    """Token bucket exhausts after TASK_CREATE_RATE_CAPACITY handler calls."""
+    from equipa import mcp_server as srv
+
+    monkeypatch.setattr(srv, "_TASK_CREATE_BUCKET",
+                        srv._TokenBucket(2, 3600))
+    monkeypatch.setenv("EQUIPA_MCP_TOKEN", TEST_TOKEN)
+
+    # Patch the DB context so we don't need a real DB for this unit test.
+    class _FakeCursor:
+        lastrowid = 1
+
+    class _FakeConn:
+        def execute(self, sql, params=()):
+            if sql.strip().startswith("SELECT id, status"):
+                class _Row:
+                    def __getitem__(self, k):
+                        return {"id": params[0], "status": "active"}[k]
+                return type("R", (), {"fetchone": lambda self_: _Row()})()
+            return _FakeCursor()
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def fake_conn(write=False):
+        yield _FakeConn()
+
+    monkeypatch.setattr(srv, "_db_conn", fake_conn)
+
+    base = {"auth_token": TEST_TOKEN, "project_id": 23, "title": "t"}
+    assert srv._handle_equipa_task_create(dict(base)).get("status") == "created"
+    assert srv._handle_equipa_task_create(dict(base)).get("status") == "created"
+    blocked = srv._handle_equipa_task_create(dict(base))
+    assert "Rate limit exceeded" in blocked.get("error", "")
+
+
+# --- MCP-03: query limit clamp ---
+
+
+def test_lessons_limit_clamped(mcp_server):
+    """Caller-supplied lessons limit is clamped to MAX_QUERY_LIMIT."""
+    from equipa.mcp_server import MAX_QUERY_LIMIT
+
+    response = _send_request(mcp_server, "tools/call", {
+        "name": "equipa_lessons",
+        "arguments": {"limit": 10_000_000},
+    })
+    content = json.loads(response["result"]["content"][0]["text"])
+    assert content.get("limit") == MAX_QUERY_LIMIT
+
+
+def test_agent_logs_limit_clamped(mcp_server):
+    """Caller-supplied agent_logs limit is clamped to MAX_QUERY_LIMIT."""
+    from equipa.mcp_server import MAX_QUERY_LIMIT
+
+    response = _send_request(mcp_server, "tools/call", {
+        "name": "equipa_agent_logs",
+        "arguments": {"limit": 10_000_000},
+    })
+    content = json.loads(response["result"]["content"][0]["text"])
+    assert content.get("limit") == MAX_QUERY_LIMIT
+
+
+def test_session_notes_limit_clamped(mcp_server):
+    """Caller-supplied session_notes limit is clamped to MAX_QUERY_LIMIT."""
+    from equipa.mcp_server import MAX_QUERY_LIMIT
+
+    response = _send_request(mcp_server, "tools/call", {
+        "name": "equipa_session_notes",
+        "arguments": {"limit": 10_000_000},
+    })
+    content = json.loads(response["result"]["content"][0]["text"])
+    assert content.get("limit") == MAX_QUERY_LIMIT
+
+
+def test_clamp_limit_unit():
+    """_clamp_limit unit coverage for non-int, zero, negative and oversize inputs."""
+    from equipa.mcp_server import MAX_QUERY_LIMIT, _clamp_limit
+
+    assert _clamp_limit(5, "t") == 5
+    assert _clamp_limit("12", "t") == 12
+    assert _clamp_limit("not a number", "t") == MAX_QUERY_LIMIT
+    assert _clamp_limit(0, "t") == MAX_QUERY_LIMIT
+    assert _clamp_limit(-1, "t") == MAX_QUERY_LIMIT
+    assert _clamp_limit(MAX_QUERY_LIMIT + 1, "t") == MAX_QUERY_LIMIT
 
 
 def test_cli_mcp_server_flag():

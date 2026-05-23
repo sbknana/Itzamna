@@ -1,4 +1,5 @@
 {
+  "_comment": "EQUIPA MCP server hardening (task 2452): privileged tool calls (equipa_dispatch, equipa_task_create) require EQUIPA_MCP_TOKEN. EQUIPA_MCP_COST_CAP_USD bounds 24h dispatch spend. EQUIPA_MCP_PROJECT_IDS optionally restricts task_create targets to a comma-separated allowlist.",
   "mcpServers": {
     "theforge": {
       "type": "stdio",
@@ -8,6 +9,16 @@
         "--db-path",
         "theforge.db"
       ]
+    },
+    "equipa": {
+      "type": "stdio",
+      "command": "python3",
+      "args": ["-m", "equipa.mcp_server"],
+      "env": {
+        "EQUIPA_MCP_TOKEN": "REPLACE_WITH_LONG_RANDOM_TOKEN",
+        "EQUIPA_MCP_COST_CAP_USD": "50.0",
+        "EQUIPA_MCP_PROJECT_IDS": ""
+      }
     }
   }
 }
