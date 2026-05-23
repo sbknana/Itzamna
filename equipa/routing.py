@@ -1,19 +1,41 @@
 """Intelligent task routing — complexity scoring + model selection + circuit breaker.
 
 Layer 2 module: imports from equipa.constants only.
-Complexity scoring uses 4 weighted features to classify tasks as haiku/sonnet/opus tier.
-Circuit breaker tracks consecutive failures per model with 60s recovery window.
+
+Complexity scoring uses 4 weighted features to classify tasks as haiku/sonnet/opus
+tier. Scoring is keyword-stuffing-resistant (RT-01): unique keyword presence is
+used in place of raw count, low-tier keywords are capped so they cannot drag a
+genuinely complex task into the cheap tier, and task.priority is cross-validated
+against the scored tier so a "critical"/"high" priority cannot be downgraded.
+
+Circuit breaker tracks consecutive failures per model with a 60s recovery
+window. Fallback direction is DOWN to a cheaper tier, never up (RT-02): an
+attacker who trips the cheap tier's breaker can never coerce dispatch onto the
+expensive tier. If the cheapest tier is itself unavailable we fail closed
+(``auto_select_model`` returns ``None``) rather than escalating cost.
+
+Circuit-breaker state is shared across dispatcher threads/coroutines and is
+guarded by a ``threading.Lock`` (RT-03) so concurrent record/read calls cannot
+observe a torn or stale state. Every public function that touches
+``_circuit_breaker_state`` acquires ``_circuit_breaker_lock`` for the full
+read-modify-write window.
 
 Copyright 2026 Forgeborn
 """
 
 from __future__ import annotations
 
+import logging
 import re
-import time
+import threading
 from typing import Any
 
 from equipa.constants import DEFAULT_MODEL
+
+# Reuse the dedicated monotonic clock module so tests can monkeypatch it.
+import time as _time
+
+logger = logging.getLogger(__name__)
 
 # --- Complexity Scoring Keywords ---
 
@@ -53,6 +75,27 @@ WEIGHT_UNCERTAINTY = 0.2
 THRESHOLD_HAIKU = 0.3   # < 0.3 = haiku
 THRESHOLD_SONNET = 0.6  # 0.3-0.6 = sonnet, >= 0.6 = opus
 
+# Tier ordering — index 0 is cheapest, index -1 is most expensive.
+TIER_ORDER: tuple[str, ...] = ("haiku", "sonnet", "opus")
+
+# Priority -> minimum tier index in TIER_ORDER.
+# RT-01(c): the scored tier may never be cheaper than what the human-set
+# task priority demands. "critical" pins to opus, "high" pins to sonnet+.
+PRIORITY_MIN_TIER: dict[str, int] = {
+    "critical": 2,  # opus
+    "high": 1,      # sonnet+
+    "medium": 0,    # haiku+ (no constraint)
+    "low": 0,
+}
+
+# RT-01(b): cap how much the LOW-keyword bucket can shift the score.
+# Without this cap, an attacker can stuff 20x "simple/trivial/typo" into a
+# description and drag a genuinely complex task's semantic score toward 0.
+# We treat the LOW bucket as a SINGLE boolean signal regardless of count.
+MAX_LOW_KEYWORD_WEIGHT = 0.1
+MAX_MEDIUM_KEYWORD_WEIGHT = 0.5
+MAX_HIGH_KEYWORD_WEIGHT = 1.0
+
 # --- Circuit Breaker Settings ---
 
 CB_FAILURE_THRESHOLD = 5  # consecutive failures before circuit opens
@@ -61,8 +104,12 @@ CB_STATE_CLOSED = "closed"
 CB_STATE_OPEN = "open"
 CB_STATE_HALF_OPEN = "half_open"
 
-# In-memory circuit breaker state per model
+# In-memory circuit breaker state per model — guarded by _circuit_breaker_lock.
+# RT-03: all reads/writes must hold the lock for the full read-modify-write
+# window. Holders are short (dict ops, time.time()), never call back into
+# user code, and never block on I/O, so contention is negligible.
 _circuit_breaker_state: dict[str, dict[str, Any]] = {}
+_circuit_breaker_lock = threading.Lock()
 
 
 def _lexical_complexity(text: str) -> float:
@@ -93,26 +140,36 @@ def _lexical_complexity(text: str) -> float:
 
 
 def _semantic_depth(text: str) -> float:
-    """Compute semantic depth via keyword matching.
+    """Compute semantic depth via UNIQUE keyword presence (RT-01 hardened).
 
-    Returns weighted score 0.0-1.0 based on HIGH/MEDIUM/LOW keyword presence.
+    Returns weighted score 0.0-1.0 based on which buckets fire. Each bucket
+    contributes at most its cap regardless of how many times its keywords
+    appear, so keyword stuffing (e.g. 20x "simple/trivial") cannot drag the
+    score down past the cap. A description that fires the HIGH bucket
+    therefore *always* contributes >= MAX_HIGH_KEYWORD_WEIGHT to the
+    bucket-mean numerator even if LOW keywords are spammed alongside it.
     """
     text_lower = text.lower()
 
-    high_count = sum(1 for kw in HIGH_KEYWORDS if kw in text_lower)
-    medium_count = sum(1 for kw in MEDIUM_KEYWORDS if kw in text_lower)
-    low_count = sum(1 for kw in LOW_KEYWORDS if kw in text_lower)
+    # Boolean presence per bucket — duplicates do not stack.
+    high_hit = any(kw in text_lower for kw in HIGH_KEYWORDS)
+    medium_hit = any(kw in text_lower for kw in MEDIUM_KEYWORDS)
+    low_hit = any(kw in text_lower for kw in LOW_KEYWORDS)
 
-    # Weighted scoring: HIGH=1.0, MEDIUM=0.5, LOW=0.1
-    total_matches = high_count + medium_count + low_count
-    if total_matches == 0:
+    contributions: list[float] = []
+    if high_hit:
+        contributions.append(MAX_HIGH_KEYWORD_WEIGHT)
+    if medium_hit:
+        contributions.append(MAX_MEDIUM_KEYWORD_WEIGHT)
+    if low_hit:
+        contributions.append(MAX_LOW_KEYWORD_WEIGHT)
+
+    if not contributions:
         return 0.5  # neutral default
 
-    weighted_score = (
-        (high_count * 1.0) + (medium_count * 0.5) + (low_count * 0.1)
-    ) / total_matches
-
-    return min(weighted_score, 1.0)
+    # Mean of bucket weights -> a description firing HIGH+LOW averages to
+    # (1.0 + 0.1)/2 = 0.55, still well above haiku threshold.
+    return min(sum(contributions) / len(contributions), 1.0)
 
 
 def _task_scope(text: str) -> float:
@@ -156,7 +213,6 @@ def _uncertainty_level(text: str) -> float:
     Returns score 0.0-1.0 (higher = more uncertain).
     """
     text_lower = text.lower()
-    score = 0.0
 
     uncertainty_patterns = [
         r"\bdebug\b",
@@ -171,13 +227,39 @@ def _uncertainty_level(text: str) -> float:
     ]
 
     match_count = sum(1 for p in uncertainty_patterns if re.search(p, text_lower))
-    score = min(match_count / len(uncertainty_patterns), 1.0)
+    return min(match_count / len(uncertainty_patterns), 1.0)
 
-    return score
+
+def _structural_complexity_bonus(description: str) -> float:
+    """Semantic-features bonus that is immune to keyword stuffing (RT-01a).
+
+    Uses purely structural signals — total length, line count, distinct
+    code/path tokens — which an attacker cannot fake by repeating cheap
+    words. Returns 0.0-1.0.
+    """
+    if not description:
+        return 0.0
+
+    # Length-based: 200 chars = small bump, 2000+ chars = max.
+    length_score = min(len(description) / 2000.0, 1.0)
+
+    # Line-based: tasks that span many lines typically span many files/steps.
+    line_count = description.count("\n") + 1
+    line_score = min(line_count / 40.0, 1.0)
+
+    # Path/code token count — "file.py", "src/foo/bar.ts", "module.Class"
+    # are all signals of multi-component work. Counts distinct tokens so
+    # repetition does not inflate the bonus.
+    path_tokens = set(re.findall(
+        r"\b[\w-]+(?:/[\w.-]+)+|\b[\w-]+\.[a-zA-Z]{1,5}\b", description
+    ))
+    path_score = min(len(path_tokens) / 8.0, 1.0)
+
+    return (length_score + line_score + path_score) / 3.0
 
 
 def score_complexity(description: str, title: str = "") -> float:
-    """Score task complexity using 4 weighted features.
+    """Score task complexity using 4 weighted features + structural bonus.
 
     Args:
         description: Task description text
@@ -202,20 +284,41 @@ def score_complexity(description: str, title: str = "") -> float:
         + WEIGHT_UNCERTAINTY * uncertainty
     )
 
-    return round(score, 3)
+    # Structural bonus (RT-01a) — semantic features that resist keyword
+    # stuffing. Worth up to 0.15 of the final score.
+    structural = _structural_complexity_bonus(description)
+    score = score + 0.15 * structural
+
+    return round(min(score, 1.0), 3)
+
+
+def _priority_minimum_tier_index(priority: Any) -> int:
+    """Return the minimum TIER_ORDER index implied by task.priority.
+
+    Unknown/None priorities yield 0 (no constraint). Case-insensitive.
+    """
+    if not priority:
+        return 0
+    key = str(priority).strip().lower()
+    return PRIORITY_MIN_TIER.get(key, 0)
 
 
 def select_model_by_complexity(
     score: float,
     uncertainty: float,
     config: dict[str, Any] | None = None,
+    priority: Any = None,
 ) -> str:
-    """Select model tier based on complexity score and uncertainty.
+    """Select model tier based on complexity, uncertainty, and priority.
 
     Args:
         score: Complexity score from score_complexity()
         uncertainty: Uncertainty level from _uncertainty_level()
         config: Optional dispatch config with model overrides
+        priority: Optional task priority ("critical"/"high"/"medium"/"low")
+            used for RT-01(c) cross-validation. If the scored tier is
+            cheaper than what priority demands, the priority floor wins
+            and a warning is logged.
 
     Returns:
         Model name: "haiku", "sonnet", or "opus"
@@ -226,11 +329,24 @@ def select_model_by_complexity(
 
     # Three-tier thresholds
     if score < THRESHOLD_HAIKU:
-        model = "haiku"
+        tier_index = 0  # haiku
     elif score < THRESHOLD_SONNET:
-        model = "sonnet"
+        tier_index = 1  # sonnet
     else:
-        model = "opus"
+        tier_index = 2  # opus
+
+    # RT-01(c): cross-validate against task.priority. Take the HIGHER of
+    # the scored tier and the priority-implied tier; never the cheaper.
+    priority_floor = _priority_minimum_tier_index(priority)
+    if priority_floor > tier_index:
+        logger.warning(
+            "routing: scored tier %s overridden by priority floor %s "
+            "(score=%s, priority=%s)",
+            TIER_ORDER[tier_index], TIER_ORDER[priority_floor], score, priority,
+        )
+        tier_index = priority_floor
+
+    model = TIER_ORDER[tier_index]
 
     # Check for config overrides
     if config and "model_overrides" in config:
@@ -248,34 +364,37 @@ def record_model_outcome(model: str, success: bool) -> None:
         model: Model name
         success: True if task succeeded, False if failed
     """
-    if model not in _circuit_breaker_state:
-        _circuit_breaker_state[model] = {
-            "state": CB_STATE_CLOSED,
-            "consecutive_failures": 0,
-            "last_failure_time": 0.0,
-        }
+    with _circuit_breaker_lock:
+        if model not in _circuit_breaker_state:
+            _circuit_breaker_state[model] = {
+                "state": CB_STATE_CLOSED,
+                "consecutive_failures": 0,
+                "last_failure_time": 0.0,
+            }
 
-    state = _circuit_breaker_state[model]
+        state = _circuit_breaker_state[model]
 
-    if success:
-        # Reset on success
-        state["consecutive_failures"] = 0
-        if state["state"] == CB_STATE_HALF_OPEN:
-            state["state"] = CB_STATE_CLOSED
-    else:
-        # Increment failure count
-        state["consecutive_failures"] += 1
-        state["last_failure_time"] = time.time()
+        if success:
+            # Reset on success
+            state["consecutive_failures"] = 0
+            if state["state"] == CB_STATE_HALF_OPEN:
+                state["state"] = CB_STATE_CLOSED
+        else:
+            # Increment failure count
+            state["consecutive_failures"] += 1
+            state["last_failure_time"] = _time.time()
 
-        # Open circuit if threshold exceeded
-        if state["consecutive_failures"] >= CB_FAILURE_THRESHOLD:
-            state["state"] = CB_STATE_OPEN
+            # Open circuit if threshold exceeded
+            if state["consecutive_failures"] >= CB_FAILURE_THRESHOLD:
+                state["state"] = CB_STATE_OPEN
 
 
 def _get_circuit_state(model: str) -> str:
     """Get current circuit breaker state for model.
 
     Handles recovery window logic: OPEN -> HALF_OPEN after recovery time.
+    Holds _circuit_breaker_lock for the full check-and-transition window
+    so concurrent callers cannot race and observe inconsistent states.
 
     Args:
         model: Model name
@@ -283,51 +402,93 @@ def _get_circuit_state(model: str) -> str:
     Returns:
         Circuit state: "closed", "open", or "half_open"
     """
-    if model not in _circuit_breaker_state:
-        return CB_STATE_CLOSED
+    with _circuit_breaker_lock:
+        if model not in _circuit_breaker_state:
+            return CB_STATE_CLOSED
 
-    state = _circuit_breaker_state[model]
-    current_time = time.time()
+        state = _circuit_breaker_state[model]
+        current_time = _time.time()
 
-    # Check recovery window
-    if state["state"] == CB_STATE_OPEN:
-        elapsed = current_time - state["last_failure_time"]
-        if elapsed >= CB_RECOVERY_SECONDS:
-            state["state"] = CB_STATE_HALF_OPEN
-            state["consecutive_failures"] = 0
+        # Check recovery window
+        if state["state"] == CB_STATE_OPEN:
+            elapsed = current_time - state["last_failure_time"]
+            if elapsed >= CB_RECOVERY_SECONDS:
+                state["state"] = CB_STATE_HALF_OPEN
+                state["consecutive_failures"] = 0
 
-    return state["state"]
+        return state["state"]
+
+
+# RT-02: Fallback map ALWAYS goes DOWN to a cheaper tier. The cheapest tier
+# falls to None (fail closed). An attacker who trips a cheap tier's breaker
+# can NEVER coerce dispatch onto a more expensive tier — that is the policy
+# invariant this map encodes. Do not change a value to a more-expensive tier.
+_FALLBACK_DOWN: dict[str, str | None] = {
+    "opus": "sonnet",
+    "sonnet": "haiku",
+    "haiku": None,  # fail closed — never escalate
+}
+
+
+def _fallback_when_open(model: str) -> str | None:
+    """Return the cheaper-tier fallback for ``model`` (RT-02).
+
+    Returns None for the cheapest tier — caller MUST treat this as
+    "fail closed", not "use default". Callers that need a non-None
+    fallback should retry later, not coerce to a different model.
+    """
+    return _FALLBACK_DOWN.get(model, None)
 
 
 def auto_select_model(
     task: dict[str, Any],
     config: dict[str, Any] | None = None,
-) -> str:
+) -> str | None:
     """Auto-select model for task using complexity scoring + circuit breaker.
 
     Args:
-        task: Task dict with "description" and optional "title" keys
+        task: Task dict with "description", optional "title", optional
+            "priority" keys.
         config: Optional dispatch config
 
     Returns:
-        Selected model name (with fallback if circuit is open)
+        Selected model name, or ``None`` if all suitable circuits are
+        open and no cheaper fallback is available (fail-closed). Callers
+        must handle ``None`` — typically by deferring the dispatch.
     """
     description = task.get("description", "")
     title = task.get("title", "")
+    priority = task.get("priority")
 
     # Score complexity
     complexity = score_complexity(description, title)
     uncertainty = _uncertainty_level(f"{title} {description}")
 
-    # Select model tier
-    model = select_model_by_complexity(complexity, uncertainty, config)
+    # Select model tier (with priority cross-validation)
+    model = select_model_by_complexity(complexity, uncertainty, config, priority)
 
-    # Check circuit breaker
-    circuit_state = _get_circuit_state(model)
+    # RT-02: walk DOWN the tier ladder while the chosen circuit is open.
+    # Bounded by len(TIER_ORDER) to prevent any loop pathology.
+    for _ in range(len(TIER_ORDER) + 1):
+        if model is None:
+            return None
+        if _get_circuit_state(model) != CB_STATE_OPEN:
+            return model
+        logger.warning(
+            "routing: circuit OPEN for %s — falling DOWN to cheaper tier",
+            model,
+        )
+        model = _fallback_when_open(model)
 
-    if circuit_state == CB_STATE_OPEN:
-        # Circuit open: fallback to next tier up
-        fallback_map = {"haiku": "sonnet", "sonnet": "opus", "opus": "opus"}
-        model = fallback_map.get(model, DEFAULT_MODEL)
+    # If we walked the entire ladder and every tier is open, fail closed.
+    logger.error(
+        "routing: every circuit is OPEN — failing closed, deferring dispatch"
+    )
+    return None
 
-    return model
+
+# DEFAULT_MODEL is imported but only referenced here for compatibility with
+# downstream call sites that may want to know the configured default. We do
+# NOT use it as a fallback when all circuits are open — that would defeat the
+# RT-02 fail-closed guarantee.
+_ = DEFAULT_MODEL

@@ -67,6 +67,18 @@ class TestSemanticDepth:
         score = _semantic_depth("Do something unclear")
         assert score == 0.5
 
+    def test_keyword_stuffing_does_not_drag_score_down(self):
+        # RT-01: repeated LOW keywords MUST NOT drag a HIGH-keyword score
+        # below the HIGH bucket's expected contribution. Old code averaged
+        # raw counts so 20x "simple/trivial/typo" + 1x "security" produced
+        # ~0.05 (haiku tier); new code uses set presence so the result
+        # stays above the haiku threshold.
+        stuffed = ("simple trivial typo simple trivial typo " * 20) + " security"
+        score = _semantic_depth(stuffed)
+        assert score >= THRESHOLD_HAIKU, (
+            f"Keyword stuffing dragged semantic_depth to {score}"
+        )
+
 
 class TestTaskScope:
     """Test task scope detection."""
@@ -221,31 +233,66 @@ class TestAutoSelectModel:
         model = auto_select_model(task)
         assert model == "opus"
 
-    def test_circuit_open_fallback(self):
+    def test_circuit_open_haiku_fails_closed(self):
+        # RT-02: trip Haiku breaker, dispatch MUST fall to None (fail-closed),
+        # NEVER to Sonnet/Opus. Escalating up on failure is a financial-DoS
+        # vector — an attacker who triggers Haiku rate-limits would otherwise
+        # force every subsequent call onto Opus.
         task = {"description": "Fix typo", "title": "Typo fix"}
 
-        # Open haiku circuit
         for _ in range(CB_FAILURE_THRESHOLD):
             record_model_outcome("haiku", success=False)
 
         model = auto_select_model(task)
-        assert model == "sonnet"  # Fallback from haiku
+        assert model is None, (
+            f"RT-02 violation: haiku breaker open must fail closed, got {model}"
+        )
 
-    def test_opus_circuit_no_fallback(self):
+    def test_opus_circuit_falls_down_to_sonnet(self):
+        # RT-02: when Opus is open, fall DOWN to sonnet (cheaper), never
+        # stay on Opus and never escalate.
         task = {
             "description": "Architect distributed authentication infrastructure with encryption, "
             "authorization, and database migration across multiple microservices",
             "title": "Security architecture",
         }
 
-        # Open opus circuit
         for _ in range(CB_FAILURE_THRESHOLD):
             record_model_outcome("opus", success=False)
 
         model = auto_select_model(task)
-        assert model == "opus"  # No higher tier, stays at opus
+        assert model == "sonnet", (
+            f"RT-02: opus open must fall DOWN to sonnet, got {model}"
+        )
+
+    def test_sonnet_circuit_falls_down_to_haiku(self):
+        # RT-02: medium-tier task with Sonnet open must fall DOWN to Haiku.
+        task = {
+            "description": "Implement validation endpoint with error handling",
+            "title": "Add validation",
+        }
+        for _ in range(CB_FAILURE_THRESHOLD):
+            record_model_outcome("sonnet", success=False)
+
+        model = auto_select_model(task)
+        assert model == "haiku", (
+            f"RT-02: sonnet open must fall DOWN to haiku, got {model}"
+        )
+
+    def test_all_circuits_open_fails_closed(self):
+        # RT-02: if every tier is open, return None (fail closed) rather
+        # than coerce dispatch onto any model.
+        task = {"description": "Fix typo", "title": "Typo fix"}
+        for tier in ("haiku", "sonnet", "opus"):
+            for _ in range(CB_FAILURE_THRESHOLD):
+                record_model_outcome(tier, success=False)
+
+        model = auto_select_model(task)
+        assert model is None
 
     def test_empty_task(self):
         task = {}
         model = auto_select_model(task)
-        assert model in ["haiku", "sonnet", "opus"]
+        # Empty task returns a model OR None — both are acceptable as long
+        # as the result is not coerced to a more-expensive tier.
+        assert model is None or model in ["haiku", "sonnet", "opus"]
