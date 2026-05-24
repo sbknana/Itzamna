@@ -37,6 +37,36 @@ import time as _time
 
 logger = logging.getLogger(__name__)
 
+
+# --- Exceptions ---
+
+
+class CircuitOpenError(RuntimeError):
+    """Signal that auto-routing failed closed because every suitable tier is open.
+
+    Raised upward from ``equipa.roles.get_role_model`` when auto-routing is
+    enabled, ``auto_select_model`` returned ``None`` (fail-closed per RT-02),
+    and the caller MUST NOT silently fall through to a default model. The
+    dispatch wrapper catches this and demotes the task outcome to
+    ``circuit_breaker_blocked`` so the breaker can recover before the task
+    is retried.
+
+    Attributes:
+        role: The role name whose model resolution failed.
+        tier_attempted: The cheapest tier the router tried before failing
+            closed (informational only; may be ``None`` if unknown).
+    """
+
+    def __init__(self, role: str, tier_attempted: str | None = None) -> None:
+        self.role = role
+        self.tier_attempted = tier_attempted
+        suffix = f" (cheapest tier attempted: {tier_attempted})" if tier_attempted else ""
+        super().__init__(
+            f"auto-routing fail-closed for role={role}: every suitable circuit is OPEN"
+            f"{suffix}"
+        )
+
+
 # --- Complexity Scoring Keywords ---
 
 # HIGH complexity: architectural, security, distributed system work
