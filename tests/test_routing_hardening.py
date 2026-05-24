@@ -337,3 +337,196 @@ class TestRT03Concurrency:
         assert hasattr(_circuit_breaker_lock, "acquire")
         assert hasattr(_circuit_breaker_lock, "release")
         # threading.Lock and threading.RLock both expose these.
+
+
+# ---------------------------------------------------------------------------
+# S1 (RT-02 follow-up): fail-closed signal must propagate through
+# get_role_model rather than silently falling through to DEFAULT_ROLE_MODELS.
+#
+# The attempt-1 review surfaced that RT-02's fail-closed return value from
+# auto_select_model was being absorbed by equipa.roles.get_role_model, which
+# then returned DEFAULT_ROLE_MODELS[role] — and the developer/security-reviewer
+# /planner/frontend-designer/debugger entries in that map all resolve to
+# "opus". So the attack RT-02 was designed to block (trip haiku, force opus
+# on every cheap-tier task) still succeeded end-to-end. The fix raises
+# CircuitOpenError instead.
+# ---------------------------------------------------------------------------
+
+
+class TestS1FailClosedPropagation:
+    """S1 HIGH: when auto-routing is ON and every circuit is OPEN,
+    get_role_model MUST raise CircuitOpenError. It must NOT silently
+    return DEFAULT_ROLE_MODELS[role] (which is opus for most roles)."""
+
+    @pytest.fixture
+    def _mock_args(self):
+        from unittest.mock import Mock
+
+        from equipa.constants import DEFAULT_MODEL
+
+        return Mock(model=DEFAULT_MODEL, dispatch_config=None)
+
+    def _trip_all_circuits(self):
+        for tier in TIER_ORDER:
+            for _ in range(CB_FAILURE_THRESHOLD):
+                record_model_outcome(tier, success=False)
+
+    @pytest.mark.parametrize(
+        "role",
+        ["developer", "security-reviewer", "planner",
+         "frontend-designer", "debugger"],
+    )
+    def test_get_role_model_raises_circuit_open_error_for_opus_roles(
+        self, role, _mock_args,
+    ):
+        """The five DEFAULT_ROLE_MODELS=opus roles are the attack surface for
+        S1: a tripped haiku circuit USED to coerce them to opus. They must
+        now raise instead — fail closed, not silently escalate."""
+        from equipa.roles import get_role_model
+        from equipa.routing import CircuitOpenError
+
+        self._trip_all_circuits()
+        config = {"features": {"auto_model_routing": True}}
+        task = {"id": 1, "description": "fix typo in README", "title": "Fix typo"}
+
+        with pytest.raises(CircuitOpenError) as exc_info:
+            get_role_model(role, _mock_args, config=config, task=task)
+
+        # The exception must carry the role so the dispatch wrapper can log
+        # which role's resolution failed.
+        assert exc_info.value.role == role
+
+    def test_get_role_model_raises_when_only_cheapest_attack_path_tripped(
+        self, _mock_args,
+    ):
+        """The exact RT-02 attack: trip ONLY haiku, dispatch a trivial task
+        that auto-routes to haiku. auto_select_model fails closed because
+        haiku's fallback is None. get_role_model must propagate that as
+        CircuitOpenError, NOT silently return DEFAULT_ROLE_MODELS=opus."""
+        from equipa.roles import get_role_model
+        from equipa.routing import CircuitOpenError
+
+        for _ in range(CB_FAILURE_THRESHOLD):
+            record_model_outcome("haiku", success=False)
+
+        config = {"features": {"auto_model_routing": True}}
+        # Trivial task -> haiku tier -> only haiku circuit matters here.
+        task = {"id": 2, "description": "fix typo", "title": "typo"}
+
+        # Pre-flight: confirm auto_select_model itself fails closed.
+        assert auto_select_model(task, config) is None
+
+        with pytest.raises(CircuitOpenError):
+            get_role_model("developer", _mock_args, config=config, task=task)
+
+    def test_get_role_model_flag_off_still_falls_through(self, _mock_args):
+        """Legacy path: when auto_model_routing is OFF, behavior is unchanged
+        even if every circuit is somehow OPEN — DEFAULT_ROLE_MODELS still
+        wins because the routing path is never consulted at all."""
+        from equipa.roles import get_role_model
+
+        self._trip_all_circuits()
+        config = {"features": {"auto_model_routing": False}}
+        task = {"id": 3, "description": "fix typo", "title": "typo"}
+
+        # Must NOT raise — auto-routing path is gated by the flag.
+        result = get_role_model("developer", _mock_args, config=config, task=task)
+        assert result == "opus"  # DEFAULT_ROLE_MODELS["developer"]
+
+    def test_get_role_model_does_not_raise_when_circuits_healthy(
+        self, _mock_args,
+    ):
+        """Sanity: with auto-routing ON and clean circuits, no exception."""
+        from equipa.roles import get_role_model
+
+        config = {"features": {"auto_model_routing": True}}
+        task = {"id": 4, "description": "fix typo in README", "title": "Fix typo"}
+
+        result = get_role_model("developer", _mock_args, config=config, task=task)
+        # Trivial task routes to haiku.
+        assert result in TIER_ORDER
+
+    def test_circuit_open_error_carries_diagnostic_payload(self, _mock_args):
+        """The exception must carry enough info for the dispatch wrapper
+        to log a useful GATE-AUDIT line — role and the cheapest tier
+        attempted (informational)."""
+        from equipa.roles import get_role_model
+        from equipa.routing import CircuitOpenError
+
+        self._trip_all_circuits()
+        config = {"features": {"auto_model_routing": True}}
+        task = {"id": 5, "description": "fix typo", "title": "typo"}
+
+        with pytest.raises(CircuitOpenError) as exc_info:
+            get_role_model("security-reviewer", _mock_args,
+                           config=config, task=task)
+
+        exc = exc_info.value
+        assert exc.role == "security-reviewer"
+        assert exc.tier_attempted == "haiku"
+        # The string form mentions both the role and the fail-closed cause.
+        msg = str(exc)
+        assert "security-reviewer" in msg
+        assert "OPEN" in msg
+
+    def test_circuit_open_error_inherits_from_runtime_error(self):
+        """Callers may use ``except RuntimeError`` defensively; verify
+        that catch path still works."""
+        from equipa.routing import CircuitOpenError
+
+        exc = CircuitOpenError(role="developer", tier_attempted="haiku")
+        assert isinstance(exc, RuntimeError)
+
+
+class TestS1DispatchWrapperDemotion:
+    """S1 HIGH: the dispatch wrapper must catch CircuitOpenError and demote
+    the outcome to ``circuit_breaker_blocked`` instead of letting it bubble
+    up and crash the dispatch loop."""
+
+    def test_dispatch_wrapper_imports_circuit_open_error(self):
+        """The wrapper module must have CircuitOpenError in scope so its
+        try/except can catch the typed exception."""
+        from equipa import dispatch as _dispatch
+
+        assert hasattr(_dispatch, "CircuitOpenError")
+
+    def test_cli_module_imports_circuit_open_error(self):
+        """Single-task path in cli.py must also catch CircuitOpenError —
+        the security-gate parity invariant from #2448 means BOTH dispatch
+        modes (single-task --dev-test and --tasks) must demote consistently."""
+        from equipa import cli as _cli
+
+        assert hasattr(_cli, "CircuitOpenError")
+
+    def test_dispatch_wrapper_handler_emits_circuit_blocked_outcome(
+        self, monkeypatch,
+    ):
+        """Integration: when run_dev_test_loop raises CircuitOpenError,
+        run_dev_test_loop_with_autoresearch must return the demoted
+        outcome ``circuit_breaker_blocked`` rather than propagating the
+        exception."""
+        import asyncio
+
+        from equipa import dispatch as _dispatch
+        from equipa.routing import CircuitOpenError
+
+        async def _raise_circuit_open(*args, **kwargs):
+            raise CircuitOpenError(role="developer", tier_attempted="haiku")
+
+        monkeypatch.setattr(_dispatch, "run_dev_test_loop", _raise_circuit_open)
+
+        task = {"id": 999, "description": "fix typo", "title": "Fix"}
+        config = {"features": {"autoresearch": False}}
+
+        result, cycles, outcome, cost, duration, returned_task = asyncio.run(
+            _dispatch.run_dev_test_loop_with_autoresearch(
+                task, project_dir="/tmp", project_context={},
+                args=None, config=config, output=[],
+            )
+        )
+
+        assert outcome == "circuit_breaker_blocked"
+        assert cycles == 0
+        assert cost == 0.0
+        # Task echoed back unchanged.
+        assert returned_task["id"] == 999
