@@ -14,6 +14,15 @@ attacker who trips the cheap tier's breaker can never coerce dispatch onto the
 expensive tier. If the cheapest tier is itself unavailable we fail closed
 (``auto_select_model`` returns ``None``) rather than escalating cost.
 
+The fail-closed return value of ``auto_select_model`` is propagated upward
+through ``equipa.roles.get_role_model`` as ``CircuitOpenError`` (2453-S1).
+This enforces the RT-02 invariant end-to-end: a tripped haiku circuit can
+NEVER coerce dispatch onto ``DEFAULT_ROLE_MODELS[role]`` (which maps most
+roles to opus). Dispatch entry points
+(``equipa.dispatch.run_dev_test_loop_with_autoresearch`` and
+``equipa.cli.run_mode_task``) catch ``CircuitOpenError`` and demote the
+task outcome to ``circuit_breaker_blocked``.
+
 Circuit-breaker state is shared across dispatcher threads/coroutines and is
 guarded by a ``threading.Lock`` (RT-03) so concurrent record/read calls cannot
 observe a torn or stale state. Every public function that touches

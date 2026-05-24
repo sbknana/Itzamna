@@ -80,6 +80,16 @@ def get_role_model(
       4. dispatch config global model
       5. DEFAULT_ROLE_MODELS
       6. auto-routing (if auto_model_routing feature flag enabled)
+
+    Raises:
+        equipa.routing.CircuitOpenError — when auto-routing is enabled AND
+            every suitable circuit is OPEN (auto_select_model returned
+            None). The dispatch wrapper catches this and demotes the
+            task outcome to ``circuit_breaker_blocked``. NEVER silently
+            falls through to DEFAULT_ROLE_MODELS in that case (2453-S1):
+            DEFAULT_ROLE_MODELS maps developer/security-reviewer/planner
+            /frontend-designer/debugger to "opus", so silent fallthrough
+            would defeat RT-02 end-to-end.
     """
     from equipa.tasks import get_task_complexity
 
