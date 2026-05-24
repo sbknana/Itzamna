@@ -75,6 +75,7 @@ from equipa.plugins import load_plugins
 from equipa.prompts import build_planner_prompt, build_system_prompt
 from equipa.reflexion import maybe_run_reflexion
 from equipa.roles import _discover_roles, get_role_model, get_role_turns
+from equipa.routing import CircuitOpenError
 from equipa.routing import record_model_outcome
 from equipa.security import write_skill_manifest
 from equipa.security_gate import (
@@ -1108,9 +1109,28 @@ async def run_mode_task(args: argparse.Namespace) -> None:
         attempt_reflections: list[str] = []
 
         while True:
-            result, cycles, outcome = await run_dev_test_loop(
-                task, project_dir, project_context, args,
-            )
+            try:
+                result, cycles, outcome = await run_dev_test_loop(
+                    task, project_dir, project_context, args,
+                )
+            except CircuitOpenError as exc:
+                # S1 (2453, RT-02 follow-up): auto-routing fail-closed.
+                # Demote to ``circuit_breaker_blocked`` so the task can be
+                # re-tried after the breaker recovery window without
+                # silently escalating cost to opus via DEFAULT_ROLE_MODELS.
+                print(
+                    f"  [GATE-AUDIT] task={task['id']} event=circuit-blocked "
+                    f"role={exc.role} tier_attempted={exc.tier_attempted}"
+                )
+                print(
+                    f"  [Routing] Task #{task['id']} blocked by circuit "
+                    f"breaker ({exc}); deferring dispatch "
+                    f"(outcome=circuit_breaker_blocked)."
+                )
+                result = {"cost": 0.0, "duration": 0.0}
+                cycles = 0
+                outcome = "circuit_breaker_blocked"
+                break
 
             # Success - break out
             if outcome in ("tests_passed", "no_tests", "early_completed_no_changes"):
@@ -1281,9 +1301,16 @@ async def run_mode_task(args: argparse.Namespace) -> None:
         # ``security_review_blocked`` outcome is persisted to the task
         # row (rather than ``tests_passed``).
         task_role = task.get("role") or "developer"
+        # S1 (2453): telemetry must survive a CircuitOpenError-demoted
+        # outcome — no model was dispatched so log the sentinel
+        # ``circuit_blocked`` rather than re-raising through bookkeeping.
+        try:
+            telemetry_model = get_role_model(task_role, args, task=task)
+        except CircuitOpenError:
+            telemetry_model = "circuit_blocked"
         await _post_task_telemetry(
             task, result, outcome, role=task_role,
-            model=get_role_model(task_role, args, task=task),
+            model=telemetry_model,
             max_turns=get_role_turns(task_role, args, task=task),
             cycle_number=cycles,
             dispatch_config=getattr(args, "dispatch_config", None))

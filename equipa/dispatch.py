@@ -70,6 +70,7 @@ from equipa.output import (
 from equipa.prompts import build_planner_prompt
 from equipa.reflexion import maybe_run_reflexion
 from equipa.roles import get_role_model, get_role_turns
+from equipa.routing import CircuitOpenError
 from equipa.security_gate import (
     SecurityGateBypassError,
     _gate_audit_log,
@@ -414,9 +415,29 @@ async def run_dev_test_loop_with_autoresearch(
     loop_total_duration = 0.0
 
     while True:
-        result, cycles, outcome = await run_dev_test_loop(
-            task, project_dir, project_context, args, output=output,
-        )
+        try:
+            result, cycles, outcome = await run_dev_test_loop(
+                task, project_dir, project_context, args, output=output,
+            )
+        except CircuitOpenError as exc:
+            # S1 (RT-02 follow-up): auto-routing fail-closed signal — every
+            # circuit is OPEN. Demote to ``circuit_breaker_blocked`` so the
+            # task can be retried after the breaker recovery window without
+            # silently escalating cost to opus via DEFAULT_ROLE_MODELS.
+            log(
+                f"  [GATE-AUDIT] task={task_id} event=circuit-blocked "
+                f"role={exc.role} tier_attempted={exc.tier_attempted}",
+                output,
+            )
+            log(
+                f"  [Routing] Task #{task_id} blocked by circuit breaker "
+                f"({exc}); deferring dispatch (outcome=circuit_breaker_blocked).",
+                output,
+            )
+            result = {"cost": 0.0, "duration": 0.0}
+            cycles = 0
+            outcome = "circuit_breaker_blocked"
+            break
         loop_total_duration += result.get("duration", 0)
         if result.get("cost"):
             loop_total_cost += result["cost"]
@@ -734,9 +755,17 @@ async def run_project_tasks(
 
         # ForgeSmith telemetry
         task_role = task.get("role") or "developer"
+        # S1 (2453): telemetry must survive a CircuitOpenError-demoted
+        # outcome — at that point no model was actually dispatched, so
+        # log the sentinel ``circuit_blocked`` rather than re-raising
+        # through the post-loop bookkeeping.
+        try:
+            telemetry_model = get_role_model(task_role, task_args, task=task)
+        except CircuitOpenError:
+            telemetry_model = "circuit_blocked"
         record_agent_run(
             task, result, outcome, role=task_role,
-            model=get_role_model(task_role, task_args, task=task),
+            model=telemetry_model,
             max_turns=get_role_turns(task_role, task_args, task=task),
             cycle_number=cycles, output=output,
         )
@@ -1963,9 +1992,13 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
                     logger.exception("[flows] child terminal update failed")
             # Record telemetry
             task_role = task.get("role") or "developer"
+            try:
+                telemetry_model = get_role_model(task_role, args, task=task)
+            except CircuitOpenError:
+                telemetry_model = "circuit_blocked"
             record_agent_run(
                 task, result, outcome, role=task_role,
-                model=get_role_model(task_role, args, task=task),
+                model=telemetry_model,
                 max_turns=get_role_turns(task_role, args, task=task),
                 cycle_number=cycles, output=output,
             )
