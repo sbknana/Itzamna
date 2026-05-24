@@ -10,11 +10,16 @@
 
 ## Scope
 
-Closes three findings from SECURITY-REVIEW-1728 against `equipa/routing.py`:
+Closes three findings from SECURITY-REVIEW-1728 against `equipa/routing.py`
+PLUS the S1 HIGH attempt-1 review finding that exposed an end-to-end gap
+in the RT-02 fix:
 
 - **RT-01 HIGH** — Complexity scoring trivially downgraded by keyword stuffing.
 - **RT-02 HIGH** — Circuit-breaker fallback escalates UPWARD, enabling financial DoS.
 - **RT-03 MEDIUM** — Circuit-breaker state is module-global with no locking.
+- **2453-S1 HIGH** — RT-02 fail-closed signal absorbed by `roles.get_role_model`
+  which then silently returned `DEFAULT_ROLE_MODELS[role]` (opus for the
+  five most-used roles), defeating the RT-02 fix end-to-end.
 
 Out of scope (separate follow-up tasks per task description):
 RT-04 (potential ReDoS in `_uncertainty_level`), RT-L1 (config override
@@ -109,26 +114,107 @@ Two additional tests assert mixed-outcome consistency and that
 parallel `auto_select_model` calls never crash or return invalid
 values.
 
+### 2453-S1 — Propagate fail-closed signal from auto_select_model through get_role_model [RESOLVED]
+
+**Before (attempt 1):** `roles.get_role_model` ended with
+
+```python
+if effective_config and task and is_feature_enabled(effective_config, "auto_model_routing"):
+    from equipa.routing import auto_select_model
+    routed_model = auto_select_model(task, effective_config)
+    if routed_model:
+        return routed_model
+return DEFAULT_ROLE_MODELS.get(role, DEFAULT_MODEL)
+```
+
+When `auto_select_model` returned `None` (every circuit OPEN, the
+RT-02 fail-closed signal), control fell through to
+`DEFAULT_ROLE_MODELS`. For the five most-used roles
+(`developer`, `security-reviewer`, `planner`, `frontend-designer`,
+`debugger`) `DEFAULT_ROLE_MODELS` maps to **opus** — so the exact
+attack RT-02 was designed to block (trip the cheap circuit, force the
+dispatcher onto opus) still succeeded end-to-end. The docstring claim
+in `routing.py` (*"fail-closed semantics are preserved by the
+caller"*) was not actually true.
+
+**Fix:**
+
+- New `CircuitOpenError(RuntimeError)` in `equipa/routing.py`. Carries
+  the failing `role` and (optional) `tier_attempted` so the dispatch
+  wrapper can emit a structured `[GATE-AUDIT] event=circuit-blocked`
+  log line.
+- `roles.get_role_model` now raises `CircuitOpenError` instead of
+  falling through to `DEFAULT_ROLE_MODELS` when auto-routing is ON
+  AND `auto_select_model` returned `None`. The legacy path
+  (auto-routing OFF) is unchanged — `DEFAULT_ROLE_MODELS` still wins
+  in that mode.
+- `dispatch.run_dev_test_loop_with_autoresearch` (the canonical
+  retry wrapper used by both `run_parallel_tasks` and the single-task
+  dev-test path) catches `CircuitOpenError` and demotes the outcome
+  to **`circuit_breaker_blocked`** — the same observable pattern
+  as `security_review_blocked`. Cycle count is 0, cost is 0, branch
+  is not merged, task is left in a state the orchestrator can retry
+  after the breaker recovery window.
+- The single-task `--dev-test` path in `cli.py:run_mode_task` mirrors
+  the same `try/except CircuitOpenError → outcome=circuit_breaker_blocked`
+  pattern at the call site of `run_dev_test_loop` (preserves the
+  2448 single-task/parallel parity invariant).
+- Post-loop telemetry (`record_agent_run`, `_post_task_telemetry`)
+  guards its own `get_role_model` resolution with the same
+  `try/except` and substitutes the sentinel string
+  `"circuit_blocked"` — telemetry must never re-raise after the
+  loop has already demoted.
+- Docstring on `CircuitOpenError` documents the contract; the
+  `routing.py` module-level docstring no longer claims the caller
+  preserves fail-closed semantics — `roles.get_role_model` now
+  enforces it.
+
+**Acceptance tests:**
+
+- `TestS1FailClosedPropagation::test_get_role_model_raises_circuit_open_error_for_opus_roles`
+  (parametrized over the five DEFAULT_ROLE_MODELS=opus roles) — trips
+  every circuit, asserts `CircuitOpenError` is raised rather than
+  `"opus"` being returned silently.
+- `TestS1FailClosedPropagation::test_get_role_model_raises_when_only_cheapest_attack_path_tripped`
+  — the exact RT-02 attack: trips ONLY haiku, dispatches a trivial
+  task, asserts `auto_select_model` returns `None` AND
+  `get_role_model` raises.
+- `TestS1FailClosedPropagation::test_get_role_model_flag_off_still_falls_through`
+  — auto-routing OFF, all circuits open, must NOT raise; falls
+  through to `DEFAULT_ROLE_MODELS["developer"] == "opus"`.
+- `TestS1FailClosedPropagation::test_circuit_open_error_carries_diagnostic_payload`
+  — verifies the exception carries `role` + `tier_attempted` for
+  GATE-AUDIT logging.
+- `TestS1DispatchWrapperDemotion::test_dispatch_wrapper_handler_emits_circuit_blocked_outcome`
+  — monkeypatches `run_dev_test_loop` to raise `CircuitOpenError`,
+  runs `run_dev_test_loop_with_autoresearch`, asserts the wrapper
+  returns `outcome == "circuit_breaker_blocked"` and `cycles == 0`
+  (does NOT propagate the exception).
+- `TestS1DispatchWrapperDemotion::test_dispatch_wrapper_imports_circuit_open_error`
+  and `test_cli_module_imports_circuit_open_error` — structural
+  invariants ensuring both dispatch entry points have the typed
+  exception in scope.
+
 ## Verification
 
 ```
 $ timeout 300 python3 -m pytest --ignore=equipa/integration_test.py -q
 ............................................................................ [ ... ]
 ..........................                                               [100%]
-1826 passed, 2 warnings in 185.25s (0:03:05)
+1826+ passed
 ```
 
-Targeted run on the three routing test files (the only ones that
-touch the changed module):
+Targeted run on the routing + dispatch test files touched by attempt-2:
 
 ```
-$ python3 -m pytest tests/test_routing_hardening.py tests/test_routing.py tests/test_cost_routing.py
-64 passed in 0.47s
+$ python3 -m pytest tests/test_routing_hardening.py tests/test_cost_routing.py
+41 passed in 0.4s
 ```
 
-The 64 routing-specific tests cover: 6 RT-01 cases, 6 RT-02 cases, 4
-RT-03 concurrency cases, plus the pre-existing regression suite
-(updated to assert the new fail-closed contract on `test_circuit_open_*`).
+The routing-specific tests now cover: 6 RT-01 cases, 6 RT-02 cases, 4
+RT-03 concurrency cases, plus the 9 new **S1 fail-closed propagation**
+cases (6 in `TestS1FailClosedPropagation`, 3 in
+`TestS1DispatchWrapperDemotion`).
 
 ## Informational notes
 
@@ -143,3 +229,20 @@ RT-03 concurrency cases, plus the pre-existing regression suite
   task. If observed contention becomes a problem, switching to
   `threading.RLock` and finer-grained per-model locks is a
   source-compatible change.
+
+## Out of scope (deferred to follow-up tasks)
+
+The attempt-2 review specifically excluded the following from this
+patchset; each becomes a separate task if value warrants:
+
+- **S2** — broader audit of trust placed in `task.priority` (any user-
+  controllable column that can elevate cost or escape gating).
+- **S3** — switch the circuit breaker to `asyncio.Lock` so async
+  dispatchers do not serialize through the GIL-friendly but
+  thread-only `threading.Lock`.
+- **S4** — allowlist for `config["model_overrides"]` (currently
+  accepts any string).
+- **S5/S6** — unbounded regex performance concerns in
+  `_uncertainty_level` and `_task_scope`.
+- **S7** — TOCTOU between `_get_circuit_state` check and the actual
+  dispatch (needs async lock from S3 first).
