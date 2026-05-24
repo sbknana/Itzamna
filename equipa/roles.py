@@ -109,11 +109,26 @@ def get_role_model(
         return effective_config["model"]
 
     # Priority 6: Auto-routing (late import, gated by feature flag)
+    #
+    # S1 (HIGH, follow-up to RT-02) — when auto_model_routing is enabled AND
+    # auto_select_model returns None (every circuit OPEN, fail-closed signal),
+    # we MUST NOT silently fall through to DEFAULT_ROLE_MODELS. Doing so
+    # defeats RT-02's whole point: DEFAULT_ROLE_MODELS maps most roles
+    # (developer, security-reviewer, planner, frontend-designer, debugger)
+    # to "opus", so a tripped Haiku circuit would force the very cost
+    # escalation RT-02 was designed to block.
+    #
+    # Instead, raise CircuitOpenError. The dispatch wrapper
+    # (run_dev_test_loop_with_autoresearch) catches it and demotes the
+    # task outcome to ``circuit_breaker_blocked`` — same observable
+    # pattern as ``security_review_blocked``. Auto-routing OFF is the
+    # legacy path and still falls through to DEFAULT_ROLE_MODELS.
     if effective_config and task and is_feature_enabled(effective_config, "auto_model_routing"):
-        from equipa.routing import auto_select_model
+        from equipa.routing import CircuitOpenError, auto_select_model
         routed_model = auto_select_model(task, effective_config)
         if routed_model:
             return routed_model
+        raise CircuitOpenError(role=role, tier_attempted="haiku")
 
     return DEFAULT_ROLE_MODELS.get(role, DEFAULT_MODEL)
 
