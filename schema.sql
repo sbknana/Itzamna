@@ -290,6 +290,7 @@ CREATE TABLE agent_runs (
     error_summary TEXT,
     turns_allocated INTEGER,
     prompt_version TEXT DEFAULT 'baseline',
+    worktree_path TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (task_id) REFERENCES tasks(id),
     FOREIGN KEY (project_id) REFERENCES projects(id)
@@ -753,8 +754,27 @@ CREATE INDEX IF NOT EXISTS idx_agent_sessions_expires
     ON agent_sessions(expires_at);
 
 -- ============================================================
+-- v12: Worktree isolation tracking
+-- ============================================================
+CREATE TABLE IF NOT EXISTS worktrees (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER NOT NULL,
+    project_id INTEGER NOT NULL,
+    path TEXT NOT NULL,
+    branch TEXT NOT NULL,
+    status TEXT NOT NULL,  -- active / merged / failed / conflict / abandoned
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    ended_at DATETIME,
+    FOREIGN KEY (task_id) REFERENCES tasks(id),
+    FOREIGN KEY (project_id) REFERENCES projects(id)
+);
+CREATE INDEX IF NOT EXISTS idx_worktrees_status ON worktrees(status);
+CREATE INDEX IF NOT EXISTS idx_worktrees_task ON worktrees(task_id);
+CREATE INDEX IF NOT EXISTS idx_worktrees_project ON worktrees(project_id);
+
+-- ============================================================
 -- VERSION STAMP
 -- ============================================================
--- Marks fresh installs as v11. Migrations handle upgrades from older versions.
-PRAGMA user_version = 11;
+-- Marks fresh installs as v12. Migrations handle upgrades from older versions.
+PRAGMA user_version = 12;
 

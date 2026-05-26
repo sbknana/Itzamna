@@ -49,6 +49,14 @@ from equipa.db import (
 )
 from equipa.hooks import fire_async as fire_hook
 from equipa.git_ops import _is_git_repo, git_run_async
+from equipa.worktree_manager import (
+    WorktreeError,
+    create as create_worktree,
+    destroy as destroy_worktree,
+    mark_conflict as mark_worktree_conflict,
+    mark_failed as mark_worktree_failed,
+    merge_back as merge_worktree_back,
+)
 from equipa.lessons import update_injected_episode_q_values_for_task
 from equipa.loops import (
     run_dev_test_loop,
@@ -1003,328 +1011,13 @@ def parse_task_ids(task_str: str) -> list[int]:
     return ids
 
 
-def _copy_hooks_to_worktree(main_repo_dir: str, worktree_dir: str) -> None:
-    """Copy git hooks from the main repo into a worktree.
-
-    Worktrees do NOT inherit .git/hooks from the parent repo. This means
-    pre-commit hooks (like plugin boundary checks) won't fire in worktrees
-    unless we explicitly copy them.
-    """
-    import shutil
-    main_hooks = Path(main_repo_dir) / ".git" / "hooks"
-    if not main_hooks.is_dir():
-        return
-
-    # Worktree .git is a file pointing to the main repo's worktree dir.
-    # The actual hooks dir for a worktree is in the main repo at:
-    # .git/worktrees/<worktree-name>/hooks (doesn't exist by default)
-    # But we can also just copy hooks into the worktree and configure.
-    #
-    # Simplest approach: copy the pre-commit hook and any other hooks
-    # to the worktree's common hooks dir.
-    wt_git_path = Path(worktree_dir) / ".git"
-    if wt_git_path.is_file():
-        # .git is a file like "gitdir: /path/to/.git/worktrees/task-123"
-        gitdir = wt_git_path.read_text().strip().replace("gitdir: ", "")
-        wt_hooks = Path(gitdir) / "hooks"
-        wt_hooks.mkdir(exist_ok=True)
-        for hook in main_hooks.iterdir():
-            if hook.is_file() and not hook.name.endswith(".sample"):
-                dest = wt_hooks / hook.name
-                shutil.copy2(str(hook), str(dest))
-    # Also copy .plugin-boundary-markers if it exists (for the pre-commit hook)
-    markers_src = Path(main_repo_dir) / ".plugin-boundary-markers"
-    markers_dst = Path(worktree_dir) / ".plugin-boundary-markers"
-    if markers_src.exists() and not markers_dst.exists():
-        shutil.copy2(str(markers_src), str(markers_dst))
-
-
-async def _create_isolation_worktrees(
-    tasks: list[dict],
-    project_dir: str,
-    worktree_base: Path,
-) -> dict[int, str]:
-    """Create per-task git worktrees for filesystem isolation.
-
-    Returns a map of task_id -> worktree directory path. Tasks for which
-    worktree creation fails are omitted from the returned map (they will
-    fall back to sharing project_dir).
-
-    Uses ``git_run_async`` so the per-task git invocations do not block
-    the event loop while parallel task dispatch is queued.
-    """
-    worktree_dirs: dict[int, str] = {}
-    worktree_base.mkdir(exist_ok=True)
-    for t in tasks:
-        task_id = t["id"]
-        branch_name = f"forge-task-{task_id}"
-        wt_path = worktree_base / f"task-{task_id}"
-        try:
-            if wt_path.exists():
-                await git_run_async(
-                    ["worktree", "remove", "--force", str(wt_path)],
-                    project_dir, timeout=30,
-                )
-            add_res = await git_run_async(
-                ["worktree", "add", "-b", branch_name, str(wt_path), "HEAD"],
-                project_dir, timeout=60,
-            )
-            if add_res.returncode != 0:
-                # Fallback: branch may already exist — delete and retry.
-                await git_run_async(
-                    ["branch", "-D", branch_name], project_dir, timeout=10,
-                )
-                retry_res = await git_run_async(
-                    ["worktree", "add", "-b", branch_name, str(wt_path), "HEAD"],
-                    project_dir, timeout=60,
-                )
-                if retry_res.returncode != 0:
-                    err_preview = (
-                        retry_res.stderr[:200] if retry_res.stderr
-                        else f"rc={retry_res.returncode}"
-                    )
-                    print(
-                        f"  [Isolation] WARNING: Could not create worktree for "
-                        f"task #{task_id}, using shared dir "
-                        f"(retry failed: {err_preview})"
-                    )
-                    continue
-                worktree_dirs[task_id] = str(wt_path)
-                _copy_hooks_to_worktree(project_dir, str(wt_path))
-                print(f"  [Isolation] Task #{task_id} -> {wt_path.name} (retry)")
-            else:
-                worktree_dirs[task_id] = str(wt_path)
-                _copy_hooks_to_worktree(project_dir, str(wt_path))
-                print(f"  [Isolation] Task #{task_id} -> {wt_path.name}")
-        except (subprocess.SubprocessError, OSError) as e:
-            print(
-                f"  [Isolation] WARNING: Worktree creation errored for "
-                f"task #{task_id}: {e}"
-            )
-    return worktree_dirs
-
-
-async def _merge_task_branch(project_dir: str, task_id: int, branch_name: str) -> bool:
-    """Merge a single task branch into the main repo's current branch.
-
-    Returns True if the merge succeeded (HEAD advanced), False otherwise.
-    All failures are logged to stdout — the function NEVER swallows errors
-    silently. On any failure path, the branch is preserved (not deleted).
-
-    Uses ``git_run_async`` so the 6-12 git invocations per merge do not
-    block the event loop.
-    """
-    try:
-        current = await git_run_async(
-            ["branch", "--show-current"], project_dir, timeout=10,
-        )
-        current_branch = current.stdout.strip()
-        if not current_branch:
-            for candidate in ["master", "main"]:
-                check = await git_run_async(
-                    ["show-ref", "--verify", f"refs/heads/{candidate}"],
-                    project_dir, timeout=10,
-                )
-                if check.returncode == 0:
-                    await git_run_async(
-                        ["checkout", candidate], project_dir, timeout=30,
-                    )
-                    current_branch = candidate
-                    break
-        print(f"  [Isolation] Merging on branch: {current_branch} in {project_dir}")
-
-        pre_head_res = await git_run_async(
-            ["rev-parse", "HEAD"], project_dir, timeout=10,
-        )
-        pre_head = pre_head_res.stdout.strip()
-
-        ahead = await git_run_async(
-            ["log", "--oneline", f"HEAD..{branch_name}"], project_dir, timeout=15,
-        )
-        if not ahead.stdout.strip():
-            print(
-                f"  [Isolation] Task #{task_id}: branch '{branch_name}' has "
-                f"NO commits ahead of HEAD — skipping merge"
-            )
-            return False
-
-        commits_ahead = len(ahead.stdout.strip().split("\n"))
-        print(
-            f"  [Isolation] Task #{task_id}: branch '{branch_name}' has "
-            f"{commits_ahead} commit(s) to merge"
-        )
-
-        stash_result = await git_run_async(
-            ["stash"], project_dir, timeout=30,
-        )
-        had_stash = "Saved working directory" in stash_result.stdout
-
-        try:
-            merge_result = await git_run_async(
-                ["merge", "--no-edit", branch_name], project_dir, timeout=60,
-            )
-            post_head_res = await git_run_async(
-                ["rev-parse", "HEAD"], project_dir, timeout=10,
-            )
-            post_head = post_head_res.stdout.strip()
-
-            if merge_result.returncode == 0 and post_head != pre_head:
-                print(
-                    f"  [Isolation] Merged task #{task_id} into main "
-                    f"({pre_head[:8]} -> {post_head[:8]})"
-                )
-                return True
-            if merge_result.returncode == 0 and post_head == pre_head:
-                print(
-                    f"  [Isolation] WARNING: Merge returned 0 for task "
-                    f"#{task_id} but HEAD unchanged ({pre_head[:8]})"
-                )
-                print(f"  [Isolation] Merge stdout: {merge_result.stdout[:200]}")
-                return False
-
-            # Conflict path: try rebase-then-merge.
-            await git_run_async(
-                ["merge", "--abort"], project_dir, timeout=15,
-            )
-            rebase_result = await git_run_async(
-                ["rebase", "HEAD", branch_name], project_dir, timeout=60,
-            )
-            if rebase_result.returncode != 0:
-                await git_run_async(
-                    ["rebase", "--abort"], project_dir, timeout=15,
-                )
-                print(
-                    f"  [Isolation] Merge FAILED for task #{task_id}: "
-                    f"{merge_result.stderr[:200]}"
-                )
-                print(f"  [Isolation] Branch '{branch_name}' PRESERVED")
-                return False
-
-            merge2 = await git_run_async(
-                ["merge", "--no-edit", branch_name], project_dir, timeout=60,
-            )
-            if merge2.returncode == 0:
-                print(f"  [Isolation] Merged task #{task_id} (after rebase)")
-                return True
-            await git_run_async(
-                ["merge", "--abort"], project_dir, timeout=15,
-            )
-            print(
-                f"  [Isolation] Merge FAILED for task #{task_id} "
-                f"(conflict after rebase)"
-            )
-            print(f"  [Isolation] Branch '{branch_name}' PRESERVED")
-            return False
-        finally:
-            if had_stash:
-                await git_run_async(
-                    ["stash", "pop"], project_dir, timeout=30,
-                )
-    except (subprocess.SubprocessError, OSError) as e:
-        # Explicit error log — do NOT silently swallow. Branch is preserved
-        # because we did not add it to the merged set.
-        print(f"  [Isolation] Merge error for task #{task_id}: {e}")
-        print(f"  [Isolation] Branch '{branch_name}' PRESERVED (merge errored)")
-        return False
-
-
-async def _stash_uncommitted_in_worktree(
-    wt_path: str,
-    task_id: int,
-    branch_name: str,
-) -> None:
-    """Stash any uncommitted changes inside ``wt_path`` onto its branch.
-
-    Runs inside the worktree itself so the stash lands on ``branch_name``'s
-    HEAD. Includes untracked files (``-u``) so newly-created agent files
-    are preserved. Stash message is tagged so it can be located later by
-    rescue tooling: ``equipa-early-term task-<id>``.
-
-    Silent failure paths (missing git, no changes, locked index) are
-    logged but never raised — cleanup must continue even if the stash
-    cannot be saved.
-    """
-    if not Path(wt_path).exists():
-        return
-    try:
-        status = await git_run_async(
-            ["status", "--porcelain"], wt_path, timeout=15,
-        )
-        if status.returncode != 0 or not status.stdout.strip():
-            return
-        stash_msg = f"equipa-early-term task-{task_id} branch-{branch_name}"
-        result = await git_run_async(
-            ["stash", "push", "-u", "-m", stash_msg],
-            wt_path, timeout=30,
-        )
-        if result.returncode == 0 and "No local changes" not in result.stdout:
-            print(
-                f"  [Isolation] Task #{task_id}: stashed uncommitted work "
-                f"on '{branch_name}' as '{stash_msg}'"
-            )
-    except (subprocess.SubprocessError, OSError) as e:
-        print(
-            f"  [Isolation] Could not stash uncommitted work for task "
-            f"#{task_id} on '{branch_name}': {e}"
-        )
-
-
-async def _cleanup_worktrees(
-    project_dir: str,
-    worktree_dirs: dict[int, str],
-    merged_tasks: set[int],
-    worktree_base: Path,
-) -> None:
-    """Remove worktree directories; delete merged branches; preserve unmerged.
-
-    Per-task failures are logged (not silently swallowed) so that data-loss
-    investigations have evidence of which step failed.
-
-    Uses ``git_run_async`` so the per-task ``git worktree remove`` and
-    ``git branch -D`` calls do not block the event loop.
-    """
-    for task_id, wt_path in worktree_dirs.items():
-        branch_name = f"forge-task-{task_id}"
-        try:
-            state_file = Path(wt_path) / ".forge-state.json"
-            if state_file.exists():
-                state_file.unlink()
-            # Preserve uncommitted work on UNMERGED branches before the
-            # `git worktree remove --force` discards the working tree.
-            # Without this, an early_terminated agent that wrote 32 turns of
-            # edits but did not commit loses everything when the worktree is
-            # torn down. Stash on the worktree's own branch (HEAD) so the
-            # work can be salvaged later by checking out the branch and
-            # running `git stash pop`.
-            if task_id not in merged_tasks:
-                await _stash_uncommitted_in_worktree(
-                    wt_path, task_id, branch_name,
-                )
-            await git_run_async(
-                ["worktree", "remove", "--force", wt_path],
-                project_dir, timeout=30,
-            )
-            if task_id in merged_tasks:
-                await git_run_async(
-                    ["branch", "-D", branch_name], project_dir, timeout=10,
-                )
-            else:
-                print(
-                    f"  [Isolation] Keeping branch '{branch_name}' "
-                    f"(unmerged work)"
-                )
-        except (subprocess.SubprocessError, OSError) as e:
-            print(
-                f"  [Isolation] Cleanup error for task #{task_id} "
-                f"(branch '{branch_name}'): {e}"
-            )
-    # Clean up worktree base dir if empty (rmdir on non-empty dir raises
-    # OSError — that's expected when other worktrees exist, not an error).
-    try:
-        worktree_base.rmdir()
-    except OSError:
-        pass
-
+# --- Worktree isolation helpers removed in Phase 1 convergence (2026-05-23) ---
+# Functions _copy_hooks_to_worktree, _create_isolation_worktrees, _merge_task_branch,
+# _stash_uncommitted_in_worktree, and _cleanup_worktrees have been replaced by the
+# canonical implementation in equipa.worktree_manager. The parallel-dispatch flow
+# in run_parallel_tasks now uses create_worktree / merge_worktree_back / destroy_worktree
+# / mark_worktree_failed / mark_worktree_conflict from that module so single-task and
+# parallel dispatch share one implementation.
 
 async def run_parallel_tasks(task_ids: list[int], args) -> None:
     """Run multiple tasks concurrently with dev-test loops.
@@ -1408,16 +1101,24 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
             print("Aborted.")
             return
 
-    # Create per-task git worktrees for filesystem isolation
-    worktree_base = Path(project_dir) / ".forge-worktrees"
+    # Create per-task git worktrees for filesystem isolation.
+    # Phase 1 convergence (2026-05-23): the parallel path now uses
+    # worktree_manager.create() so single-task and parallel dispatch share
+    # one canonical implementation. Tasks that fail worktree creation fall
+    # back to sharing project_dir (logged as a warning).
     use_worktrees = len(tasks) > 1 and _is_git_repo(project_dir)
-    # Worktree creation issues 2-3 git commands per task. The helper is
-    # natively async (uses git_run_async) so the event loop is not
-    # blocked while subprocesses run.
-    worktree_dirs: dict[int, str] = (
-        await _create_isolation_worktrees(tasks, project_dir, worktree_base)
-        if use_worktrees else {}
-    )
+    worktree_dirs: dict[int, str] = {}
+    if use_worktrees:
+        for t in tasks:
+            try:
+                record = await create_worktree(t["id"], project_dir)
+                worktree_dirs[t["id"]] = record.path
+                print(f"  [Isolation] Task #{t['id']} -> {Path(record.path).name}")
+            except WorktreeError as e:
+                print(
+                    f"  [Isolation] WARNING: worktree creation failed for "
+                    f"task #{t['id']}, using shared dir: {e}"
+                )
 
     async def run_one_task(task):
         output = []
@@ -1574,36 +1275,35 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
         print(f"Cost: ${total_cost:.4f}")
     print(f"{'#' * 60}")
 
-    # Sequential merge — merge task branches one at a time to avoid conflicts
-    merged_tasks_seq: set[int] = set()
+    # Sequential merge + cleanup — merge task branches one at a time via
+    # worktree_manager so single-task and parallel dispatch share one
+    # canonical implementation. On successful merge, destroy the worktree.
+    # On failed task (outcome not in success set) or merge failure, the
+    # worktree is retained on disk for operator inspection — Phase 3
+    # introduces --cleanup-worktrees for batch cleanup.
     if use_worktrees:
-        merge_candidates = []
         for r in results:
             if isinstance(r, Exception):
                 continue
-            if r.get("needs_merge", False) or (
-                r["task"]["id"] in worktree_dirs
-                and r["outcome"] in ("tests_passed", "no_tests")
-            ):
-                merge_candidates.append(r)
-
-        for r in merge_candidates:
             task_id = r["task"]["id"]
-            branch_name = f"forge-task-{task_id}"
-            # Each merge issues 6-12 git invocations; the helper is now
-            # natively async (uses git_run_async) so the event loop stays
-            # responsive for any background work draining post-gather.
-            merge_ok = await _merge_task_branch(
-                project_dir, task_id, branch_name,
-            )
-            if merge_ok:
-                r["merge_ok"] = True
-                merged_tasks_seq.add(task_id)
+            if task_id not in worktree_dirs:
+                continue
 
-    # Clean up worktrees — only delete branches that were successfully merged.
-    # Helper is natively async; per-task `git worktree remove` and
-    # `git branch -D` calls do not block the event loop.
-    if use_worktrees:
-        await _cleanup_worktrees(
-            project_dir, worktree_dirs, merged_tasks_seq, worktree_base,
-        )
+            if r["outcome"] in ("tests_passed", "no_tests"):
+                merge_result = await merge_worktree_back(task_id)
+                if merge_result.ok:
+                    r["merge_ok"] = True
+                    await destroy_worktree(task_id)
+                else:
+                    await mark_worktree_conflict(task_id, merge_result)
+                    print(
+                        f"  [Isolation] Task #{task_id} merge FAILED: "
+                        f"{merge_result.message}. Worktree retained at "
+                        f"{worktree_dirs[task_id]}"
+                    )
+            else:
+                await mark_worktree_failed(task_id)
+                print(
+                    f"  [Isolation] Task #{task_id} {r['outcome']}; "
+                    f"worktree retained at {worktree_dirs[task_id]}"
+                )

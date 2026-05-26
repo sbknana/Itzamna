@@ -30,7 +30,7 @@ from datetime import datetime
 from pathlib import Path
 
 # The schema version that matches the current schema.sql
-CURRENT_VERSION = 11
+CURRENT_VERSION = 12
 
 
 # ============================================================
@@ -844,6 +844,50 @@ def migrate_v10_to_v11(conn):
     conn.commit()
 
 
+def migrate_v11_to_v12(conn):
+    """Add worktree isolation tracking (v11 -> v12).
+
+    Adds the ``worktrees`` table and a ``worktree_path`` column on
+    ``agent_runs`` to support git-worktree-isolated agent dispatch.
+    See planning/worktree-isolation.md and Equipa task #215.
+
+    The ``worktrees`` table tracks one row per worktree-isolated dispatch:
+      - ``status`` lifecycle: active -> merged | failed | conflict | abandoned
+      - ``path`` is absolute; the worktree lives at
+        ``<project_dir>/forge_worktrees/<codename>-task-<id>/``
+      - ``branch`` is always ``forge-task-<task_id>`` in Phase 1
+
+    The ``agent_runs.worktree_path`` column is redundant with the join via
+    ``task_id`` but kept for direct querying during forensics.
+    """
+    try:
+        conn.execute(
+            "ALTER TABLE agent_runs ADD COLUMN worktree_path TEXT"
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS worktrees (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id INTEGER NOT NULL,
+            project_id INTEGER NOT NULL,
+            path TEXT NOT NULL,
+            branch TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            ended_at DATETIME,
+            FOREIGN KEY (task_id) REFERENCES tasks(id),
+            FOREIGN KEY (project_id) REFERENCES projects(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_worktrees_status ON worktrees(status);
+        CREATE INDEX IF NOT EXISTS idx_worktrees_task ON worktrees(task_id);
+        CREATE INDEX IF NOT EXISTS idx_worktrees_project ON worktrees(project_id);
+    """)
+    conn.commit()
+
+
 # Migration registry: version -> (description, function)
 MIGRATIONS = {
     1: ("Baseline schema stamp (v0 -> v1)", migrate_v0_to_v1),
@@ -857,6 +901,7 @@ MIGRATIONS = {
     9: ("Task Flow tables (v8 -> v9)", migrate_v8_to_v9),
     10: ("Paperclip config version tables (v9 -> v10)", migrate_v9_to_v10),
     11: ("Paperclip agent_sessions table (v10 -> v11)", migrate_v10_to_v11),
+    12: ("Worktree isolation tracking (v11 -> v12)", migrate_v11_to_v12),
 }
 
 

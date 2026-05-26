@@ -1,16 +1,17 @@
-"""Unit tests for the worktree-isolation helpers extracted from
-run_parallel_tasks: _create_isolation_worktrees, _merge_task_branch,
-and _cleanup_worktrees.
+"""Unit tests for equipa.worktree_manager — the canonical worktree-isolation
+implementation that replaced the inline helpers in dispatch.py (Phase 1
+convergence, 2026-05-23).
 
-These helpers exist because run_parallel_tasks was a 295-line function
-in which silent ``except Exception: pass`` made worktree-merge data-loss
-(open question #332) impossible to diagnose. The tests here exercise:
-
-1. happy path — helper does its job, prints expected breadcrumbs
-2. error path — helper logs the error explicitly and does NOT swallow it
+Tests exercise:
+  1. create  — worktree + branch + DB row created
+  2. merge_back — commits land on main, no-commits case handled
+  3. destroy — stash-before-remove, branch cleanup
+  4. mark_failed / mark_conflict — DB status transitions
+  5. TaskWorkspace context manager — success and failure paths
 
 Tests use real ``git`` subprocess calls inside ``tmp_path`` repos so the
-helper logic is exercised end-to-end without mocking subprocess.
+worktree logic is exercised end-to-end. A temporary SQLite DB (from
+schema.sql) replaces the production TheForge DB via monkeypatch.
 
 Copyright 2026 Forgeborn
 """
@@ -19,34 +20,32 @@ from __future__ import annotations
 
 import asyncio
 import shutil
+import sqlite3
 import subprocess
 from pathlib import Path
 
 import pytest
 
-from equipa.dispatch import (
-    _cleanup_worktrees as _cleanup_worktrees_async,
-    _create_isolation_worktrees as _create_isolation_worktrees_async,
-    _merge_task_branch as _merge_task_branch_async,
+import equipa.constants as constants
+import equipa.db as db_mod
+from equipa.worktree_manager import (
+    STATUS_ACTIVE,
+    STATUS_ABANDONED,
+    STATUS_CONFLICT,
+    STATUS_FAILED,
+    STATUS_MERGED,
+    TaskWorkspace,
+    WorktreeError,
+    create,
+    destroy,
+    list_active,
+    mark_conflict,
+    mark_failed,
+    merge_back,
+    MergeResult,
 )
 
-
-def _create_isolation_worktrees(tasks, project_dir, base):
-    return asyncio.run(
-        _create_isolation_worktrees_async(tasks, project_dir, base),
-    )
-
-
-def _merge_task_branch(project_dir, task_id, branch_name):
-    return asyncio.run(
-        _merge_task_branch_async(project_dir, task_id, branch_name),
-    )
-
-
-def _cleanup_worktrees(project_dir, worktree_dirs, merged_tasks, base):
-    return asyncio.run(
-        _cleanup_worktrees_async(project_dir, worktree_dirs, merged_tasks, base),
-    )
+REPO_ROOT_REAL = Path(__file__).resolve().parent.parent
 
 
 def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
@@ -72,203 +71,328 @@ def _git_available() -> bool:
 pytestmark = pytest.mark.skipif(not _git_available(), reason="git not available")
 
 
-# --- _create_isolation_worktrees ---
+@pytest.fixture
+def isolated_env(tmp_path, monkeypatch):
+    """Create a temp git repo + temp DB with a project row pointing at it.
 
-
-def test_create_isolation_worktrees_happy_path(tmp_path, capsys):
+    Returns ``(repo_path, db_path, project_id)``.
+    """
+    db_path = tmp_path / "test_theforge.db"
     repo = tmp_path / "repo"
     _init_repo(repo)
-    tasks = [{"id": 1}, {"id": 2}]
-    base = repo / ".forge-worktrees"
 
-    result = _create_isolation_worktrees(tasks, str(repo), base)
+    schema_sql = (REPO_ROOT_REAL / "schema.sql").read_text()
+    conn = sqlite3.connect(db_path)
+    conn.executescript(schema_sql)
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO projects (name, codename, local_path) VALUES (?, ?, ?)",
+        ("IsoTest", "isotest", str(repo.resolve())),
+    )
+    project_id = cur.lastrowid
+    conn.commit()
+    conn.close()
 
-    assert set(result.keys()) == {1, 2}
-    assert (base / "task-1").is_dir()
-    assert (base / "task-2").is_dir()
+    monkeypatch.setattr(constants, "THEFORGE_DB", db_path)
+    monkeypatch.setattr(db_mod, "THEFORGE_DB", db_path)
+
+    return repo, db_path, int(project_id)
+
+
+def _run(coro):
+    """Run an async coroutine synchronously."""
+    return asyncio.run(coro)
+
+
+# --- create ---
+
+
+def test_create_happy_path(isolated_env):
+    repo, db_path, project_id = isolated_env
+
+    record = _run(create(1, str(repo)))
+
+    assert record.task_id == 1
+    assert record.project_id == project_id
+    assert record.status == STATUS_ACTIVE
+    assert record.branch == "forge-task-1"
+    assert Path(record.path).is_dir()
+
     branches = _git(repo, "branch", "--list").stdout
     assert "forge-task-1" in branches
-    assert "forge-task-2" in branches
-    out = capsys.readouterr().out
-    assert "[Isolation] Task #1 -> task-1" in out
-    assert "[Isolation] Task #2 -> task-2" in out
+
+    gitignore = (repo / ".gitignore").read_text()
+    assert "forge_worktrees/" in gitignore
 
 
-def test_create_isolation_worktrees_error_path_logs_warning(tmp_path, capsys):
-    """If git can't create worktrees (bare/invalid repo), the helper
-    must log a WARNING and return without the failed task — never crash
-    or silently swallow the error.
-    """
-    not_a_repo = tmp_path / "not_a_repo"
-    not_a_repo.mkdir()
-    base = not_a_repo / ".forge-worktrees"
+def test_create_duplicate_raises(isolated_env):
+    repo, _, _ = isolated_env
 
-    result = _create_isolation_worktrees([{"id": 99}], str(not_a_repo), base)
-
-    assert 99 not in result
-    out = capsys.readouterr().out
-    assert "WARNING" in out
-    assert "task #99" in out
+    _run(create(2, str(repo)))
+    with pytest.raises(WorktreeError, match="already exists"):
+        _run(create(2, str(repo)))
 
 
-# --- _merge_task_branch ---
+def test_create_orphan_branch_recovery(isolated_env):
+    """If a branch exists from a prior failed run but the worktree path is
+    gone, create() should delete the orphan branch and succeed."""
+    repo, _, _ = isolated_env
+
+    _git(repo, "branch", "forge-task-3")
+
+    record = _run(create(3, str(repo)))
+    assert record.status == STATUS_ACTIVE
+    assert Path(record.path).is_dir()
 
 
-def test_merge_task_branch_happy_path(tmp_path, capsys):
-    repo = tmp_path / "repo"
-    _init_repo(repo)
-    base = repo / ".forge-worktrees"
-    _create_isolation_worktrees([{"id": 7}], str(repo), base)
-    capsys.readouterr()  # clear setup output
+# --- merge_back ---
 
-    wt = base / "task-7"
+
+def test_merge_back_happy_path(isolated_env):
+    repo, _, _ = isolated_env
+    record = _run(create(10, str(repo)))
+
+    wt = Path(record.path)
     (wt / "feature.txt").write_text("hello\n")
     _git(wt, "add", "feature.txt")
     _git(wt, "commit", "-m", "feat: add feature")
 
     pre_head = _git(repo, "rev-parse", "HEAD").stdout.strip()
-    ok = _merge_task_branch(str(repo), 7, "forge-task-7")
+    result = _run(merge_back(10))
     post_head = _git(repo, "rev-parse", "HEAD").stdout.strip()
 
-    assert ok is True
+    assert result.ok is True
     assert pre_head != post_head
-    out = capsys.readouterr().out
-    assert "Merged task #7 into main" in out
+    assert (repo / "feature.txt").exists()
+
+    conn = sqlite3.connect(isolated_env[1])
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT status FROM worktrees WHERE task_id = ?", (10,),
+    ).fetchone()
+    conn.close()
+    assert row["status"] == STATUS_MERGED
 
 
-def test_merge_task_branch_no_commits_returns_false(tmp_path, capsys):
-    """A worktree with zero new commits must be skipped (False) and
-    explicitly logged as 'NO commits ahead' — never silently treated as
-    success.
-    """
-    repo = tmp_path / "repo"
-    _init_repo(repo)
-    base = repo / ".forge-worktrees"
-    _create_isolation_worktrees([{"id": 5}], str(repo), base)
-    capsys.readouterr()
+def test_merge_back_no_commits(isolated_env):
+    """A worktree with zero new commits should report ok=True with a
+    'nothing to merge' message — not a failure."""
+    repo, _, _ = isolated_env
+    _run(create(11, str(repo)))
 
-    ok = _merge_task_branch(str(repo), 5, "forge-task-5")
+    result = _run(merge_back(11))
 
-    assert ok is False
-    out = capsys.readouterr().out
-    assert "NO commits ahead of HEAD" in out
+    assert result.ok is True
+    assert "no commits" in result.message.lower()
 
 
-def test_merge_task_branch_missing_branch_logs_explicitly(tmp_path, capsys):
-    """A nonexistent branch is still a failure that must be logged —
-    not silently swallowed (the bug class behind open question #332).
-    """
-    repo = tmp_path / "repo"
-    _init_repo(repo)
-
-    ok = _merge_task_branch(str(repo), 42, "forge-task-does-not-exist")
-
-    assert ok is False
-    out = capsys.readouterr().out
-    # Either "NO commits" (git log returns empty) or an explicit error log
-    # — what matters is the helper does NOT silently return True.
-    assert "task #42" in out or "forge-task-does-not-exist" in out
+def test_merge_back_no_active_worktree(isolated_env):
+    result = _run(merge_back(999))
+    assert result.ok is False
+    assert "No active worktree" in result.message
 
 
-# --- _cleanup_worktrees ---
+# --- destroy ---
 
 
-def test_cleanup_worktrees_deletes_merged_preserves_unmerged(tmp_path, capsys):
-    repo = tmp_path / "repo"
-    _init_repo(repo)
-    base = repo / ".forge-worktrees"
-    worktree_dirs = _create_isolation_worktrees(
-        [{"id": 10}, {"id": 11}], str(repo), base,
-    )
-    capsys.readouterr()
+def test_destroy_removes_worktree_and_branch(isolated_env):
+    repo, db_path, _ = isolated_env
+    record = _run(create(20, str(repo)))
 
-    # Pretend task 10 merged, task 11 did not.
-    _cleanup_worktrees(str(repo), worktree_dirs, {10}, base)
+    _run(destroy(20))
+
+    assert not Path(record.path).exists()
+    branches = _git(repo, "branch", "--list").stdout
+    assert "forge-task-20" not in branches
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT status FROM worktrees WHERE task_id = ?", (20,),
+    ).fetchone()
+    conn.close()
+    assert row["status"] == STATUS_ABANDONED
+
+
+def test_destroy_keep_branch(isolated_env):
+    repo, _, _ = isolated_env
+    _run(create(21, str(repo)))
+
+    _run(destroy(21, keep_branch=True))
 
     branches = _git(repo, "branch", "--list").stdout
-    assert "forge-task-10" not in branches  # merged → deleted
-    assert "forge-task-11" in branches      # unmerged → preserved
-    out = capsys.readouterr().out
-    assert "Keeping branch 'forge-task-11'" in out
-    assert not (base / "task-10").exists()
-    assert not (base / "task-11").exists()
+    assert "forge-task-21" in branches
 
 
-def test_cleanup_worktrees_stashes_uncommitted_on_unmerged_branch(
-    tmp_path, capsys,
-):
-    """Regression for task #2158 — when an early_terminated agent leaves
-    uncommitted file changes in its worktree, cleanup must stash them on
+def test_destroy_stashes_uncommitted_work(isolated_env):
+    """Regression for task #2158 — when an early-terminated agent leaves
+    uncommitted file changes in its worktree, destroy() must stash them on
     the branch BEFORE ``git worktree remove --force`` discards them.
     """
-    repo = tmp_path / "repo"
-    _init_repo(repo)
-    base = repo / ".forge-worktrees"
-    worktree_dirs = _create_isolation_worktrees(
-        [{"id": 30}], str(repo), base,
-    )
-    wt_path = Path(worktree_dirs[30])
+    repo, _, _ = isolated_env
+    record = _run(create(30, str(repo)))
+    wt = Path(record.path)
 
-    # Simulate 32 turns of edits the agent never got to commit.
-    (wt_path / "modified.py").write_text("print('important work')\n")
-    _git(wt_path, "add", "modified.py")
-    (wt_path / "untracked.txt").write_text("untracked but valuable\n")
+    (wt / "modified.py").write_text("print('important work')\n")
+    _git(wt, "add", "modified.py")
+    (wt / "untracked.txt").write_text("untracked but valuable\n")
 
-    capsys.readouterr()
-    # Empty merged_tasks set → task 30 is unmerged → must stash.
-    _cleanup_worktrees(str(repo), worktree_dirs, set(), base)
+    _run(destroy(30, keep_branch=True))
 
-    out = capsys.readouterr().out
-    assert "stashed uncommitted work" in out
-    assert "task-30" in out
+    assert not wt.exists()
 
-    # Verify the stash actually exists on the preserved branch.
     stash_list = _git(repo, "stash", "list").stdout
     assert "equipa-early-term task-30" in stash_list
 
-    # Branch is preserved even though work is stashed.
     branches = _git(repo, "branch", "--list").stdout
     assert "forge-task-30" in branches
 
 
-def test_cleanup_worktrees_no_stash_when_clean(tmp_path, capsys):
+def test_destroy_no_stash_when_clean(isolated_env):
     """If the worktree has no uncommitted changes, do NOT create an
-    empty stash — keeps the stash list noise-free.
-    """
-    repo = tmp_path / "repo"
-    _init_repo(repo)
-    base = repo / ".forge-worktrees"
-    worktree_dirs = _create_isolation_worktrees(
-        [{"id": 31}], str(repo), base,
-    )
-    capsys.readouterr()
-    _cleanup_worktrees(str(repo), worktree_dirs, set(), base)
+    empty stash."""
+    repo, _, _ = isolated_env
+    _run(create(31, str(repo)))
+
+    _run(destroy(31, keep_branch=True))
 
     stash_list = _git(repo, "stash", "list").stdout
     assert "task-31" not in stash_list
 
 
-def test_cleanup_worktrees_logs_errors_explicitly(tmp_path, capsys):
-    """If git operations fail (e.g. invalid project_dir), the cleanup
-    helper must LOG the error — the original code's
-    ``except Exception: pass`` is exactly the bug we are fixing.
-    """
-    repo = tmp_path / "repo"
-    _init_repo(repo)
-    base = repo / ".forge-worktrees"
-    worktree_dirs = _create_isolation_worktrees(
-        [{"id": 20}], str(repo), base,
-    )
-    capsys.readouterr()
+# --- mark_failed / mark_conflict ---
 
-    # Point cleanup at a nonexistent project_dir → subprocess.run with
-    # cwd=bad_dir raises FileNotFoundError. The helper must catch it and
-    # LOG explicitly (not silently `pass` like the pre-refactor code).
-    bad_dir = str(tmp_path / "definitely-not-a-repo")
-    _cleanup_worktrees(bad_dir, worktree_dirs, set(), base)
 
-    out = capsys.readouterr().out
-    # Helper must produce an explicit "Cleanup error" log line — this is
-    # the exact behavior change vs. the old `except Exception: pass`.
-    assert "Cleanup error for task #20" in out
-    assert "forge-task-20" in out
+def test_mark_failed(isolated_env):
+    repo, db_path, _ = isolated_env
+    record = _run(create(40, str(repo)))
+
+    _run(mark_failed(40))
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT status, ended_at FROM worktrees WHERE task_id = ?", (40,),
+    ).fetchone()
+    conn.close()
+    assert row["status"] == STATUS_FAILED
+    assert row["ended_at"] is not None
+    assert Path(record.path).is_dir()
+
+
+def test_mark_conflict(isolated_env):
+    repo, db_path, _ = isolated_env
+    _run(create(41, str(repo)))
+
+    _run(mark_conflict(41, MergeResult(ok=False, message="test conflict")))
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT status FROM worktrees WHERE task_id = ?", (41,),
+    ).fetchone()
+    conn.close()
+    assert row["status"] == STATUS_CONFLICT
+
+
+# --- list_active ---
+
+
+def test_list_active(isolated_env):
+    repo, _, project_id = isolated_env
+    _run(create(50, str(repo)))
+    _run(create(51, str(repo)))
+    _run(mark_failed(51))
+
+    active = _run(list_active(project_id))
+    assert len(active) == 1
+    assert active[0].task_id == 50
+
+
+# --- TaskWorkspace ---
+
+
+def test_task_workspace_success_merges_and_destroys(isolated_env):
+    repo, db_path, _ = isolated_env
+
+    async def _run_ws():
+        async with TaskWorkspace(60, str(repo), isolate=True) as ws:
+            wt = Path(ws.path)
+            assert wt != repo
+            (wt / "ws_feature.txt").write_text("from workspace\n")
+            _git(wt, "add", "ws_feature.txt")
+            _git(wt, "commit", "-m", "workspace commit")
+            ws.set_success(True)
+
+    _run(_run_ws())
+
+    assert (repo / "ws_feature.txt").exists()
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT status FROM worktrees WHERE task_id = ?", (60,),
+    ).fetchone()
+    conn.close()
+    assert row["status"] == STATUS_MERGED
+
+
+def test_task_workspace_failure_retains_worktree(isolated_env):
+    repo, db_path, _ = isolated_env
+
+    async def _run_ws():
+        async with TaskWorkspace(61, str(repo), isolate=True) as ws:
+            (Path(ws.path) / "wip.txt").write_text("work in progress\n")
+
+    _run(_run_ws())
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT status, path FROM worktrees WHERE task_id = ?", (61,),
+    ).fetchone()
+    conn.close()
+    assert row["status"] == STATUS_FAILED
+    assert Path(row["path"]).is_dir()
+
+
+def test_task_workspace_exception_marks_failed(isolated_env):
+    repo, db_path, _ = isolated_env
+
+    async def _run_ws():
+        async with TaskWorkspace(62, str(repo), isolate=True) as ws:
+            raise RuntimeError("agent crashed")
+
+    with pytest.raises(RuntimeError, match="agent crashed"):
+        _run(_run_ws())
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT status FROM worktrees WHERE task_id = ?", (62,),
+    ).fetchone()
+    conn.close()
+    assert row["status"] == STATUS_FAILED
+
+
+def test_task_workspace_no_isolation(isolated_env):
+    repo, _, _ = isolated_env
+
+    async def _run_ws():
+        async with TaskWorkspace(63, str(repo), isolate=False) as ws:
+            assert ws.path == str(repo)
+
+    _run(_run_ws())
+
+
+def test_task_workspace_non_git_dir_falls_back(tmp_path, isolated_env):
+    """A non-git directory should fall back to non-isolated mode."""
+    not_a_repo = tmp_path / "not_a_repo"
+    not_a_repo.mkdir()
+
+    async def _run_ws():
+        async with TaskWorkspace(64, str(not_a_repo), isolate=True) as ws:
+            assert ws.path == str(not_a_repo)
+            assert ws.isolate is False
+
+    _run(_run_ws())

@@ -30,6 +30,7 @@ from equipa.constants import (
     THEFORGE_DB,
 )
 from equipa.agent_runner import build_cli_command, run_agent_streaming, run_agent_with_retries
+from equipa.worktree_manager import TaskWorkspace
 from equipa.checkpoints import load_checkpoint
 from equipa.db import record_agent_run, update_task_status
 from equipa.dispatch import (
@@ -484,6 +485,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         help=f"Agent role (available: {', '.join(_available_roles)}) (default: developer)")
     parser.add_argument("--retries", type=int, default=DEFAULT_MAX_RETRIES, help=f"Max retry attempts (default: {DEFAULT_MAX_RETRIES})")
     parser.add_argument("--dev-test", action="store_true", help="Enable Dev+Tester iteration loop mode")
+    parser.add_argument("--worktree", action="store_true",
+                        help="Run the task in an isolated git worktree (forge_worktrees/<codename>-task-<id>). "
+                             "Commits land on branch forge-task-<id>; on success, merged back to the project's "
+                             "main branch and the worktree is destroyed. On failure, worktree retained for inspection. "
+                             "Single-task path only; --tasks A,B parallel dispatch already isolates.")
     parser.add_argument("--security-review", action="store_true", default=None,
                         help="Run security review after dev-test passes (default: from dispatch config)")
     parser.add_argument("--provider", choices=["claude", "ollama"], default=None,
@@ -969,130 +975,137 @@ async def run_mode_task(args: argparse.Namespace) -> None:
 
     # --- Execute ---
 
-    if args.dev_test:
-        # Dev+Tester iteration loop (Phase 2) with autoresearch retry
-        print(f"\nStarting Dev+Test loop (max {MAX_DEV_TEST_CYCLES} cycles)...")
+    async with TaskWorkspace(task["id"], project_dir, isolate=getattr(args, "worktree", False)) as ws:
+        project_dir = ws.path  # substitute worktree path when isolation is active
 
-        # Autoresearch config
-        dc = getattr(args, "dispatch_config", None) or {}
-        autoresearch_on = is_feature_enabled(dc, "autoresearch")
-        max_retries = dc.get("autoresearch_max_retries", 3) if autoresearch_on else 0
-        retry_count = 0
-        attempt_reflections: list[str] = []
+        if args.dev_test:
+            # Dev+Tester iteration loop (Phase 2) with autoresearch retry
+            print(f"\nStarting Dev+Test loop (max {MAX_DEV_TEST_CYCLES} cycles)...")
 
-        while True:
-            result, cycles, outcome = await run_dev_test_loop(
-                task, project_dir, project_context, args,
-            )
+            # Autoresearch config
+            dc = getattr(args, "dispatch_config", None) or {}
+            autoresearch_on = is_feature_enabled(dc, "autoresearch")
+            max_retries = dc.get("autoresearch_max_retries", 3) if autoresearch_on else 0
+            retry_count = 0
+            attempt_reflections: list[str] = []
 
-            # Success - break out
-            if outcome in ("tests_passed", "no_tests", "early_completed_no_changes"):
-                break
-
-            # Capture reflection from the failed attempt for cross-attempt memory
-            attempt_reflections.append(
-                _build_dispatch_attempt_reflection(
-                    retry_count + 1, outcome, cycles, result,
+            while True:
+                result, cycles, outcome = await run_dev_test_loop(
+                    task, project_dir, project_context, args,
                 )
-            )
 
-            # Not retriable or exhausted
-            if not autoresearch_on or retry_count >= max_retries:
-                if retry_count > 0:
-                    print(f"  [Autoresearch] Exhausted {retry_count}/{max_retries} retries "
-                          f"for task #{task['id']}. Final outcome: {outcome}")
-                break
+                # Success - break out
+                if outcome in ("tests_passed", "no_tests", "early_completed_no_changes"):
+                    break
 
-            retry_count += 1
-            print(f"  [Autoresearch] Task #{task['id']} failed ({outcome}). "
-                  f"Retry {retry_count}/{max_retries}...")
+                # Capture reflection from the failed attempt for cross-attempt memory
+                attempt_reflections.append(
+                    _build_dispatch_attempt_reflection(
+                        retry_count + 1, outcome, cycles, result,
+                    )
+                )
 
-            # Clean up failed branch and reset task (with reflection memory)
-            await cleanup_failed_attempt(
-                task["id"], project_dir, attempt_reflections,
-            )
+                # Not retriable or exhausted
+                if not autoresearch_on or retry_count >= max_retries:
+                    if retry_count > 0:
+                        print(f"  [Autoresearch] Exhausted {retry_count}/{max_retries} retries "
+                              f"for task #{task['id']}. Final outcome: {outcome}")
+                    break
 
-        # Post-task telemetry (DB update, ForgeSmith recording, quality scoring, reflexion, MemRL)
-        task_role = task.get("role") or "developer"
-        await _post_task_telemetry(
-            task, result, outcome, role=task_role,
-            model=get_role_model(task_role, args, task=task),
-            max_turns=get_role_turns(task_role, args, task=task),
-            cycle_number=cycles,
-            dispatch_config=getattr(args, "dispatch_config", None))
+                retry_count += 1
+                print(f"  [Autoresearch] Task #{task['id']} failed ({outcome}). "
+                      f"Retry {retry_count}/{max_retries}...")
 
-        # Optional security review after successful dev-test
-        # CLI --security-review flag takes precedence, then dispatch config top-level key,
-        # then features.security_review flag (all must agree for review to run)
-        dc = getattr(args, "dispatch_config", None) or {}
-        security_review_enabled = args.security_review
-        if security_review_enabled is None:
-            security_review_enabled = dc.get("security_review", False)
-        # Feature flag can disable even if top-level key is True
-        if not is_feature_enabled(dc, "security_review"):
-            security_review_enabled = False
+                # Clean up failed branch and reset task (with reflection memory)
+                await cleanup_failed_attempt(
+                    task["id"], project_dir, attempt_reflections,
+                )
 
-        if security_review_enabled and outcome in ("tests_passed", "no_tests"):
-            await run_security_review(task, project_dir, project_context, args)
+            # Post-task telemetry (DB update, ForgeSmith recording, quality scoring, reflexion, MemRL)
+            task_role = task.get("role") or "developer"
+            await _post_task_telemetry(
+                task, result, outcome, role=task_role,
+                model=get_role_model(task_role, args, task=task),
+                max_turns=get_role_turns(task_role, args, task=task),
+                cycle_number=cycles,
+                dispatch_config=getattr(args, "dispatch_config", None))
 
-        # Verify the task status in TheForge
-        verified, verify_msg = verify_task_updated(task["id"])
+            ws.set_success(outcome in ("tests_passed", "no_tests", "early_completed_no_changes"))
 
-        # Print loop summary
-        print_dev_test_summary(task, result, cycles, outcome, verified, verify_msg)
+            # Optional security review after successful dev-test
+            # CLI --security-review flag takes precedence, then dispatch config top-level key,
+            # then features.security_review flag (all must agree for review to run)
+            dc = getattr(args, "dispatch_config", None) or {}
+            security_review_enabled = args.security_review
+            if security_review_enabled is None:
+                security_review_enabled = dc.get("security_review", False)
+            # Feature flag can disable even if top-level key is True
+            if not is_feature_enabled(dc, "security_review"):
+                security_review_enabled = False
 
-    else:
-        # Single-agent mode (Phase 1 — with model tiering)
-        use_streaming = args.role not in EARLY_TERM_EXEMPT_ROLES
-        role_turns_max = get_role_turns(args.role, args, task=task)
-        role_model = get_role_model(args.role, args, task=task)
-        # Dynamic budget for single-agent mode
-        role_turns_allocated, _ = calculate_dynamic_budget(role_turns_max)
-        system_prompt = build_system_prompt(
-            task, project_context, project_dir, role=args.role,
-            dispatch_config=getattr(args, "dispatch_config", None),
-            max_turns=role_turns_allocated,
-        )
-        print(f"Dynamic budget: {role_turns_allocated}/{role_turns_max} turns")
-        with build_cli_command(
-            system_prompt, project_dir, role_turns_allocated, role_model, role=args.role,
-            streaming=use_streaming,
-        ) as cmd:
-            print(f"System prompt: {len(system_prompt)} chars, ~{estimate_tokens(system_prompt)} tokens")
+            if security_review_enabled and outcome in ("tests_passed", "no_tests"):
+                await run_security_review(task, project_dir, project_context, args)
 
-            print(f"\nStarting {args.role} agent...")
-            if use_streaming:
-                # Streaming mode with early termination — no retries (kill is intentional)
-                result = await run_agent_streaming(cmd, role=args.role)
-                attempts = 1
-            else:
-                result, attempts = await run_agent_with_retries(cmd, task, args.retries)
+            # Verify the task status in TheForge
+            verified, verify_msg = verify_task_updated(task["id"])
 
-        # Tag result with dynamic budget info for telemetry
-        result["turns_allocated"] = role_turns_allocated
-        result["turns_max"] = role_turns_max
+            # Print loop summary
+            print_dev_test_summary(task, result, cycles, outcome, verified, verify_msg)
 
-        # Determine outcome
-        if result.get("early_terminated"):
-            single_outcome = "early_terminated"
-        elif result["success"]:
-            single_outcome = "tests_passed"
         else:
-            single_outcome = "developer_failed"
+            # Single-agent mode (Phase 1 — with model tiering)
+            use_streaming = args.role not in EARLY_TERM_EXEMPT_ROLES
+            role_turns_max = get_role_turns(args.role, args, task=task)
+            role_model = get_role_model(args.role, args, task=task)
+            # Dynamic budget for single-agent mode
+            role_turns_allocated, _ = calculate_dynamic_budget(role_turns_max)
+            system_prompt = build_system_prompt(
+                task, project_context, project_dir, role=args.role,
+                dispatch_config=getattr(args, "dispatch_config", None),
+                max_turns=role_turns_allocated,
+            )
+            print(f"Dynamic budget: {role_turns_allocated}/{role_turns_max} turns")
+            with build_cli_command(
+                system_prompt, project_dir, role_turns_allocated, role_model, role=args.role,
+                streaming=use_streaming,
+            ) as cmd:
+                print(f"System prompt: {len(system_prompt)} chars, ~{estimate_tokens(system_prompt)} tokens")
 
-        # Post-task telemetry
-        await _post_task_telemetry(
-            task, result, single_outcome, role=args.role,
-            model=role_model, max_turns=role_turns_max,
-            dispatch_config=getattr(args, "dispatch_config", None))
+                print(f"\nStarting {args.role} agent...")
+                if use_streaming:
+                    # Streaming mode with early termination — no retries (kill is intentional)
+                    result = await run_agent_streaming(cmd, role=args.role)
+                    attempts = 1
+                else:
+                    result, attempts = await run_agent_with_retries(cmd, task, args.retries)
 
-        # Verify the task status in TheForge
-        verified, verify_msg = verify_task_updated(task["id"])
+            # Tag result with dynamic budget info for telemetry
+            result["turns_allocated"] = role_turns_allocated
+            result["turns_max"] = role_turns_max
 
-        # Print summary
-        print_summary(task, result, verified, verify_msg)
-        if attempts > 1:
-            print(f"  Attempts: {attempts}/{args.retries}")
+            # Determine outcome
+            if result.get("early_terminated"):
+                single_outcome = "early_terminated"
+            elif result["success"]:
+                single_outcome = "tests_passed"
+            else:
+                single_outcome = "developer_failed"
+
+            ws.set_success(single_outcome == "tests_passed")
+
+            # Post-task telemetry
+            await _post_task_telemetry(
+                task, result, single_outcome, role=args.role,
+                model=role_model, max_turns=role_turns_max,
+                dispatch_config=getattr(args, "dispatch_config", None))
+
+            # Verify the task status in TheForge
+            verified, verify_msg = verify_task_updated(task["id"])
+
+            # Print summary
+            print_summary(task, result, verified, verify_msg)
+            if attempts > 1:
+                print(f"  Attempts: {attempts}/{args.retries}")
 
 
 # --- Mode Dispatcher ---
