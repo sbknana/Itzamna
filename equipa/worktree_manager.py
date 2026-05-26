@@ -1,20 +1,22 @@
 """EQUIPA worktree manager: git-worktree-isolated agent dispatch.
 
-Phase 1: primitives + single-task opt-in mode. Each isolated task gets:
+Each isolated task gets:
   - Its own git worktree at <project_dir>/forge_worktrees/<codename>-task-<id>/
   - A dedicated branch forge-task-<id>
   - On success-flagged exit: fast-forward merge back to the project's HEAD
     branch, worktree destroyed, branch deleted.
   - On failure or unexpected exception: worktree retained for inspection.
 
-Parallel concerns (real merge-lock semantics for concurrent writers,
---tasks A,B integration) are Phase 2 — see planning/worktree-isolation.md.
+Phase 1: primitives + single-task opt-in mode (--worktree).
+Phase 2: per-project merge lock for cross-process serialization.
+Phase 3: --cleanup-worktrees batch cleanup of failed/abandoned worktrees.
 
 Copyright 2026 Forgeborn
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import shutil
 from contextlib import asynccontextmanager
@@ -22,6 +24,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import AsyncIterator, Optional
+
+from filelock import FileLock, Timeout as FileLockTimeout
 
 from equipa.db import db_conn
 from equipa.git_ops import git_run_async
@@ -35,6 +39,8 @@ STATUS_MERGED = "merged"
 STATUS_FAILED = "failed"
 STATUS_CONFLICT = "conflict"
 STATUS_ABANDONED = "abandoned"
+
+MERGE_LOCK_TIMEOUT_SECONDS = 300
 
 
 @dataclass
@@ -61,6 +67,12 @@ class WorktreeError(RuntimeError):
 
 
 # --- Helpers ---
+
+def _merge_lock_path(project_dir: str) -> Path:
+    """Per-project merge lock file. Lives in forge_worktrees/ (already gitignored)."""
+    lock_dir = Path(project_dir) / "forge_worktrees"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    return lock_dir / ".merge.lock"
 
 async def _stash_uncommitted(
     worktree_path: str,
@@ -336,7 +348,10 @@ async def destroy(task_id: int, keep_branch: bool = False) -> None:
 async def merge_back(task_id: int) -> MergeResult:
     """Merge the task's worktree branch back into the project's main branch.
 
-    Strategy (ported from dispatch.py._merge_task_branch with refinements):
+    Acquires a per-project file lock so concurrent merges (from parallel
+    dispatch or multiple CLI invocations) are serialized.
+
+    Strategy:
       1. Determine the project's current branch; fall back to main/master if
          the project is on a detached HEAD.
       2. Check the worktree branch is actually ahead of the project's HEAD.
@@ -347,10 +362,6 @@ async def merge_back(task_id: int) -> MergeResult:
          creates a merge commit when not. Returns ok if HEAD advances.
       5. If the merge fails (conflict), abort, try rebase-then-merge as a
          recovery path, fall back to ok=False with the branch preserved.
-
-    Phase 1 assumes single writer per project. Phase 2 will add a per-project
-    file lock around this function to serialize concurrent merges from
-    parallel dispatch.
     """
     with db_conn() as conn:
         row = conn.execute(
@@ -368,6 +379,38 @@ async def merge_back(task_id: int) -> MergeResult:
 
     project_dir = str(Path(worktree_path).parent.parent)
 
+    # Non-blocking acquire with async polling — acquire and release both run
+    # in the event loop thread (Windows msvcrt.locking requires same-thread
+    # lock/unlock on the same fd).
+    lock = FileLock(_merge_lock_path(project_dir), timeout=0)
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + MERGE_LOCK_TIMEOUT_SECONDS
+    while True:
+        try:
+            lock.acquire()
+            break
+        except FileLockTimeout:
+            if loop.time() >= deadline:
+                return MergeResult(
+                    ok=False,
+                    message=(
+                        f"Could not acquire merge lock for {project_dir} "
+                        f"within {MERGE_LOCK_TIMEOUT_SECONDS}s"
+                    ),
+                    branch=branch,
+                )
+            await asyncio.sleep(0.1)
+
+    try:
+        return await _merge_back_locked(task_id, project_dir, branch)
+    finally:
+        lock.release()
+
+
+async def _merge_back_locked(
+    task_id: int, project_dir: str, branch: str,
+) -> MergeResult:
+    """Inner merge logic, called with the per-project lock held."""
     # Step 1: resolve project's current branch, falling back to main/master.
     current = await git_run_async(["branch", "--show-current"], cwd=project_dir)
     main_branch = current.stdout.strip()
@@ -562,6 +605,106 @@ async def list_active(project_id: Optional[int] = None) -> list[WorktreeRecord]:
         )
         for r in rows
     ]
+
+
+# --- Cleanup (Phase 3) ---
+
+def list_stale(project_id: Optional[int] = None) -> list[WorktreeRecord]:
+    """List worktrees in terminal statuses (failed/conflict/abandoned)."""
+    sql = (
+        "SELECT id, task_id, project_id, path, branch, status, created_at, ended_at "
+        "FROM worktrees WHERE status IN (?, ?, ?)"
+    )
+    params: list = [STATUS_FAILED, STATUS_CONFLICT, STATUS_ABANDONED]
+    if project_id is not None:
+        sql += " AND project_id = ?"
+        params.append(project_id)
+    sql += " ORDER BY created_at ASC"
+
+    with db_conn() as conn:
+        rows = conn.execute(sql, params).fetchall()
+
+    return [
+        WorktreeRecord(
+            id=r["id"], task_id=r["task_id"], project_id=r["project_id"],
+            path=r["path"], branch=r["branch"], status=r["status"],
+            created_at=r["created_at"], ended_at=r["ended_at"],
+        )
+        for r in rows
+    ]
+
+
+async def cleanup_stale_worktree(record: WorktreeRecord) -> tuple[bool, str]:
+    """Clean up a single stale worktree: stash, remove directory, delete branch.
+
+    Returns (success, message).
+    """
+    project_dir = str(Path(record.path).parent.parent)
+
+    if Path(record.path).exists():
+        await _stash_uncommitted(record.path, record.task_id, record.branch)
+
+        r = await git_run_async(
+            ["worktree", "remove", "--force", record.path],
+            cwd=project_dir,
+        )
+        if r.returncode != 0:
+            try:
+                shutil.rmtree(record.path, ignore_errors=True)
+                await git_run_async(["worktree", "prune"], cwd=project_dir)
+            except Exception as e:
+                return False, f"Could not remove worktree directory: {e}"
+
+    r = await git_run_async(["branch", "-D", record.branch], cwd=project_dir)
+    if r.returncode != 0 and "not found" not in r.stderr.lower():
+        logger.warning(
+            "[worktree] cleanup: branch delete failed for %s: %s",
+            record.branch, r.stderr.strip(),
+        )
+
+    if record.status != STATUS_ABANDONED:
+        with db_conn(write=True) as conn:
+            conn.execute(
+                "UPDATE worktrees SET status = ?, ended_at = ? WHERE id = ?",
+                (STATUS_ABANDONED, _utcnow_iso(), record.id),
+            )
+
+    return True, (
+        f"Cleaned up task #{record.task_id} ({record.status}) "
+        f"at {Path(record.path).name}"
+    )
+
+
+async def cleanup_all_stale(
+    project_id: Optional[int] = None,
+    dry_run: bool = False,
+) -> list[tuple[WorktreeRecord, bool, str]]:
+    """Batch cleanup of all stale worktrees. Returns (record, success, message) tuples."""
+    stale = list_stale(project_id)
+    results: list[tuple[WorktreeRecord, bool, str]] = []
+
+    for record in stale:
+        disk_exists = Path(record.path).exists()
+        if dry_run:
+            status_label = "EXISTS" if disk_exists else "MISSING"
+            results.append((
+                record, True,
+                f"[DRY RUN] Would clean up task #{record.task_id} "
+                f"({record.status}, disk={status_label}) branch={record.branch}",
+            ))
+        elif not disk_exists:
+            if record.status != STATUS_ABANDONED:
+                with db_conn(write=True) as conn:
+                    conn.execute(
+                        "UPDATE worktrees SET status = ?, ended_at = ? WHERE id = ?",
+                        (STATUS_ABANDONED, _utcnow_iso(), record.id),
+                    )
+            results.append((record, True, "Already removed from disk; DB updated"))
+        else:
+            success, msg = await cleanup_stale_worktree(record)
+            results.append((record, success, msg))
+
+    return results
 
 
 # --- Context manager ---

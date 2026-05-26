@@ -456,6 +456,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         help="Regenerate skill_manifest.json with SHA-256 hashes of all prompt/skill files")
     group.add_argument("--mcp-server", action="store_true",
                         help="Run as MCP server (JSON-RPC over stdio)")
+    group.add_argument("--cleanup-worktrees", action="store_true",
+                        help="Batch cleanup failed/abandoned worktrees. "
+                             "Stashes uncommitted work, removes directories, deletes branches. "
+                             "Use --dry-run to preview. Use --only-project to scope.")
     group.add_argument("--config-cmd", choices=["snapshot", "list", "diff", "rollback"],
                         metavar="VERB",
                         help="Config-versioning subcommand: snapshot|list|diff|rollback")
@@ -648,6 +652,45 @@ async def run_mode_config(args: argparse.Namespace) -> None:
 
     print(f"ERROR: unknown config verb: {verb}")
     sys.exit(1)
+
+
+async def run_mode_cleanup_worktrees(args: argparse.Namespace) -> None:
+    """Batch cleanup of failed/abandoned worktrees."""
+    from equipa.worktree_manager import cleanup_all_stale, list_stale
+
+    project_id = args.only_project[0] if args.only_project else None
+
+    stale = list_stale(project_id)
+    if not stale:
+        print("No stale worktrees found.")
+        return
+
+    print(f"\nStale worktrees ({len(stale)} found):")
+    print(f"{'Task':>6}  {'Status':<10}  {'Branch':<25}  {'Created':<20}  {'Disk':<5}  Path")
+    print("-" * 100)
+    for r in stale:
+        disk = "YES" if Path(r.path).exists() else "no"
+        created = r.created_at[:19] if r.created_at else "?"
+        print(f"#{r.task_id:>5}  {r.status:<10}  {r.branch:<25}  {created:<20}  {disk:<5}  {r.path}")
+
+    if args.dry_run:
+        print(f"\n[DRY RUN] Would clean up {len(stale)} worktree(s). No changes made.")
+        return
+
+    if not args.yes:
+        response = input(f"\nClean up {len(stale)} worktree(s)? (y/n): ").strip().lower()
+        if response != "y":
+            print("Aborted.")
+            return
+
+    results = await cleanup_all_stale(project_id)
+
+    successes = sum(1 for _, ok, _ in results if ok)
+    failures = len(results) - successes
+    for _, ok, msg in results:
+        status = "OK" if ok else "FAIL"
+        print(f"  [{status}] {msg}")
+    print(f"\nCleanup complete: {successes} cleaned, {failures} failed")
 
 
 async def run_mode_regenerate_manifest(args: argparse.Namespace) -> None:
@@ -1135,6 +1178,8 @@ def _select_mode_handler(args: argparse.Namespace) -> "callable":
     """
     if args.mcp_server:
         return run_mode_mcp_server
+    if getattr(args, "cleanup_worktrees", False):
+        return run_mode_cleanup_worktrees
     if getattr(args, "config_cmd", None):
         return run_mode_config
     if args.regenerate_manifest:
