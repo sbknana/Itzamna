@@ -156,12 +156,17 @@ def _looks_like_repo_path(candidate: str) -> bool:
 def _resolve(repo_root: Path, doc_file: Path, raw: str) -> Path:
     """Resolve ``raw`` to an absolute path under ``repo_root``."""
 
-    candidate = raw.strip().lstrip("./")
+    candidate = raw.strip()
     # Strip URL fragments and query strings.
     candidate = candidate.split("#", 1)[0].split("?", 1)[0]
+    # Strip a single leading "./" but never the leading "../" that
+    # could legitimately appear in relative links from docs/*.md.
+    if candidate.startswith("./"):
+        candidate = candidate[2:]
 
-    if raw.startswith("/"):
-        return (repo_root / candidate).resolve()
+    if candidate.startswith("/"):
+        # Absolute-looking paths resolve against the repo root.
+        return (repo_root / candidate.lstrip("/")).resolve()
     return (doc_file.parent / candidate).resolve()
 
 
