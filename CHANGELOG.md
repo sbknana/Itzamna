@@ -2,6 +2,34 @@
 
 All notable changes to EQUIPA are documented here.
 
+## [Unreleased]
+
+### Changed
+
+- **Review-agent output path** (task #2476) — security-reviewer,
+  code-reviewer, and other review-style agents now write their output
+  artifacts to `.equipa-artifacts/<TYPE>-<TASK_ID>.md` (e.g.
+  `.equipa-artifacts/SECURITY-REVIEW-1234.md`) in the target repo
+  instead of dumping `SECURITY-REVIEW-1234.md` / `CODE-REVIEW-1234.md`
+  at the repo root. The orchestrator pre-creates the
+  `.equipa-artifacts/` directory before each review-style dispatch
+  (`equipa.loops.ensure_artifacts_dir`). The merge gate
+  (`equipa.dispatch._security_review_blocks_merge` and
+  `equipa.dispatch._merge_task_branch`) reads the new location first,
+  with a legacy-path fallback (`equipa.loops.find_review_artifact`) so
+  in-flight artifacts from older agents still parse during the
+  transition. The "EQUIPA agents MUST save output files" lesson
+  remains in force — only the destination changed.
+
+  Why: the repo-root pollution had been bleeding into every project
+  EQUIPA touched (companion cleanup task moved historical strays). The
+  prompt templates (`prompts/security-reviewer.md`,
+  `prompts/code-reviewer.md`, `standing_orders/security-reviewer.md`)
+  and the agent prompt builders (`run_security_review`,
+  `run_code_review` in `equipa/loops.py`) have all been updated; a
+  regression test (`tests/test_review_artifact_paths.py`, 18 cases)
+  asserts the contract end-to-end and guards against future drift.
+
 ## [3.1.0] - 2026-03-05
 
 ### Added

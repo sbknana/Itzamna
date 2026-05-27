@@ -281,7 +281,8 @@ def test_missing_review_file_writes_fallback_dump(tmp_path: Path) -> None:
         tmp_path,
         result_text=raw_text,
     )
-    review_path = tmp_path / "SECURITY-REVIEW-4246.md"
+    # Task 2476: fallback dumps now land under .equipa-artifacts/.
+    review_path = tmp_path / ".equipa-artifacts" / "SECURITY-REVIEW-4246.md"
     assert review_path.exists(), (
         f"expected orchestrator to write fallback file {review_path}; "
         f"log lines: {lines}"
@@ -382,9 +383,18 @@ def test_security_review_prompt_uses_task_scoped_filename() -> None:
     assert "SECURITY-REVIEW-2412.md" in desc, (
         f"expected task-scoped filename in prompt; got: {desc!r}"
     )
+    # Task 2476: the prompt must point at .equipa-artifacts/, NOT repo root.
+    assert ".equipa-artifacts/SECURITY-REVIEW-2412.md" in desc, (
+        f"expected .equipa-artifacts/ path in prompt; got: {desc!r}"
+    )
     # The bug-2412 mistake (generic filename) MUST not be the only instruction.
-    # The exact-filename language must appear.
-    assert "EXACT filename" in desc or "exact filename" in desc
+    # The exact-path language must appear.
+    assert (
+        "EXACT path" in desc
+        or "exact path" in desc
+        or "EXACT filename" in desc
+        or "exact filename" in desc
+    )
 
 
 def test_zero_findings_reports_zero(tmp_path: Path) -> None:

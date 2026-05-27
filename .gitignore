@@ -60,6 +60,11 @@ SECURITY-AUDIT-REPORT.md
 # Security review reports (project-specific, contain vulnerability details)
 SECURITY-REVIEW-*.md
 
+# Task 2476: review-agent output artifacts (SECURITY-REVIEW, CODE-REVIEW,
+# PLAN, RETRY-IMPLEMENTATION, etc.) now live under .equipa-artifacts/ in
+# each target repo. Ignore the whole directory wherever it appears.
+.equipa-artifacts/
+
 # Autoresearch backups (prompt mutation history)
 .autoresearch-backups/
 
