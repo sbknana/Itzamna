@@ -11,7 +11,7 @@
 > **Task:** Security review of the authentication module
 >
 > - Turn 1: Run semgrep + structural greps in parallel
-> - Turn 2: Create SECURITY-REVIEW-{task_id}.md (this EXACT filename, substituting your assigned task id) with initial findings from scans
+> - Turn 2: Create .equipa-artifacts/SECURITY-REVIEW-{task_id}.md (this EXACT filename, substituting your assigned task id) with initial findings from scans
 > - Turn 3-4: Read 3 high-risk files (auth, session, middleware), add findings
 > - Turn 5-6: Read payment/input handlers, add findings
 > - Turn 7-8: Check dependencies, finalize report with severity ratings
@@ -80,9 +80,9 @@ In parallel, run structural greps:
 
 If semgrep ran, read `/tmp/semgrep-results.json` and extract findings. Combine with grep results.
 
-**CREATE `SECURITY-REVIEW-{task_id}.md` — this must be a complete, submittable report even if you stop here.**
+**CREATE `.equipa-artifacts/SECURITY-REVIEW-{task_id}.md` — this must be a complete, submittable report even if you stop here.**
 
-Substitute `{task_id}` with the integer task id from the "## Assigned Task" block in your prompt (e.g. for Task ID 2412 the filename is `SECURITY-REVIEW-2412.md`). Write it in the project ROOT directory. Do NOT write to a generic `SECURITY-REVIEW.md`, a `reviews/` subdirectory, or any other filename — the orchestrator reads counts ONLY from this exact path, and any other name causes findings to be logged as "artifact missing" and dropped.
+Substitute `{task_id}` with the integer task id from the "## Assigned Task" block in your prompt (e.g. for Task ID 2412 the path is `.equipa-artifacts/SECURITY-REVIEW-2412.md`). The `.equipa-artifacts/` directory has been pre-created at the project root by the orchestrator; write the file there. Do NOT write to a generic `SECURITY-REVIEW.md`, do NOT write at the repo root, do NOT use a `reviews/` subdirectory, and do NOT change the filename in any other way — the orchestrator reads counts ONLY from this exact path, and any other location causes findings to be logged as "artifact missing" and dropped.
 
 ---
 
@@ -127,7 +127,7 @@ If the project has custom semgrep rules in `.semgrep/` or `semgrep-rules/`, incl
 
 ### REPORT FORMAT
 
-Write to `SECURITY-REVIEW-{task_id}.md` in the project root (this EXACT filename, with `{task_id}` replaced by the integer task id from the "## Assigned Task" block):
+Write to `.equipa-artifacts/SECURITY-REVIEW-{task_id}.md` (this EXACT path, relative to the project root; substitute `{task_id}` with the integer task id from the "## Assigned Task" block):
 
 ```markdown
 # Security Review: [Project Name]

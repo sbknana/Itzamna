@@ -54,6 +54,9 @@ from equipa.git_ops import _is_git_repo, git_run_async
 from equipa.lessons import update_injected_episode_q_values_for_task
 from equipa.loops import (
     _count_findings_in_review_file,
+    ensure_artifacts_dir,
+    find_review_artifact,
+    review_artifact_path,
     run_dev_test_loop,
     run_quality_scoring,
     run_security_review,
@@ -1272,7 +1275,12 @@ async def _merge_task_branch(
     Uses ``git_run_async`` so the 6-12 git invocations per merge do not
     block the event loop.
     """
-    review_path = Path(os.fspath(project_dir)) / f"SECURITY-REVIEW-{task_id}.md"
+    # Task 2476: artifacts now live under .equipa-artifacts/. Tolerate
+    # legacy repo-root artifacts via find_review_artifact for in-flight
+    # runs still on the old layout.
+    review_path = find_review_artifact(
+        os.fspath(project_dir), "SECURITY-REVIEW", task_id,
+    )
     if not expect_artifact:
         _gate_audit_log(
             f"task={task_id} event=defensive-invariant-skipped "
@@ -1539,7 +1547,9 @@ def _security_review_blocks_merge(
     Operators who need the legacy fail-open behaviour can disable the
     ``security_review_block_on_missing_artifact`` feature flag.
     """
-    review_path = Path(project_dir) / f"SECURITY-REVIEW-{task_id}.md"
+    # Task 2476: read from .equipa-artifacts/ first, then fall back to
+    # the legacy repo-root path so in-flight artifacts still parse.
+    review_path = find_review_artifact(project_dir, "SECURITY-REVIEW", task_id)
     counts = _count_findings_in_review_file(review_path)
     _gate_audit_log(
         f"task={task_id} event=blocks-merge-eval "

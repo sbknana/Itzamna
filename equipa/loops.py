@@ -95,6 +95,66 @@ from equipa import sessions
 from equipa.tasks import _get_task_status, get_task_complexity
 
 
+# Task 2476: review-agent output artifacts (SECURITY-REVIEW-{id}.md,
+# CODE-REVIEW-{id}.md, PLAN-{id}.md, RETRY-IMPLEMENTATION-{id}.md, etc.)
+# are written under this subdirectory of the target repo, NOT at repo
+# root. Keeping them out of the repo root avoids polluting every
+# downstream project EQUIPA runs against. The directory is created
+# (idempotently) by the orchestrator before each review-style agent runs.
+ARTIFACTS_DIR_NAME = ".equipa-artifacts"
+
+
+def ensure_artifacts_dir(project_dir: str | Path) -> Path:
+    """Create ``.equipa-artifacts/`` in ``project_dir`` if missing.
+
+    Idempotent. Returns the resolved directory path. Called by the
+    orchestrator before dispatching any review-style agent so the agent
+    can always write its artifact there.
+    """
+    artifacts = Path(project_dir) / ARTIFACTS_DIR_NAME
+    artifacts.mkdir(parents=True, exist_ok=True)
+    return artifacts
+
+
+def review_artifact_relpath(kind: str, task_id: int | str) -> str:
+    """Return the repo-relative path string for a review artifact.
+
+    Format: ``.equipa-artifacts/<KIND>-<TASK_ID>.md`` (forward slashes,
+    suitable for embedding directly into agent prompt instructions).
+    """
+    return f"{ARTIFACTS_DIR_NAME}/{kind}-{task_id}.md"
+
+
+def review_artifact_path(
+    project_dir: str | Path, kind: str, task_id: int | str,
+) -> Path:
+    """Return the absolute path for a review artifact under ``project_dir``."""
+    return Path(project_dir) / ARTIFACTS_DIR_NAME / f"{kind}-{task_id}.md"
+
+
+def find_review_artifact(
+    project_dir: str | Path, kind: str, task_id: int | str,
+) -> Path:
+    """Locate an existing review artifact, preferring the new artifacts dir.
+
+    Returns the path under ``.equipa-artifacts/`` if it exists, else the
+    legacy repo-root path. Callers that READ artifacts use this helper so
+    that the orchestrator stays compatible with in-flight runs and
+    pre-existing artifacts written before the path change (task 2476).
+    The returned path is always returned — the caller is expected to
+    check ``.exists()`` itself (the dispatch fail-closed gate relies on
+    .exists()==False semantics to trigger the fallback dump).
+    """
+    new_path = review_artifact_path(project_dir, kind, task_id)
+    if new_path.is_file():
+        return new_path
+    legacy = Path(project_dir) / f"{kind}-{task_id}.md"
+    if legacy.is_file():
+        return legacy
+    # Default to the new path so writes go to the right place.
+    return new_path
+
+
 def run_quality_scoring(
     task: dict[str, Any] | int,
     result: dict[str, Any] | str,
@@ -187,7 +247,10 @@ async def run_security_review(
     # frequently logged as "artifact missing" and discarded.
     security_task = dict(task)  # copy
     task_id = task.get("id")
-    review_filename = f"SECURITY-REVIEW-{task_id}.md"
+    # Task 2476: write under .equipa-artifacts/ to avoid polluting the
+    # downstream repo root. Ensure the dir exists before the agent runs.
+    ensure_artifacts_dir(project_dir)
+    review_filename = review_artifact_relpath("SECURITY-REVIEW", task_id)
     security_task["description"] = (
         f"Security review of code written for: {task['title']}. "
         f"Review ALL files changed in the project directory. "
@@ -196,10 +259,12 @@ async def run_security_review(
         f"fix-review, semgrep-rule-creator, and sharp-edges. "
         f"Check for OWASP Top 10 vulnerabilities, zero-day risks in dependencies, "
         f"and any security anti-patterns. "
-        f"Write your findings to a file named {review_filename} in the "
-        f"project root directory (this EXACT filename — not SECURITY-REVIEW.md, "
-        f"not a generic name). The orchestrator reads counts from this exact "
+        f"Write your findings to a file named {review_filename} (relative to "
+        f"the project root — this EXACT path, including the "
+        f"`.equipa-artifacts/` prefix; not a generic SECURITY-REVIEW.md, not "
+        f"the project root). The orchestrator reads counts from this exact "
         f"path; if you write a different filename the findings will be lost. "
+        f"The `.equipa-artifacts/` directory has been pre-created for you. "
         f"Rate each finding: CRITICAL, HIGH, MEDIUM, LOW, INFO. "
         # Task #2451 Phase I-b (F-02): MANDATE a final Counts footer so the
         # orchestrator gate can read finding counts from a tamper-evident
@@ -244,13 +309,22 @@ async def run_security_review(
         # reasoning ("[S1] LOW — this is NOT a CRITICAL because…") so substring
         # counts on CRITICAL / HIGH double-count rejected findings, severity
         # mentions in prose, and so on (see task 2315 root-cause analysis).
-        review_path = Path(project_dir) / f"SECURITY-REVIEW-{task_id}.md"
+        # Task 2476: prefer the new .equipa-artifacts/ location, fall back
+        # to the legacy repo-root path so in-flight artifacts still parse.
+        review_path = find_review_artifact(
+            project_dir, "SECURITY-REVIEW", task_id,
+        )
         counts = _count_findings_in_review_file(review_path)
         if counts is None:
             log(
                 f"  WARNING: security-review artifact missing — expected "
-                f"{review_path.name} in project root (agent did not save it)",
+                f"{ARTIFACTS_DIR_NAME}/{review_path.name} (agent did not save it)",
                 output,
+            )
+            # Re-target fallback writes at the new artifacts location so the
+            # dump lands next to where future agents will look.
+            review_path = review_artifact_path(
+                project_dir, "SECURITY-REVIEW", task_id,
             )
             # Robustness fallback (task 2412): preserve the agent's raw output
             # on disk so operators can recover findings even when the reviewer
@@ -333,9 +407,12 @@ def _persist_security_review_artifact(
     """
     if not task_id:
         return
+    # Task 2476: persist under .equipa-artifacts/, but tolerate legacy
+    # repo-root artifacts written by older agents during the transition.
     filename = f"SECURITY-REVIEW-{task_id}.md"
-    src = Path(worktree_dir) / filename
-    dst = Path(stable_dir) / filename
+    src = find_review_artifact(worktree_dir, "SECURITY-REVIEW", task_id)
+    dst = review_artifact_path(stable_dir, "SECURITY-REVIEW", task_id)
+    ensure_artifacts_dir(stable_dir)
 
     try:
         if src.is_file():
@@ -635,6 +712,10 @@ async def run_code_review(
 
     # Build code review task description — emphasizes craftsmanship, not vulnerabilities
     review_task = dict(task)  # copy
+    # Task 2476: write under .equipa-artifacts/ to avoid repo-root pollution.
+    ensure_artifacts_dir(project_dir)
+    cr_task_id = task.get("id")
+    cr_filename = review_artifact_relpath("CODE-REVIEW", cr_task_id)
     review_task["description"] = (
         f"Code review of changes made for: {task['title']}. "
         f"Review ALL files changed in the project directory. "
@@ -643,7 +724,9 @@ async def run_code_review(
         f"existing patterns, clean boundaries), performance (no N+1, no unbounded "
         f"loops, proper indexes), and security (basic input validation, no obvious "
         f"injection — defer deep security review to the security-reviewer). "
-        f"Write findings to a CODE-REVIEW.md file in the project directory. "
+        f"Write findings to {cr_filename} (relative to the project root — this "
+        f"EXACT path, NOT the repo root, NOT a generic CODE-REVIEW.md). The "
+        f"`.equipa-artifacts/` directory has been pre-created for you. "
         f"Rate each finding: Critical, Important, or Suggestion. "
         f"Original task description: {task['description']}"
     )

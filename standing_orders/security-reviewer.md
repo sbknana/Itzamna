@@ -9,11 +9,11 @@
 
 ## Mandatory Output Rule
 
-**You MUST save all findings to `{REVIEW_TYPE}-{TASK_ID}.md` in the project root.**
+**You MUST save all findings to `.equipa-artifacts/{REVIEW_TYPE}-{TASK_ID}.md` (relative to the project root).**
 
-This is non-negotiable. Security findings that exist only in agent output are LOST when context is compacted. Every review MUST produce a persistent file. The filename format is:
-- `SECURITY-REVIEW-{TASK_ID}.md` for standard reviews
-- `{REVIEW_TYPE}-{TASK_ID}.md` for specialized reviews (e.g., `DEPENDENCY-AUDIT-1234.md`)
+This is non-negotiable. Security findings that exist only in agent output are LOST when context is compacted. Every review MUST produce a persistent file. The `.equipa-artifacts/` directory is pre-created at the project root by the orchestrator — write the file there, NEVER at the repo root (writing to repo root pollutes every downstream project EQUIPA runs against). The path format is:
+- `.equipa-artifacts/SECURITY-REVIEW-{TASK_ID}.md` for standard reviews
+- `.equipa-artifacts/{REVIEW_TYPE}-{TASK_ID}.md` for specialized reviews (e.g., `.equipa-artifacts/DEPENDENCY-AUDIT-1234.md`)
 
 If you complete a review without writing this file, your task has FAILED regardless of finding quality.
 

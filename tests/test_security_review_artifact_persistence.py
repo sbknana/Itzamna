@@ -28,10 +28,16 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from equipa.loops import (
+    ARTIFACTS_DIR_NAME,
     SECURITY_REVIEW_FALLBACK_MARKER,
     _persist_security_review_artifact,
     run_security_review,
 )
+
+
+def _stable_artifact(stable: Path, task_id: int) -> Path:
+    """Per task 2476, persisted artifacts live under .equipa-artifacts/."""
+    return stable / ARTIFACTS_DIR_NAME / f"SECURITY-REVIEW-{task_id}.md"
 
 
 # ---------------------------------------------------------------------------
@@ -67,11 +73,13 @@ def test_persist_copies_structured_artifact_from_worktree(tmp_path):
         agent_succeeded=True,
     )
 
-    dst = stable / "SECURITY-REVIEW-2447.md"
+    dst = _stable_artifact(stable, 2447)
     assert dst.is_file()
     assert dst.read_text(encoding="utf-8") == src.read_text(encoding="utf-8")
     # Must NOT be a fallback dump — it is the agent's real artifact.
     assert SECURITY_REVIEW_FALLBACK_MARKER not in dst.read_text(encoding="utf-8")
+    # Task 2476: artifact must NOT appear at the legacy repo-root path.
+    assert not (stable / "SECURITY-REVIEW-2447.md").exists()
 
 
 def test_persist_synthesizes_fallback_when_agent_wrote_nothing(tmp_path):
@@ -93,7 +101,7 @@ def test_persist_synthesizes_fallback_when_agent_wrote_nothing(tmp_path):
         agent_succeeded=True,
     )
 
-    dst = stable / "SECURITY-REVIEW-2447.md"
+    dst = _stable_artifact(stable, 2447)
     assert dst.is_file(), "fallback must be written at stable path"
     body = dst.read_text(encoding="utf-8")
     assert SECURITY_REVIEW_FALLBACK_MARKER in body
@@ -110,7 +118,8 @@ def test_persist_does_not_clobber_existing_structured_artifact(tmp_path):
     stable = tmp_path / "stable"
     worktree.mkdir()
     stable.mkdir()
-    existing = stable / "SECURITY-REVIEW-2447.md"
+    existing = _stable_artifact(stable, 2447)
+    existing.parent.mkdir(parents=True, exist_ok=True)
     existing.write_text(_structured_review(high=1), encoding="utf-8")
     original_text = existing.read_text(encoding="utf-8")
 
@@ -137,7 +146,8 @@ def test_persist_overwrites_with_fresh_worktree_artifact(tmp_path):
     stable.mkdir()
     src = worktree / "SECURITY-REVIEW-2447.md"
     src.write_text(_structured_review(critical=1), encoding="utf-8")
-    stale = stable / "SECURITY-REVIEW-2447.md"
+    stale = _stable_artifact(stable, 2447)
+    stale.parent.mkdir(parents=True, exist_ok=True)
     stale.write_text("# stale from previous run\n", encoding="utf-8")
 
     _persist_security_review_artifact(
@@ -169,7 +179,9 @@ def test_persist_noop_without_task_id(tmp_path):
         agent_succeeded=False,
     )
 
+    # No artifact directory created, no files written.
     assert list(stable.iterdir()) == []
+    assert not (stable / ARTIFACTS_DIR_NAME).exists()
 
 
 def test_persist_synthesizes_fallback_when_agent_crashed(tmp_path):
@@ -189,7 +201,7 @@ def test_persist_synthesizes_fallback_when_agent_crashed(tmp_path):
         agent_succeeded=False,
     )
 
-    dst = stable / "SECURITY-REVIEW-2447.md"
+    dst = _stable_artifact(stable, 2447)
     assert dst.is_file()
     body = dst.read_text(encoding="utf-8")
     assert SECURITY_REVIEW_FALLBACK_MARKER in body
@@ -223,7 +235,7 @@ def test_artifact_survives_worktree_removal(tmp_path):
     shutil.rmtree(worktree)
     assert not worktree.exists()
 
-    dst = stable / "SECURITY-REVIEW-2447.md"
+    dst = _stable_artifact(stable, 2447)
     assert dst.is_file(), (
         "artifact at stable path must survive worktree removal"
     )
@@ -294,8 +306,11 @@ async def test_security_review_artifact_persisted_on_pass(
     worktree.mkdir()
     stable.mkdir()
 
-    # Agent writes a clean structured artifact in the worktree.
-    artifact = worktree / "SECURITY-REVIEW-3001.md"
+    # Agent writes a clean structured artifact in the worktree at the
+    # new artifacts-dir location (task 2476).
+    artifact_dir = worktree / ARTIFACTS_DIR_NAME
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    artifact = artifact_dir / "SECURITY-REVIEW-3001.md"
     artifact.write_text(
         "# Review\n\n### [I1] INFO — no real issues\n", encoding="utf-8",
     )
@@ -306,10 +321,9 @@ async def test_security_review_artifact_persisted_on_pass(
         stable_project_dir=str(stable),
     )
 
-    assert (stable / "SECURITY-REVIEW-3001.md").is_file()
-    assert "[I1] INFO" in (
-        stable / "SECURITY-REVIEW-3001.md"
-    ).read_text(encoding="utf-8")
+    dst = _stable_artifact(stable, 3001)
+    assert dst.is_file()
+    assert "[I1] INFO" in dst.read_text(encoding="utf-8")
 
 
 @pytest.mark.asyncio
@@ -324,7 +338,9 @@ async def test_security_review_artifact_persisted_on_block(
     worktree.mkdir()
     stable.mkdir()
 
-    (worktree / "SECURITY-REVIEW-3002.md").write_text(
+    artifact_dir = worktree / ARTIFACTS_DIR_NAME
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    (artifact_dir / "SECURITY-REVIEW-3002.md").write_text(
         _structured_review(high=2), encoding="utf-8",
     )
 
@@ -334,7 +350,7 @@ async def test_security_review_artifact_persisted_on_block(
         stable_project_dir=str(stable),
     )
 
-    dst = stable / "SECURITY-REVIEW-3002.md"
+    dst = _stable_artifact(stable, 3002)
     assert dst.is_file()
     body = dst.read_text(encoding="utf-8")
     assert body.count("HIGH") >= 2
@@ -365,7 +381,7 @@ async def test_gating_block_without_artifact_escalates(
         stable_project_dir=str(stable),
     )
 
-    dst = stable / "SECURITY-REVIEW-3003.md"
+    dst = _stable_artifact(stable, 3003)
     assert dst.is_file(), (
         "block without saved artifact must still produce a stable file"
     )
