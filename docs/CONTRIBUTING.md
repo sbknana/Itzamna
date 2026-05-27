@@ -257,6 +257,41 @@ Harassment, discrimination, and being a jerk are not tolerated. If someone makes
 That's it. Go build something.
 ---
 
+## Documentation Drift Check
+
+CI runs `scripts/check_docs_drift.py` on every push to `master`/`main`
+and on every pull request. The check fails if `README.md` or any
+`docs/*.md` file references paths that don't exist, or if the claimed
+module count or test-count badge has drifted too far from reality (see
+the script's docstring for tolerances).
+
+You can run the check locally:
+
+<!-- drift-ignore -->
+```
+python scripts/check_docs_drift.py
+```
+<!-- /drift-ignore -->
+
+If you need to reference a path that intentionally doesn't exist (an
+example, a future file, a path that lives outside the repo), use one of
+the two escape hatches:
+
+1. Wrap the section in HTML comments:
+
+   <!-- drift-ignore -->
+   Paths in this block are not checked, e.g. `path/to/imaginary.py`.
+   <!-- /drift-ignore -->
+
+2. Use the special `sh-example` fenced code-block language tag (paths
+   in such a block are ignored).
+
+Both forms cause the drift checker to skip every reference inside
+them. Prefer narrow scoping -- don't wrap the whole document just to
+silence one false positive.
+
+---
+
 ## Related Documentation
 
 - [Readme](README.md)
