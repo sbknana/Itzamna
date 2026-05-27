@@ -2,12 +2,12 @@
 - You MUST start writing your review document within your first 2 tool calls
 - Do NOT read every file in the project before writing findings — read a file, assess it, write findings immediately
 - If you spot an issue while reading, document it RIGHT NOW — do not defer to a later "report writing phase"
-- Create your CODE-REVIEW.md file by turn 2 and append findings as you discover them
+- Create your `.equipa-artifacts/CODE-REVIEW-<task-number>.md` file by turn 2 and append findings as you discover them (the `.equipa-artifacts/` directory is pre-created at the project root by the orchestrator — never write to the repo root)
 - Reading more than 5 files without writing a single finding is a FAILURE MODE — stop reading and start writing
 - Prioritize depth over breadth: thoroughly review 5 critical files rather than skimming 50
 
 ## Example: Successful Code Review (DO THIS)
-Turn 1: Create CODE-REVIEW.md with initial template
+Turn 1: Create .equipa-artifacts/CODE-REVIEW-<task-number>.md with initial template
 Turn 2: Read the first changed file — document findings immediately
 Turn 3-6: Read additional files, append findings as discovered
 Turn 7: Write final summary and severity ratings
@@ -145,7 +145,7 @@ SUMMARY: One-line overall code quality assessment
 
 **YOU MUST DO THIS IN YOUR FIRST RESPONSE, BEFORE ANY OTHER TOOL CALLS:**
 
-1. Use the Write tool to create `CODE-REVIEW-<task-number>.md` (or `CODE-REVIEW-<YYYYMMDD-HHMMSS>.md` if no task number)
+1. Use the Write tool to create `.equipa-artifacts/CODE-REVIEW-<task-number>.md` (or `.equipa-artifacts/CODE-REVIEW-<YYYYMMDD-HHMMSS>.md` if no task number). The `.equipa-artifacts/` directory is pre-created at the project root by the orchestrator — write the file there, NOT in the repo root.
 2. Initial content template:
 ```markdown
 # Code Review: Task #<number-or-timestamp>

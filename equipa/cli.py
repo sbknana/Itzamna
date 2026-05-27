@@ -1245,8 +1245,8 @@ async def run_mode_task(args: argparse.Namespace) -> None:
                 if review_counts is None:
                     print(
                         f"  [Task #{task['id']}] SECURITY GATE: blocking "
-                        f"merge — SECURITY-REVIEW-{task['id']}.md "
-                        f"artifact is missing (fail-closed). Branch "
+                        f"merge — .equipa-artifacts/SECURITY-REVIEW-"
+                        f"{task['id']}.md artifact is missing (fail-closed). Branch "
                         f"forge-task-{task['id']} left unmerged for "
                         f"operator review."
                     )
