@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# EQUIPA pre-commit hook: reject agent-output artifacts staged at repo root.
+#
+# Why: SECURITY-REVIEW-*.md / CODE-REVIEW-*.md / PLAN-*.md and friends are
+# transient EQUIPA agent outputs. They make the public repo look messy and
+# can leak project-internal context. They belong in .equipa-artifacts/ which
+# is gitignored.
+#
+# To enable locally (one-time):
+#   git config core.hooksPath .githooks
+
+set -euo pipefail
+
+# Patterns to reject when staged at repo root (no slash before the name).
+# Anchored to repo root: files inside subdirectories (e.g. docs/PLAN-foo.md)
+# are NOT blocked.
+forbidden_regex='^(SECURITY-REVIEW-.*\.md|CODE-REVIEW-.*\.md|PLAN-.*\.md|RETRY-IMPLEMENTATION-.*\.md|RETRY-VERIFICATION\.md|GEPA-EPISODE-CHECK-.*\.md|LEAN-CTX-PORT\.md)$'
+
+# List staged additions/modifications, top-level only (no slash in path).
+staged_offenders=$(git diff --cached --name-only --diff-filter=AM | grep -E "$forbidden_regex" || true)
+
+if [ -n "$staged_offenders" ]; then
+    echo "ERROR: pre-commit hook rejected the following files." >&2
+    echo "       EQUIPA agent artifacts must not be committed at the repo root." >&2
+    echo "" >&2
+    echo "$staged_offenders" | sed 's/^/    /' >&2
+    echo "" >&2
+    echo "Move them into .equipa-artifacts/ (which is gitignored):" >&2
+    echo "    mkdir -p .equipa-artifacts" >&2
+    echo "    mv <file> .equipa-artifacts/" >&2
+    echo "    git reset HEAD <file>" >&2
+    echo "" >&2
+    echo "If you genuinely need to commit a file matching one of these" >&2
+    echo "patterns, bypass with: git commit --no-verify" >&2
+    exit 1
+fi
+
+exit 0

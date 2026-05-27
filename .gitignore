@@ -189,3 +189,12 @@ task-outputs/
 
 # Runtime logs
 logs/
+
+# EQUIPA agent artifacts - stay out of public repo
+.equipa-artifacts/
+/SECURITY-REVIEW-*.md
+/CODE-REVIEW-*.md
+/PLAN-*.md
+/RETRY-IMPLEMENTATION-*.md
+/GEPA-EPISODE-CHECK-*.md
+/LEAN-CTX-PORT.md
