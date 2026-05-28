@@ -164,6 +164,14 @@ def validate_athena_content(block: str) -> tuple[bool, str]:
                 f"{target!r}."
             )
 
+    # S1 HIGH (task #2485): second-pass full-block scan. The inline loop
+    # above only inspects ``[text](url)`` shapes -- reference-style links
+    # ``[ref]: javascript:alert(1)`` and any other location of a forbidden
+    # scheme would slip through. Scan the entire block as a defence in
+    # depth so a dangerous URI cannot survive in ANY position.
+    if _DANGEROUS_URI_RE.search(block):
+        return False, "content contains forbidden URI scheme"
+
     return True, "ok"
 
 

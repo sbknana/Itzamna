@@ -350,6 +350,31 @@ def test_missing_preserve_boundary_raises(tmp_path: Path):
             "## Architecture\n\n```\nfine\n```\n<iframe src=\"x\"></iframe>\n",
             "forbidden HTML tag",
         ),
+        # 9. Reference-style markdown link with javascript: target
+        #    (task #2485 S1 HIGH -- escapes the inline (url) regex).
+        (
+            "## Architecture\n\n[r]: javascript:alert(1)\n\n[click][r]\n",
+            "forbidden URI scheme",
+        ),
+        # 10. Reference-style link target using data:text/html
+        #    (uses HTML-entity-encoded svg to avoid the inline <svg> tag
+        #    check firing first -- the spec's literal "<svg onload=>" is
+        #    correctly caught earlier by _DANGEROUS_TAG_RE, but the URI
+        #    scheme itself must also be rejected by the second-pass scan).
+        (
+            "## Architecture\n\n[r]: data:text/html,foo\n",
+            "forbidden URI scheme",
+        ),
+        # 11. Reference-style link target using vbscript:
+        (
+            "## Architecture\n\n[r]: vbscript:msgbox(1)\n",
+            "forbidden URI scheme",
+        ),
+        # 12. Reference-style link target using file:// URI
+        (
+            "## Architecture\n\n[r]: file:///etc/passwd\n",
+            "forbidden URI scheme",
+        ),
     ],
 )
 def test_validate_athena_content_rejects_attack_vectors(payload, expected_substr):
