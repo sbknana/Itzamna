@@ -9,10 +9,12 @@ Copyright 2026 Forgeborn
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from equipa.constants import (
@@ -21,6 +23,21 @@ from equipa.constants import (
     GITHUB_OWNER,
     PROJECT_DIRS,
 )
+
+logger = logging.getLogger(__name__)
+
+
+class DefaultBranchDetectionError(RuntimeError):
+    """Raised by ``get_default_branch(strict=True)`` when every detection
+    strategy fails (no ``origin/HEAD``, no local ``main``/``master``, no
+    valid ``HEAD``).
+
+    Callers that need fail-closed behaviour (security_gate, dispatch) can
+    opt in via ``strict=True``. Default behaviour remains backward-
+    compatible: ``strict=False`` falls back to the legacy ``"master"``
+    string while emitting a WARNING log so the silent fallback is at
+    least observable.
+    """
 
 
 def _get_git_identity() -> tuple[str | None, str | None]:
@@ -256,12 +273,31 @@ def _gh_run(
 
 # Per-process cache of detected default branch, keyed by resolved repo path.
 # Populated by get_default_branch() so the orchestrator does not re-shell out
-# on every security-gate diff. Safe across threads because dict[str, str]
-# writes are GIL-atomic.
-_DEFAULT_BRANCH_CACHE: dict[str, str] = {}
+# on every security-gate diff. Entries store (branch_name, expiry_epoch).
+# A 5-minute TTL bounds the window where a rename (master->main) goes
+# undetected within a long-lived process (S2 of SECURITY-REVIEW-2479).
+# Tests that recreate repos at the same path within the TTL must call
+# ``_clear_default_branch_cache`` explicitly.
+_DEFAULT_BRANCH_CACHE: dict[str, tuple[str, float]] = {}
+_DEFAULT_BRANCH_CACHE_TTL_SECONDS: float = 300.0
 
 
-def get_default_branch(repo_path: str | Path) -> str:
+def _cache_set(key: str, value: str) -> None:
+    _DEFAULT_BRANCH_CACHE[key] = (value, time.monotonic() + _DEFAULT_BRANCH_CACHE_TTL_SECONDS)
+
+
+def _cache_get(key: str) -> str | None:
+    entry = _DEFAULT_BRANCH_CACHE.get(key)
+    if entry is None:
+        return None
+    value, expiry = entry
+    if time.monotonic() >= expiry:
+        _DEFAULT_BRANCH_CACHE.pop(key, None)
+        return None
+    return value
+
+
+def get_default_branch(repo_path: str | Path, *, strict: bool = False) -> str:
     """Detect the default branch of ``repo_path`` (``main`` vs ``master``).
 
     Resolution order:
@@ -270,15 +306,27 @@ def get_default_branch(repo_path: str | Path) -> str:
       2. First existing local branch among ``main`` then ``master``.
       3. ``git rev-parse --abbrev-ref HEAD`` — whatever branch is currently
          checked out.
-      4. Final fallback: ``"master"`` (preserves legacy behavior so callers
-         that previously hardcoded master keep working on broken repos).
+      4. If ``strict=True``, raise :class:`DefaultBranchDetectionError`.
+         Otherwise (default) emit a WARNING and fall back to ``"master"``.
 
-    Results are cached per-process keyed by the resolved absolute path of
-    ``repo_path``. Call :func:`clear_default_branch_cache` to invalidate
-    (only needed in tests that recreate repos at the same path).
+    Results are cached per-process for 5 minutes keyed by the resolved
+    absolute path of ``repo_path``. The TTL bounds the window where a
+    branch rename remains undetected in a long-lived orchestrator
+    process. Call :func:`_clear_default_branch_cache` to invalidate
+    immediately (only needed in tests that recreate repos at the same
+    path within the TTL).
+
+    Args:
+        repo_path: Filesystem path to a git working tree.
+        strict: If True, raise :class:`DefaultBranchDetectionError` on
+            total detection failure instead of returning ``"master"``.
+
+    Raises:
+        DefaultBranchDetectionError: Only when ``strict=True`` and every
+            detection strategy fails.
     """
     key = str(Path(repo_path).resolve())
-    cached = _DEFAULT_BRANCH_CACHE.get(key)
+    cached = _cache_get(key)
     if cached is not None:
         return cached
 
@@ -293,7 +341,7 @@ def get_default_branch(repo_path: str | Path) -> str:
             if ref.startswith("origin/"):
                 ref = ref[len("origin/"):]
             if ref:
-                _DEFAULT_BRANCH_CACHE[key] = ref
+                _cache_set(key, ref)
                 return ref
     except (subprocess.SubprocessError, OSError, FileNotFoundError):
         pass
@@ -307,7 +355,7 @@ def get_default_branch(repo_path: str | Path) -> str:
                 repo_path, timeout=5,
             )
             if result.returncode == 0:
-                _DEFAULT_BRANCH_CACHE[key] = candidate
+                _cache_set(key, candidate)
                 return candidate
         except (subprocess.SubprocessError, OSError, FileNotFoundError):
             continue
@@ -320,18 +368,30 @@ def get_default_branch(repo_path: str | Path) -> str:
         if result.returncode == 0:
             ref = (result.stdout or "").strip()
             if ref and ref != "HEAD":
-                _DEFAULT_BRANCH_CACHE[key] = ref
+                _cache_set(key, ref)
                 return ref
     except (subprocess.SubprocessError, OSError, FileNotFoundError):
         pass
 
-    # 4) Final fallback — preserve legacy behavior.
-    _DEFAULT_BRANCH_CACHE[key] = "master"
+    # 4) Total detection failure.
+    if strict:
+        raise DefaultBranchDetectionError(
+            f"could not detect default branch for {repo_path!s}"
+        )
+    logger.warning(
+        "could not detect default branch for %s, using legacy fallback 'master'",
+        repo_path,
+    )
+    _cache_set(key, "master")
     return "master"
 
 
-def clear_default_branch_cache() -> None:
-    """Drop every cached default-branch entry. Intended for tests."""
+def _clear_default_branch_cache() -> None:
+    """Drop every cached default-branch entry. Intended for tests.
+
+    The underscore prefix marks this as a test-only helper (S5 of
+    SECURITY-REVIEW-2479).
+    """
     _DEFAULT_BRANCH_CACHE.clear()
 
 
@@ -470,15 +530,29 @@ def setup_single_repo(
             # blindly trying main then master — once Equipa-repo renames
             # master -> main, a stray "master" push would recreate the old
             # name on the remote.
+            # Task #2482 S1: if the first push fails and we fall back to
+            # "main", we MUST check the second push's returncode too and
+            # propagate failure with both stderr blobs. Returning success
+            # when both pushes failed was the original HIGH finding.
             default_branch = get_default_branch(p)
             pr = git_run(
                 ["push", "-u", "origin", default_branch], p, timeout=120,
             )
-            if pr.returncode != 0 and default_branch != "main":
-                # Defensive fallback only when we did NOT already try main.
-                git_run(
+            if pr.returncode != 0:
+                if default_branch == "main":
+                    return False, (
+                        f"git push failed for branch '{default_branch}': "
+                        f"{pr.stderr.strip()}"
+                    )
+                pr2 = git_run(
                     ["push", "-u", "origin", "main"], p, timeout=120,
                 )
+                if pr2.returncode != 0:
+                    return False, (
+                        f"git push failed for both branches; "
+                        f"'{default_branch}' stderr: {pr.stderr.strip()}; "
+                        f"'main' stderr: {pr2.stderr.strip()}"
+                    )
         else:
             return False, f"gh repo create failed: {r.stderr.strip()}"
 
