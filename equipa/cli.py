@@ -1185,8 +1185,9 @@ async def run_mode_task(args: argparse.Namespace) -> None:
             # positive blocking the merge. Concrete trigger: task 2358 — a
             # CRYPTOTRADER-V3-ARCHITECTURE.md spec was blocked because the
             # document used the word "HIGH" and discussed API-key auth.
+            # base_ref omitted → auto-detect default branch (task #2479).
             changed_files = await get_changed_files_for_branch(
-                project_dir, base_ref="master",
+                project_dir,
             )
             review_skipped_doc_only = is_doc_only_diff(changed_files)
             review_crashed = False

@@ -254,6 +254,87 @@ def _gh_run(
     return _run_with_env(["gh", *args], cwd, timeout)
 
 
+# Per-process cache of detected default branch, keyed by resolved repo path.
+# Populated by get_default_branch() so the orchestrator does not re-shell out
+# on every security-gate diff. Safe across threads because dict[str, str]
+# writes are GIL-atomic.
+_DEFAULT_BRANCH_CACHE: dict[str, str] = {}
+
+
+def get_default_branch(repo_path: str | Path) -> str:
+    """Detect the default branch of ``repo_path`` (``main`` vs ``master``).
+
+    Resolution order:
+      1. ``git symbolic-ref --short refs/remotes/origin/HEAD`` — fast and
+         definitive when ``origin/HEAD`` is set on the remote.
+      2. First existing local branch among ``main`` then ``master``.
+      3. ``git rev-parse --abbrev-ref HEAD`` — whatever branch is currently
+         checked out.
+      4. Final fallback: ``"master"`` (preserves legacy behavior so callers
+         that previously hardcoded master keep working on broken repos).
+
+    Results are cached per-process keyed by the resolved absolute path of
+    ``repo_path``. Call :func:`clear_default_branch_cache` to invalidate
+    (only needed in tests that recreate repos at the same path).
+    """
+    key = str(Path(repo_path).resolve())
+    cached = _DEFAULT_BRANCH_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    # 1) origin/HEAD
+    try:
+        result = git_run(
+            ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+            repo_path, timeout=5,
+        )
+        if result.returncode == 0:
+            ref = (result.stdout or "").strip()
+            if ref.startswith("origin/"):
+                ref = ref[len("origin/"):]
+            if ref:
+                _DEFAULT_BRANCH_CACHE[key] = ref
+                return ref
+    except (subprocess.SubprocessError, OSError, FileNotFoundError):
+        pass
+
+    # 2) Local branch existence: prefer main, fall back to master
+    for candidate in ("main", "master"):
+        try:
+            result = git_run(
+                ["rev-parse", "--verify", "--quiet",
+                 f"refs/heads/{candidate}"],
+                repo_path, timeout=5,
+            )
+            if result.returncode == 0:
+                _DEFAULT_BRANCH_CACHE[key] = candidate
+                return candidate
+        except (subprocess.SubprocessError, OSError, FileNotFoundError):
+            continue
+
+    # 3) Current branch
+    try:
+        result = git_run(
+            ["rev-parse", "--abbrev-ref", "HEAD"], repo_path, timeout=5,
+        )
+        if result.returncode == 0:
+            ref = (result.stdout or "").strip()
+            if ref and ref != "HEAD":
+                _DEFAULT_BRANCH_CACHE[key] = ref
+                return ref
+    except (subprocess.SubprocessError, OSError, FileNotFoundError):
+        pass
+
+    # 4) Final fallback — preserve legacy behavior.
+    _DEFAULT_BRANCH_CACHE[key] = "master"
+    return "master"
+
+
+def clear_default_branch_cache() -> None:
+    """Drop every cached default-branch entry. Intended for tests."""
+    _DEFAULT_BRANCH_CACHE.clear()
+
+
 def _git_commit(
     message: str,
     cwd: str | Path,
@@ -385,12 +466,18 @@ def setup_single_repo(
                  f"https://github.com/{owner}/{repo_name}.git"],
                 p, timeout=10,
             )
+            # Task #2479: push the repo's actual default branch instead of
+            # blindly trying main then master — once Equipa-repo renames
+            # master -> main, a stray "master" push would recreate the old
+            # name on the remote.
+            default_branch = get_default_branch(p)
             pr = git_run(
-                ["push", "-u", "origin", "main"], p, timeout=120,
+                ["push", "-u", "origin", default_branch], p, timeout=120,
             )
-            if pr.returncode != 0:
+            if pr.returncode != 0 and default_branch != "main":
+                # Defensive fallback only when we did NOT already try main.
                 git_run(
-                    ["push", "-u", "origin", "master"], p, timeout=120,
+                    ["push", "-u", "origin", "main"], p, timeout=120,
                 )
         else:
             return False, f"gh repo create failed: {r.stderr.strip()}"

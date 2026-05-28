@@ -118,7 +118,7 @@ class SecurityGateBypassError(RuntimeError):
 
 async def get_changed_files_for_branch(
     project_dir: str,
-    base_ref: str = "master",
+    base_ref: str | None = None,
 ) -> list[str]:
     """Return file paths changed on the current branch vs ``base_ref``.
 
@@ -127,12 +127,20 @@ async def get_changed_files_for_branch(
     ``base_ref`` — this matches what the eventual ``git merge`` will
     actually examine.
 
+    When ``base_ref`` is ``None`` (the default), the repository's default
+    branch is auto-detected via :func:`equipa.git_ops.get_default_branch`
+    so this helper works on both ``master``- and ``main``-defaulted repos
+    (task #2479).
+
     On any failure (timeout, missing git, base_ref unknown), returns an
     empty list. Callers MUST treat an empty list as "could not determine
     doc-only-ness" — :func:`is_doc_only_diff` already returns False for
     an empty list precisely so a failed lookup never silently disables
     the gate.
     """
+    if base_ref is None:
+        from equipa.git_ops import get_default_branch
+        base_ref = get_default_branch(project_dir)
     try:
         result = await git_run_async(
             ["diff", "--name-only", f"{base_ref}...HEAD"],
