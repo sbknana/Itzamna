@@ -675,7 +675,20 @@ INITIATIVE_GOAL_MAX = 8192
 # equipa.initiative._sanitize_agent_text, but we reject them here too so
 # the initiative row in TheForge stays clean and downstream displays
 # don't have to defend against terminal-control characters.
-_INITIATIVE_CTRL_CHARS_RE = re.compile(r"[\x00-\x08\x0B-\x1F\x7F]")
+#
+# S2486-04 fix: also reject Unicode bidirectional override (U+202A–U+202E,
+# U+2066–U+2069) and zero-width characters (U+200B–U+200D, U+2060, U+FEFF).
+# These enable the "Trojan Source" / CVE-2021-42574 attack class.
+_INITIATIVE_CTRL_CHARS_RE = re.compile(
+    "["
+    "\x00-\x08\x0b-\x1f\x7f"
+    "\u202a-\u202e"  # bidi override: LRE, RLE, PDF, LRO, RLO
+    "\u2066-\u2069"  # bidi isolate: LRI, RLI, FSI, PDI
+    "\u200b-\u200d"  # zero-width: ZWSP, ZWNJ, ZWJ
+    "\u2060"          # word joiner
+    "\ufeff"          # zero-width no-break space / BOM
+    "]"
+)
 
 
 def _validate_initiative_input(*, name: str, goal: str) -> str | None:
@@ -696,13 +709,15 @@ def _validate_initiative_input(*, name: str, goal: str) -> str | None:
         )
     if _INITIATIVE_CTRL_CHARS_RE.search(name):
         return (
-            "--create-initiative name contains ASCII control characters "
-            "(only newline and tab allowed)"
+            "--create-initiative name contains disallowed control "
+            "characters (ASCII C0/DEL, Unicode bidi-override, or "
+            "zero-width); only newline and tab are allowed"
         )
     if _INITIATIVE_CTRL_CHARS_RE.search(goal):
         return (
-            "--initiative-goal contains ASCII control characters "
-            "(only newline and tab allowed)"
+            "--initiative-goal contains disallowed control characters "
+            "(ASCII C0/DEL, Unicode bidi-override, or zero-width); "
+            "only newline and tab are allowed"
         )
     if "<!--" in name:
         return (

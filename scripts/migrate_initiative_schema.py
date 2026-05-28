@@ -9,7 +9,15 @@ Adds two pieces of schema to TheForge:
    exactly as today (backward compatible).
 
 The migration is IDEMPOTENT: it is safe to re-run. Existing rows and
-data are never mutated; only missing schema is created.
+data are never mutated; only missing schema is created — EXCEPT for
+the v2-introduced CHECK constraint on (name, goal) lengths. If the
+``initiatives`` table predates v2 and lacks the CHECK, the migration
+performs a table-rebuild (rename → recreate with constraint →
+INSERT...SELECT → drop old). Pre-existing rows whose name/goal exceed
+the v2 caps are TRUNCATED (via ``substr(..., 1, N)``) rather than
+rejected; rejecting would block the migration on production DBs.
+After the rebuild the table has the CHECK, so a second run of this
+script is a no-op (CHECK is present → branch not taken).
 
 Usage::
 
@@ -82,6 +90,7 @@ def apply_migration(conn: sqlite3.Connection) -> dict[str, bool]:
     report = {
         "initiatives_table_created": False,
         "initiative_id_column_added": False,
+        "initiatives_check_added": False,
     }
 
     if not _table_exists(conn, "tasks"):
@@ -94,6 +103,41 @@ def apply_migration(conn: sqlite3.Connection) -> dict[str, bool]:
     conn.executescript(INITIATIVES_DDL)
     conn.executescript(INITIATIVES_INDEX_DDL)
     report["initiatives_table_created"] = not existed_initiatives
+
+    # S2486-01 HIGH fix: detect v1 schema (table exists but no CHECK
+    # constraint) and rebuild. CREATE TABLE IF NOT EXISTS is a no-op
+    # when the table exists, so SQLite never retroactively adds the
+    # constraint on upgrade — without this rebuild the v3 defense in
+    # depth promise does not hold on any DB that ran v1.
+    if existed_initiatives:
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type='table' AND name='initiatives'"
+        ).fetchone()
+        existing_ddl = (row[0] or "") if row else ""
+        if "CHECK" not in existing_ddl:
+            # Truncation policy: pre-existing rows whose values exceed
+            # the v2 caps are silently truncated via substr(). Rejecting
+            # would block the migration on every production DB; the
+            # truncated row remains queryable and the constraint is now
+            # enforced for ALL future writes.
+            conn.executescript(
+                "PRAGMA foreign_keys = OFF;\n"
+                "ALTER TABLE initiatives RENAME TO initiatives_old;\n"
+                + INITIATIVES_DDL
+                + """
+                INSERT INTO initiatives
+                  (id, project_id, name, goal, status, created_at, completed_at)
+                  SELECT id, project_id,
+                         substr(name, 1, 200),
+                         substr(goal, 1, 8192),
+                         status, created_at, completed_at
+                  FROM initiatives_old;
+                DROP TABLE initiatives_old;
+                PRAGMA foreign_keys = ON;
+                """
+            )
+            report["initiatives_check_added"] = True
 
     if not _column_exists(conn, "tasks", "initiative_id"):
         # SQLite ALTER TABLE ADD COLUMN: nullable column with FK reference.

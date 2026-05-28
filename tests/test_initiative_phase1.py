@@ -245,10 +245,13 @@ def test_to_prompt_context_returns_full_plan_with_header(migrated_db, repo):
     iid = _seed_initiative(migrated_db)
     InitiativePlan.ensure_exists(repo, iid, migrated_db)
     plan = InitiativePlan.load(repo, iid)
-    rendered = plan.to_prompt_context()
+    rendered = plan.to_prompt_context(delimiter="TESTDELIM00000001")
     assert rendered.startswith(PROMPT_HEADER)
     assert "# Initiative:" in rendered
     assert BEGIN_MARKER in rendered
+    # S2486-02 fix: delimiter is now REQUIRED — calling without raises.
+    with pytest.raises((TypeError, ValueError)):
+        plan.to_prompt_context()  # type: ignore[call-arg]
 
 
 # ---------------------------------------------------------------------------
@@ -343,7 +346,7 @@ def test_record_task_completion_appends_and_next_dispatch_sees_it(
     # Now a SECOND task in the same initiative loads the plan and sees the
     # prior entry in its prompt context — this is the entire point of Phase 1.
     plan = InitiativePlan.load(repo, iid)
-    next_prompt = plan.to_prompt_context()
+    next_prompt = plan.to_prompt_context(delimiter="NEXTDISPATCH0001")
     assert "### #2484: Phase 1 schema + plan file format" in next_prompt
     assert "Idempotent ALTER TABLE" in next_prompt
 
@@ -417,9 +420,10 @@ def test_s1_to_prompt_context_wraps_in_untrusted_fence(migrated_db, repo):
     assert "<<<END_UNTRUSTED_INITIATIVE_PLAN_DEADBEEF12345678>>>" in out
     assert "# Initiative: Fenced" in out
 
-    # No-delimiter mode keeps backward compatibility.
-    plain = plan.to_prompt_context()
-    assert "UNTRUSTED_INITIATIVE_PLAN" not in plain
+    # S2486-02 fix: there is NO no-delimiter mode anymore — the safety
+    # contract makes the parameter mandatory. Tests/callers that want
+    # raw content read plan.raw_text directly.
+    assert "# Initiative: Fenced" in plan.raw_text
 
 
 def test_s1_injection_attempt_in_summary_stays_inside_fence(migrated_db, repo):
@@ -677,3 +681,103 @@ def test_s4_gitignore_excludes_lock_files():
         "Expected `.equipa/*.lock` entry in .gitignore so per-process "
         "fcntl lock files never get committed."
     )
+
+
+# ---------------------------------------------------------------------------
+# S2486-03 — Decision-list cap (prompt-budget DOS defence)
+# ---------------------------------------------------------------------------
+
+def test_decisions_capped_at_max_per_task(migrated_db, repo):
+    """An agent emitting 100 decisions renders exactly 20 + truncation marker."""
+    from equipa.initiative import MAX_DECISIONS_PER_TASK
+
+    iid = _seed_initiative(migrated_db)
+    InitiativePlan.ensure_exists(repo, iid, migrated_db)
+    plan = InitiativePlan.load(repo, iid)
+
+    decisions = [(f"decision-{i}", f"rationale-{i}") for i in range(100)]
+    plan.append_subtask(
+        task_id=42, title="cap-test", status="done", branch="b",
+        completed_at=None, summary="100-decision dump", decisions=decisions,
+    )
+    content = plan.path.read_text()
+
+    # First MAX_DECISIONS_PER_TASK survive, the rest are replaced by a
+    # single truncation marker line.
+    for i in range(MAX_DECISIONS_PER_TASK):
+        assert f"decision-{i}" in content, f"decision-{i} missing"
+    assert f"decision-{MAX_DECISIONS_PER_TASK}" not in content
+    assert f"decision-{99}" not in content
+    truncated_remaining = 100 - MAX_DECISIONS_PER_TASK
+    assert f"[... {truncated_remaining} more decisions truncated ...]" in content
+
+
+def test_decisions_below_cap_unaffected(migrated_db, repo):
+    """A normal task with < cap decisions sees no truncation marker."""
+    iid = _seed_initiative(migrated_db)
+    InitiativePlan.ensure_exists(repo, iid, migrated_db)
+    plan = InitiativePlan.load(repo, iid)
+
+    decisions = [(f"d-{i}", f"r-{i}") for i in range(5)]
+    plan.append_subtask(
+        task_id=1, title="normal", status="done", branch="b",
+        completed_at=None, summary="5 decisions", decisions=decisions,
+    )
+    content = plan.path.read_text()
+    assert "more decisions truncated" not in content
+    for i in range(5):
+        assert f"d-{i}" in content
+
+
+def test_agent_instruction_block_mentions_decision_cap():
+    """The prompt teaches the agent about the 20-decision cap so it self-limits."""
+    assert "20" in AGENT_INSTRUCTION_BLOCK
+    assert "decision" in AGENT_INSTRUCTION_BLOCK.lower()
+
+
+# ---------------------------------------------------------------------------
+# S2486-04 — Unicode bidi-override + zero-width strip
+# ---------------------------------------------------------------------------
+
+def test_unicode_bidi_and_zero_width_stripped_from_fields(migrated_db, repo):
+    """Trojan-source style bidi overrides + zero-width chars are stripped."""
+    iid = _seed_initiative(migrated_db)
+    InitiativePlan.ensure_exists(repo, iid, migrated_db)
+    plan = InitiativePlan.load(repo, iid)
+
+    # U+202E RIGHT-TO-LEFT OVERRIDE and U+200B ZERO-WIDTH SPACE in
+    # every agent-supplied field. Plus a U+2069 POP DIRECTIONAL ISOLATE
+    # for good measure.
+    rtl = "‮"
+    zwsp = "​"
+    pdi = "⁩"
+
+    plan.append_subtask(
+        task_id=1,
+        title=f"tit{rtl}le{zwsp}A{pdi}",
+        status="done",
+        branch="b",
+        completed_at=None,
+        summary=f"normal{rtl}txet desrever{zwsp}hidden",
+        decisions=[(f"dec{rtl}ision{zwsp}A", f"rat{pdi}ionale{zwsp}B")],
+    )
+    content = plan.path.read_text()
+
+    for forbidden in (rtl, zwsp, pdi, "‪", "‭", "‌", "‍", "﻿"):
+        assert forbidden not in content, (
+            f"Unicode codepoint U+{ord(forbidden):04X} leaked into plan file"
+        )
+    # Visible text around the stripped chars survives.
+    assert "title" in content
+    assert "normaltxet desreverhidden" in content
+    assert "decision" in content
+
+
+def test_cli_rejects_unicode_bidi_override():
+    """CLI validator rejects bidi-override Unicode in name/goal."""
+    from equipa.cli import _validate_initiative_input
+
+    err = _validate_initiative_input(name="evil‮name", goal="ok")
+    assert err is not None
+    err = _validate_initiative_input(name="ok", goal="evil​goal")
+    assert err is not None
