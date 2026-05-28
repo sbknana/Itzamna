@@ -25,8 +25,10 @@ import pytest
 
 from equipa import git_ops, security_gate
 from equipa.git_ops import (
-    clear_default_branch_cache,
+    DefaultBranchDetectionError,
+    _clear_default_branch_cache,
     get_default_branch,
+    setup_single_repo,
 )
 
 
@@ -65,9 +67,9 @@ def _init_repo(path: Path, initial_branch: str) -> None:
 @pytest.fixture(autouse=True)
 def _reset_default_branch_cache() -> None:
     """Each test sees a fresh cache so repos at reused tmp_path keys work."""
-    clear_default_branch_cache()
+    _clear_default_branch_cache()
     yield
-    clear_default_branch_cache()
+    _clear_default_branch_cache()
 
 
 # --- get_default_branch -----------------------------------------------------
@@ -129,7 +131,7 @@ class TestGetDefaultBranch:
             ["git", "-C", str(repo), "branch", "-m", "main", "trunk"],
             check=True, capture_output=True,
         )
-        clear_default_branch_cache()
+        _clear_default_branch_cache()
         assert get_default_branch(repo) == "trunk"
 
     def test_non_repo_falls_back_to_master(self, tmp_path: Path) -> None:
@@ -235,59 +237,105 @@ class TestCallSitesOnMainDefaultRepo:
 
 
 class TestNoHardcodedMasterInProduction:
-    """Grep-based guard. Any module under ``equipa/`` that ships in the
-    package must NOT contain the literal string ``"master"`` outside of
-    fallback / detection contexts.
+    """Counted, line-anchored guard (S4 of SECURITY-REVIEW-2479).
 
-    Allowed sites (case-by-case, justified inline):
-      * ``equipa/git_ops.py``        — defines ``get_default_branch`` itself
-                                        (the fallback tuple and the final
-                                        legacy fallback).
-      * ``equipa/single_agent_guard.py`` — historical fallback tuple
-                                        ``("master", "main", "HEAD~1")``.
-      * ``equipa/monitoring.py``     — historical fallback tuple of four
-                                        base-ref candidates.
-      * ``equipa/dispatch.py``       — existing default-branch detection
-                                        (``default_branch = "main" if cp...
-                                        else "master"`` and the
-                                        ``["master", "main"]`` candidate
-                                        list).
+    Earlier versions of this test exempted entire files (``equipa/git_ops.py``,
+    ``equipa/single_agent_guard.py``, ``equipa/monitoring.py``,
+    ``equipa/dispatch.py``) which let a developer silently add new
+    hardcoded ``"master"`` references inside those files.
 
-    Any new occurrence must either (a) be a legitimate fallback inside the
-    detection helper, in which case the file must be added to the allow
-    list with a justification, or (b) be replaced with a call to
-    ``get_default_branch``.
+    The replacement enforces:
+      * **Other files**  — zero occurrences of the literal ``"master"``
+        outside comments. Any new offender fails the test immediately.
+      * **Allow-listed files** — an EXACT expected count of code-line
+        occurrences. The count is what these modules carry today as
+        legitimate fallback / detection sites. Adding a new
+        ``"master"`` to one of them bumps the count and fails the test
+        loudly; the developer must either remove the new reference
+        (call ``get_default_branch`` instead) or — if it is genuinely
+        a new legitimate fallback — bump the expected count here.
+
+    Comments and lines inside triple-quoted docstrings are exempt from
+    the count.
     """
 
-    ALLOWED = {
-        "equipa/git_ops.py",
-        "equipa/single_agent_guard.py",
-        "equipa/monitoring.py",
-        "equipa/dispatch.py",
+    # Modules that are KNOWN to ship legitimate fallback references plus
+    # their expected COUNT of code-line ``"master"`` occurrences. Bumping
+    # a count is a deliberate decision that requires editing this map.
+    EXPECTED_MASTER_COUNT: dict[str, int] = {
+        "equipa/git_ops.py": 4,
+        "equipa/single_agent_guard.py": 1,
+        "equipa/monitoring.py": 1,
+        "equipa/dispatch.py": 2,
     }
+
+    @staticmethod
+    def _count_master_occurrences(text: str) -> list[tuple[int, str]]:
+        """Count ``"master"`` / ``'master'`` occurrences in CODE lines.
+
+        Skips:
+          * Lines whose first non-whitespace char is ``#`` (comments).
+          * Lines inside a triple-quoted string (best-effort tracking of
+            ``\"\"\"`` and ``'''`` delimiters).
+
+        Returns a list of (lineno, stripped_line) for every code-line
+        hit so failure messages can show exactly what tripped the guard.
+        """
+        hits: list[tuple[int, str]] = []
+        in_triple_double = False
+        in_triple_single = False
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            stripped = line.strip()
+            # Toggle triple-quote state (best-effort: a line containing
+            # an odd number of triple-quote markers flips the state).
+            tdq = line.count('"""')
+            tsq = line.count("'''")
+            line_starts_in_string = in_triple_double or in_triple_single
+            if tdq % 2 == 1:
+                in_triple_double = not in_triple_double
+            if tsq % 2 == 1:
+                in_triple_single = not in_triple_single
+            if line_starts_in_string:
+                continue
+            if stripped.startswith("#"):
+                continue
+            if '"master"' in line or "'master'" in line:
+                hits.append((lineno, stripped))
+        return hits
 
     def test_no_new_hardcoded_master(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
         equipa_dir = repo_root / "equipa"
         offenders: list[str] = []
+        count_drift: list[str] = []
         for py_file in sorted(equipa_dir.rglob("*.py")):
             rel = py_file.relative_to(repo_root).as_posix()
-            if rel in self.ALLOWED:
-                continue
             text = py_file.read_text(encoding="utf-8", errors="replace")
-            # Strip comments and docstrings? Too brittle. The 4 patched
-            # files have no remaining references; scan raw text and rely
-            # on the allow list for the legitimate fallbacks.
-            for lineno, line in enumerate(text.splitlines(), start=1):
-                stripped = line.strip()
-                if stripped.startswith("#"):
-                    continue
-                if '"master"' in line or "'master'" in line:
+            hits = self._count_master_occurrences(text)
+            expected = self.EXPECTED_MASTER_COUNT.get(rel)
+            if expected is None:
+                for lineno, stripped in hits:
                     offenders.append(f"{rel}:{lineno}: {stripped}")
+            else:
+                if len(hits) != expected:
+                    formatted_hits = "\n".join(
+                        f"  {rel}:{ln}: {s}" for ln, s in hits
+                    ) or "  (no hits found)"
+                    count_drift.append(
+                        f"{rel}: expected {expected} \"master\" "
+                        f"occurrences, found {len(hits)}.\n"
+                        f"{formatted_hits}\n"
+                        f"If you added a new legitimate fallback, bump "
+                        f"EXPECTED_MASTER_COUNT[{rel!r}]; otherwise "
+                        f"call get_default_branch() instead."
+                    )
         assert not offenders, (
             "Hardcoded \"master\" found in production code outside the "
             "approved fallback sites — call get_default_branch() instead:\n"
             + "\n".join(offenders)
+        )
+        assert not count_drift, (
+            "EXPECTED_MASTER_COUNT drift:\n" + "\n".join(count_drift)
         )
 
     def test_allow_list_files_actually_exist(self) -> None:
@@ -295,10 +343,10 @@ class TestNoHardcodedMasterInProduction:
         regression guard would silently let new offenders through.
         """
         repo_root = Path(__file__).resolve().parents[1]
-        for rel in self.ALLOWED:
+        for rel in self.EXPECTED_MASTER_COUNT:
             assert (repo_root / rel).exists(), (
                 f"Allow-list entry {rel!r} does not exist; update "
-                "TestNoHardcodedMasterInProduction.ALLOWED."
+                "TestNoHardcodedMasterInProduction.EXPECTED_MASTER_COUNT."
             )
 
     def test_get_default_branch_is_exported(self) -> None:
@@ -306,4 +354,146 @@ class TestNoHardcodedMasterInProduction:
         location so future call sites can adopt it.
         """
         assert callable(git_ops.get_default_branch)
-        assert callable(git_ops.clear_default_branch_cache)
+        assert callable(git_ops._clear_default_branch_cache)
+
+
+# --- S1: setup_single_repo asymmetric push fallback -------------------------
+
+
+class TestSetupSingleRepoPushFallback:
+    """S1 of SECURITY-REVIEW-2479: when the first ``push -u origin
+    <default_branch>`` fails AND we fall back to ``main``, the second
+    push's returncode must also be checked. If both fail the function
+    must return ``(False, message)`` with BOTH stderr blobs captured.
+    """
+
+    def test_both_pushes_fail_returns_failure_with_both_stderr(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # (a) Remote default branch is ``main`` (bare repo init -b main).
+        remote = tmp_path / "remote.git"
+        subprocess.run(
+            ["git", "init", "--bare", "-b", "main", str(remote)],
+            check=True, capture_output=True,
+        )
+        # (b) Local repo on ``master`` only — NO origin remote yet, so
+        # setup_single_repo will follow the "gh repo create failed with
+        # already-exists" branch where the push fallback lives.
+        local = tmp_path / "local"
+        _init_repo(local, "master")
+
+        # Stub the gh CLI call so setup_single_repo enters the
+        # "already exists" branch where the push fallback lives.
+        from equipa import git_ops as _git_ops
+
+        def _fake_gh_run(args, cwd, timeout=120):
+            return subprocess.CompletedProcess(
+                args=["gh", *args], returncode=1,
+                stdout="", stderr="GraphQL: Name already exists on this account",
+            )
+        monkeypatch.setattr(_git_ops, "_gh_run", _fake_gh_run)
+
+        # Force both pushes to fail so we can assert both stderrs land
+        # in the returned message. We do this by replacing git_run for
+        # any ``push`` invocation with a synthetic failure response;
+        # other git invocations (remote add, etc.) pass through to the
+        # real subprocess.
+        real_git_run = _git_ops.git_run
+        push_calls: list[list[str]] = []
+
+        def _fake_git_run(args, cwd, timeout=120):
+            if args and args[0] == "push":
+                push_calls.append(list(args))
+                branch = args[-1]
+                return subprocess.CompletedProcess(
+                    args=["git", *args], returncode=1, stdout="",
+                    stderr=f"fatal: push refused for {branch}",
+                )
+            return real_git_run(args, cwd, timeout=timeout)
+        monkeypatch.setattr(_git_ops, "git_run", _fake_git_run)
+
+        ok, msg = setup_single_repo(
+            codename="dummy", project_dir=local, owner="forgeborn",
+        )
+
+        # (d) Both pushes attempted; failure propagates; both stderr captured.
+        assert ok is False, f"expected failure, got success: {msg}"
+        assert "master" in msg, msg
+        assert "main" in msg, msg
+        assert "push refused for master" in msg, msg
+        assert "push refused for main" in msg, msg
+        # Sanity: BOTH pushes were attempted in order (master then main).
+        pushed_branches = [c[-1] for c in push_calls]
+        assert pushed_branches == ["master", "main"], pushed_branches
+
+
+# --- S2: cache TTL invalidation ---------------------------------------------
+
+
+class TestCacheTtlInvalidation:
+    """S2 of SECURITY-REVIEW-2479: cached default branch entries must
+    expire so a long-lived orchestrator process picks up a rename
+    (master -> main) within 5 minutes.
+    """
+
+    def test_cached_value_expires_after_ttl(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        repo = tmp_path / "ttl_repo"
+        _init_repo(repo, "main")
+
+        fake_now = [1000.0]
+
+        def _fake_monotonic() -> float:
+            return fake_now[0]
+        monkeypatch.setattr(git_ops.time, "monotonic", _fake_monotonic)
+
+        first = get_default_branch(repo)
+        assert first == "main"
+
+        # Rename underneath the cache.
+        subprocess.run(
+            ["git", "-C", str(repo), "branch", "-m", "main", "trunk"],
+            check=True, capture_output=True,
+        )
+
+        # Still within TTL -> cached "main" is returned.
+        fake_now[0] += 60.0
+        assert get_default_branch(repo) == "main"
+
+        # Past TTL -> re-detected.
+        fake_now[0] += 301.0
+        assert get_default_branch(repo) == "trunk"
+
+
+# --- S3: warning + strict mode ---------------------------------------------
+
+
+class TestStrictMode:
+    """S3 of SECURITY-REVIEW-2479: ``get_default_branch`` must
+    optionally raise ``DefaultBranchDetectionError`` when every
+    detection strategy fails, and must log a WARNING in the
+    backward-compatible (``strict=False``) path.
+    """
+
+    def test_strict_raises_on_total_failure(self, tmp_path: Path) -> None:
+        empty = tmp_path / "not_a_repo"
+        empty.mkdir()
+        with pytest.raises(DefaultBranchDetectionError):
+            get_default_branch(empty, strict=True)
+
+    def test_non_strict_falls_back_and_warns(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        empty = tmp_path / "not_a_repo2"
+        empty.mkdir()
+        with caplog.at_level("WARNING", logger="equipa.git_ops"):
+            assert get_default_branch(empty) == "master"
+        warned = [
+            r for r in caplog.records
+            if "legacy fallback 'master'" in r.getMessage()
+        ]
+        assert warned, (
+            "expected a WARNING-level log about the legacy 'master' "
+            f"fallback, got: {[r.getMessage() for r in caplog.records]}"
+        )
