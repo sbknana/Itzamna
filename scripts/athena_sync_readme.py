@@ -49,6 +49,132 @@ BADGE_BLOCK_OPEN = '<p align="center">'
 BADGE_BLOCK_CLOSE = "</p>"
 SHIELDS_MARKER = "img.shields.io"
 
+# ---------------------------------------------------------------------------
+# Content allowlist (task #2483 / SECURITY-REVIEW-2480 S1 HIGH).
+# ---------------------------------------------------------------------------
+# Athena's output domain is markdown documentation ONLY. Athena must NEVER
+# emit raw HTML tags (other than the narrow whitelist of inline elements
+# markdown itself uses), executable URIs, event handlers, or non-printable
+# bytes. The validator below is a *fail-closed* gate: any rejected
+# pattern causes the sync to abort BEFORE the splice happens, so a
+# compromised or hallucinating Athena cannot inject script-y payloads
+# into the repo via the truth-sync cron.
+
+# Maximum bytes for the Athena-supplied Architecture block. Real
+# architecture sections are <10KB; the cap blocks pathological inputs.
+MAX_ATHENA_BLOCK_BYTES = 50 * 1024
+
+# Dangerous HTML tag prefixes -- any opening tag matching these is
+# rejected outright. ``on[a-z]+`` catches every event-handler attribute
+# being expressed as a tag name (a defence-in-depth measure on top of
+# the inline-attribute check below).
+_DANGEROUS_TAG_RE = re.compile(
+    r"<\s*(?:script|iframe|object|embed|svg|style|link|meta|frame|"
+    r"frameset|applet|form|input|button|on[a-z]+)\b",
+    re.IGNORECASE,
+)
+
+# Dangerous URI schemes inside markdown link/image targets.
+_DANGEROUS_URI_RE = re.compile(
+    r"(?:javascript|vbscript|file)\s*:|data\s*:\s*text/html",
+    re.IGNORECASE,
+)
+
+# Event-handler attributes (onclick=, onload=, ...).
+_EVENT_HANDLER_RE = re.compile(r"\bon[a-z]+\s*=", re.IGNORECASE)
+
+# Any HTML tag at all -- markdown does not require inline HTML, so we
+# fail closed if Athena tries to emit one. (Comments <!-- ... --> are
+# permitted because the existing docs already use drift-ignore markers,
+# but only as a single complete tag with no attributes.)
+_ANY_HTML_TAG_RE = re.compile(r"<\s*[A-Za-z/!?][^>]*>")
+
+# Markdown comment <!-- ... --> is the only HTML construct we allow
+# through the inline-tag gate.
+_MARKDOWN_COMMENT_RE = re.compile(r"<!--[\s\S]*?-->")
+
+# Control characters other than \n (\x0A) and \t (\x09).
+_DISALLOWED_CONTROL_RE = re.compile(r"[\x00-\x08\x0B-\x1F\x7F]")
+
+
+def validate_athena_content(block: str) -> tuple[bool, str]:
+    """Validate Athena-supplied markdown content against the allowlist.
+
+    Returns ``(ok, reason)``. Pure function, no I/O -- suitable for
+    direct unit-testing of each attack vector.
+
+    The function fails CLOSED: anything not on the markdown-only
+    allowlist (headings, lists, code fences/spans, tables, blockquotes,
+    plain text, hyperlinks, images, footnotes, markdown comments) is
+    rejected. The cron's caller is expected to abort the splice and
+    log the rejection on a ``False`` result.
+    """
+
+    if block is None:
+        return False, "content is None"
+
+    # Encode to count bytes (not codepoints) for the size gate.
+    encoded = block.encode("utf-8", errors="replace")
+    if len(encoded) > MAX_ATHENA_BLOCK_BYTES:
+        return False, (
+            f"Architecture block exceeds {MAX_ATHENA_BLOCK_BYTES} bytes "
+            f"(got {len(encoded)} bytes)."
+        )
+
+    if _DISALLOWED_CONTROL_RE.search(block):
+        return False, "content contains disallowed control characters."
+
+    if _DANGEROUS_TAG_RE.search(block):
+        match = _DANGEROUS_TAG_RE.search(block)
+        return False, (
+            f"content contains forbidden HTML tag near "
+            f"{match.group(0)!r}."  # type: ignore[union-attr]
+        )
+
+    if _EVENT_HANDLER_RE.search(block):
+        match = _EVENT_HANDLER_RE.search(block)
+        return False, (
+            f"content contains event-handler attribute "
+            f"{match.group(0)!r}."  # type: ignore[union-attr]
+        )
+
+    # Strip markdown comments before the catch-all HTML scan -- comments
+    # are the only HTML we tolerate (used by drift-ignore markers).
+    stripped = _MARKDOWN_COMMENT_RE.sub("", block)
+    # Strip fenced code blocks too; inside a fence, raw HTML is just
+    # rendered text and cannot execute.
+    stripped = re.sub(r"```[\s\S]*?```", "", stripped)
+    # And inline code spans.
+    stripped = re.sub(r"`[^`\n]*`", "", stripped)
+
+    html_match = _ANY_HTML_TAG_RE.search(stripped)
+    if html_match:
+        return False, (
+            f"content contains inline HTML tag {html_match.group(0)!r}; "
+            "markdown-only allowlist forbids raw HTML in Architecture."
+        )
+
+    # Markdown link / image targets: [text](target) or ![alt](target).
+    # Reject dangerous URI schemes in any (target).
+    for target_match in re.finditer(r"!?\[[^\]]*\]\(([^)]+)\)", block):
+        target = target_match.group(1).strip()
+        if _DANGEROUS_URI_RE.search(target):
+            return False, (
+                f"content contains forbidden URI scheme in link target: "
+                f"{target!r}."
+            )
+
+    return True, "ok"
+
+
+class AthenaContentRejected(ValueError):
+    """Raised when Athena's output fails the markdown-only allowlist.
+
+    Carries the human-readable rejection reason. The CLI wrapper turns
+    this into a non-zero exit so the cron caller refuses to commit the
+    poisoned splice.
+    """
+
 
 @dataclass(frozen=True)
 class SyncResult:
@@ -291,10 +417,20 @@ def _replace_architecture(
     replacement is available (Athena run was skipped or the section is
     absent from its output), the existing section is left intact so a
     failed Athena run cannot blank the architecture block.
+
+    Raises :class:`AthenaContentRejected` if ``athena_section`` fails
+    the markdown-only allowlist (S1 HIGH, task #2483).
     """
 
     if athena_section is None:
         return False
+
+    candidate = "\n".join(athena_section)
+    ok, reason = validate_athena_content(candidate)
+    if not ok:
+        raise AthenaContentRejected(
+            f"Athena Architecture section rejected by content allowlist: {reason}"
+        )
 
     section = _find_section(lines, ARCH_HEADING, start=boundary_idx)
     if section is None:
@@ -412,6 +548,12 @@ def main(argv: list[str] | None = None) -> int:
             module_count=module_count,
             line_count=line_count,
         )
+    except AthenaContentRejected as err:
+        # Content allowlist rejection: fail closed, exit 3 so the
+        # bash runner can distinguish poisoning from a structural
+        # README error. The script does NOT write anything to disk.
+        print(f"error: {err}", file=sys.stderr)
+        return 3
     except ValueError as err:
         print(f"error: {err}", file=sys.stderr)
         return 2
