@@ -719,6 +719,15 @@ def _validate_initiative_input(*, name: str, goal: str) -> str | None:
             "(ASCII C0/DEL, Unicode bidi-override, or zero-width); "
             "only newline and tab are allowed"
         )
+    # S2486-05: literal '<!--' check is intentionally byte-exact. The
+    # orchestrator's END-marker recognition uses a literal str.find on
+    # "<!-- END ORCHESTRATOR-MANAGED -->", so only the exact 4-byte ASCII
+    # sequence \x3C\x21\x2D\x2D can spoof a marker. Unicode dash look-alikes
+    # (U+2010-U+2014, U+2212) cannot — they would not match the orchestrator's
+    # literal find either. Bidi-override and zero-width chars are already
+    # rejected by _INITIATIVE_CTRL_CHARS_RE above, so a hidden \x2D cannot be
+    # visually masked. Do NOT loosen this check without re-evaluating the
+    # orchestrator's marker recognition.
     if "<!--" in name:
         return (
             "--create-initiative name contains literal '<!--' "
