@@ -1,5 +1,15 @@
 # Athena Weekly Truth-Sync
 
+<!-- drift-ignore -->
+<!--
+  All paths in this document are written relative to the repo root (e.g.
+  `scripts/athena_truth_sync.sh`), not relative to docs/.  The drift
+  checker resolves backtick paths against the containing doc's directory,
+  which would falsely flag every path on this page.  The drift-ignore
+  marker above tells check_docs_drift.py to skip path validation for the
+  remainder of this file.
+-->
+
 EQUIPA's repo-consistency workflow has four layers; this document covers
 Layer 2.
 
