@@ -30,6 +30,7 @@ from equipa.checkpoints import (
     load_soft_checkpoint,
     save_checkpoint,
 )
+from equipa.classifier import wrote_test_files
 from equipa.config import is_feature_enabled, load_dispatch_config
 from equipa.hooks import fire_async as fire_hook
 from equipa.constants import (
@@ -1441,6 +1442,40 @@ def _dispatch_tester_outcome(
         return "exit", tester_result, "tests_passed"
 
     if test_outcome == "no-tests":
+        # Task #2481: if the developer just wrote test files in this run,
+        # but the tester reports "no tests found", that is a contradiction.
+        # The tester is looking at a stale worktree or its discovery missed
+        # the new files. Route to tests_inconclusive rather than silently
+        # downgrading to "no_tests" — see equipa/classifier.py for the
+        # detection helper and the rationale.
+        dev_files = dev_result.get("files_changed_set") if isinstance(dev_result, dict) else None
+        if dev_files is None and isinstance(dev_result, dict):
+            dev_files = dev_result.get("files_changed")
+        if wrote_test_files(dev_files):
+            log(
+                f"  [Cycle {cycle}] Tester reported 'no-tests' but developer "
+                f"wrote test files this run. Routing to tests_inconclusive "
+                f"(task #2481 classifier guard).",
+                output,
+            )
+            payload = {
+                "outcome": "inconclusive",
+                "reason": "dev_wrote_tests_but_tester_found_none",
+                "dev_test_files": [
+                    p for p in (dev_files or []) if isinstance(p, str)
+                ][:10],
+            }
+            msg_content = json.dumps(payload)
+            post_agent_message(task_id, cycle, "tester", task_role,
+                               "tests_inconclusive", msg_content)
+            log(
+                f"  [Cycle {cycle}] Posted tests_inconclusive "
+                f"(dev_wrote_tests_but_tester_found_none) for {task_role}",
+                output,
+            )
+            _apply_cost_totals(tester_result, total_cost, total_duration)
+            return "exit", tester_result, "tests_inconclusive"
+
         log(f"  [Cycle {cycle}] No tests found. Accepting Developer result.", output)
         clear_checkpoints(task_id)
         _apply_cost_totals(dev_result, total_cost, total_duration)
@@ -1459,6 +1494,32 @@ def _dispatch_tester_outcome(
 
     if (test_outcome == "unknown" and test_results["tests_run"] == 0
             and test_results["tests_failed"] == 0):
+        # Task #2481: same classifier guard as the "no-tests" branch above —
+        # don't promote an "unknown, tests_run=0" tester reading to
+        # outcome=no_tests when the developer just wrote test files.
+        dev_files = dev_result.get("files_changed_set") if isinstance(dev_result, dict) else None
+        if dev_files is None and isinstance(dev_result, dict):
+            dev_files = dev_result.get("files_changed")
+        if wrote_test_files(dev_files):
+            log(
+                f"  [Cycle {cycle}] Tester returned unknown/0 but developer "
+                f"wrote test files this run. Routing to tests_inconclusive "
+                f"(task #2481 classifier guard).",
+                output,
+            )
+            payload = {
+                "outcome": "inconclusive",
+                "reason": "dev_wrote_tests_but_tester_unknown",
+                "dev_test_files": [
+                    p for p in (dev_files or []) if isinstance(p, str)
+                ][:10],
+            }
+            msg_content = json.dumps(payload)
+            post_agent_message(task_id, cycle, "tester", task_role,
+                               "tests_inconclusive", msg_content)
+            _apply_cost_totals(tester_result, total_cost, total_duration)
+            return "exit", tester_result, "tests_inconclusive"
+
         log(
             f"  [Cycle {cycle}] Tester returned unknown with 0 tests. "
             f"Treating as no-tests.",
