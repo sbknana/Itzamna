@@ -518,7 +518,10 @@ def build_system_prompt(
                 conn = get_db_connection(write=False)
                 try:
                     section = build_initiative_prompt_section(
-                        Path(project_dir), int(initiative_id), conn,
+                        Path(project_dir),
+                        int(initiative_id),
+                        conn,
+                        delimiter=_untrusted_delimiter,
                     )
                 finally:
                     conn.close()
