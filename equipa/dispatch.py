@@ -1864,8 +1864,9 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
                 # Concrete trigger: task 2358 — a pure CRYPTOTRADER-V3-
                 # ARCHITECTURE.md spec was blocked because the document
                 # used the word "HIGH" and discussed API-key auth.
+                # base_ref omitted → auto-detect default branch (#2479).
                 changed_files = await get_changed_files_for_branch(
-                    task_dir, base_ref="master",
+                    task_dir,
                 )
                 review_skipped_doc_only = is_doc_only_diff(changed_files)
                 review_crashed = False
