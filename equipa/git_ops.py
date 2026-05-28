@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from equipa.constants import (
@@ -25,6 +26,232 @@ from equipa.constants import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class WorktreeBranchConflictError(RuntimeError):
+    """Raised when ``create_task_worktree`` would reuse an existing branch.
+
+    Task #2488 root cause: the orchestrator was not isolating tasks in
+    separate worktrees, so when task #N+1's description happened to
+    reference task #N's branch, commits landed on #N instead of being
+    rejected. This defensive invariant fails fast at worktree-creation
+    time when ``forge-task-<id>`` already exists, rather than silently
+    proceeding and leaving the operator to diagnose a missing branch in
+    the merge step.
+    """
+
+
+class MissingTaskBranchError(RuntimeError):
+    """Raised when ``merge_task_branch`` is asked to merge a branch that
+    does not exist.
+
+    Task #2488: previously the merge step swallowed this case as
+    "branch has no commits ahead of HEAD" and silently skipped the
+    merge, masking the underlying worktree-isolation bug. Raise loudly
+    so the orchestrator can surface the failure to the operator.
+    """
+
+
+@dataclass(frozen=True)
+class TaskWorktree:
+    """Handle returned by :func:`create_task_worktree`.
+
+    Attributes:
+        path: Filesystem path of the isolated worktree the agent should
+            work inside.
+        branch: Name of the fresh branch backing the worktree
+            (``forge-task-<id>``).
+        repo: Path of the main checkout the worktree was attached to.
+            Needed by :func:`remove_task_worktree` so the caller does not
+            have to remember it separately.
+    """
+
+    path: Path
+    branch: str
+    repo: Path
+
+
+def _task_branch_name(task_id: int) -> str:
+    return f"forge-task-{task_id}"
+
+
+def _branch_exists(repo_path: Path, branch: str) -> bool:
+    result = git_run(
+        ["rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"],
+        repo_path, timeout=10,
+    )
+    return result.returncode == 0
+
+
+def create_task_worktree(
+    repo: str | Path,
+    task_id: int,
+    base_ref: str | None = None,
+) -> TaskWorktree:
+    """Create a fresh ``git worktree`` for ``task_id`` branched from
+    ``base_ref``.
+
+    Implements the per-task isolation contract documented in task #2488:
+
+    1. Every task gets a brand-new branch named ``forge-task-<id>``.
+    2. If that branch already exists, raise
+       :class:`WorktreeBranchConflictError` rather than silently reusing
+       it. The previous behaviour was to ``git checkout`` the stale
+       branch in the main checkout, so commits for task N+1 landed on
+       task N's branch when a description happened to reference it.
+    3. The worktree lives in ``<repo_parent>/.equipa-worktrees/task-<id>``
+       — a sibling directory of the main checkout — so concurrent
+       dispatches do not share working-tree state.
+    4. ``base_ref`` defaults to the repo's detected default branch when
+       not supplied, so callers do not have to special-case
+       ``master`` vs ``main``.
+
+    Returns a :class:`TaskWorktree` handle. Always pair with
+    :func:`remove_task_worktree` (in a ``try``/``finally``) so the main
+    checkout returns to a clean state on the default branch.
+
+    Raises:
+        WorktreeBranchConflictError: ``forge-task-<task_id>`` already
+            exists.
+        RuntimeError: ``git worktree add`` itself failed.
+    """
+    repo_path = Path(repo).resolve()
+    branch = _task_branch_name(task_id)
+
+    if _branch_exists(repo_path, branch):
+        raise WorktreeBranchConflictError(
+            f"refusing to create worktree for task {task_id}: branch "
+            f"{branch!r} already exists. This usually means a prior "
+            f"dispatch did not clean up. Run "
+            f"`git worktree remove --force <path>` and "
+            f"`git branch -D {branch}` before retrying."
+        )
+
+    if base_ref is None:
+        base_ref = get_default_branch(repo_path)
+
+    worktree_root = repo_path.parent / ".equipa-worktrees"
+    worktree_root.mkdir(exist_ok=True)
+    wt_path = worktree_root / f"task-{task_id}"
+
+    if wt_path.exists():
+        # Stale directory from a crashed prior dispatch. Try the clean
+        # `git worktree remove` first, fall back to rmtree if git has
+        # already lost track of it.
+        git_run(
+            ["worktree", "remove", "--force", str(wt_path)],
+            repo_path, timeout=30,
+        )
+        if wt_path.exists():
+            shutil.rmtree(wt_path, ignore_errors=True)
+        git_run(["worktree", "prune"], repo_path, timeout=10)
+
+    result = git_run(
+        ["worktree", "add", "-b", branch, str(wt_path), base_ref],
+        repo_path,
+        timeout=120,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"git worktree add failed for task {task_id} "
+            f"(branch={branch}, base={base_ref}): {result.stderr.strip()}"
+        )
+
+    logger.info(
+        "created worktree for task %s at %s on branch %s (base=%s)",
+        task_id, wt_path, branch, base_ref,
+    )
+    return TaskWorktree(path=wt_path, branch=branch, repo=repo_path)
+
+
+def remove_task_worktree(repo: str | Path, wt: TaskWorktree) -> None:
+    """Tear down a worktree created by :func:`create_task_worktree`.
+
+    After this call:
+
+    * The worktree directory is gone (forcibly removed; uncommitted
+      changes inside the worktree are dropped — agents are expected to
+      commit before tear-down).
+    * Stale worktree metadata is pruned from ``.git/worktrees``.
+    * The main checkout is switched back to the default branch
+      (``main``/``master``) so the next dispatch starts from a known
+      state. Task #2488 observed the main checkout being left on the
+      prior task's branch, which is precisely how branch reuse
+      happened.
+
+    The branch itself is NOT deleted — callers (the orchestrator merge
+    step) may still need to inspect or merge it. Use
+    ``git branch -D forge-task-<id>`` after a successful merge if you
+    want to reclaim the name.
+    """
+    repo_path = Path(repo).resolve()
+    git_run(
+        ["worktree", "remove", "--force", str(wt.path)],
+        repo_path, timeout=60,
+    )
+    if wt.path.exists():
+        shutil.rmtree(wt.path, ignore_errors=True)
+    git_run(["worktree", "prune"], repo_path, timeout=10)
+
+    default_branch = get_default_branch(repo_path)
+    checkout = git_run(
+        ["checkout", "-q", default_branch], repo_path, timeout=30,
+    )
+    if checkout.returncode != 0:
+        logger.warning(
+            "failed to checkout %s after worktree teardown: %s",
+            default_branch, checkout.stderr.strip(),
+        )
+
+
+def merge_task_branch(
+    repo: str | Path,
+    task_id: int,
+    target_ref: str | None = None,
+) -> subprocess.CompletedProcess:
+    """Merge ``forge-task-<task_id>`` into ``target_ref`` (default:
+    repo's default branch).
+
+    Defensive check (task #2488 acceptance criterion 5): if the branch
+    does not exist, raise :class:`MissingTaskBranchError` with an
+    explicit message instead of returning a "no commits ahead" no-op.
+    Silent skip is exactly how the original bug masked itself.
+
+    Returns the :class:`subprocess.CompletedProcess` of the underlying
+    ``git merge`` invocation so callers can inspect ``returncode`` /
+    ``stdout`` / ``stderr`` for merge conflicts and other recoverable
+    failures.
+    """
+    repo_path = Path(repo).resolve()
+    branch = _task_branch_name(task_id)
+
+    if not _branch_exists(repo_path, branch):
+        raise MissingTaskBranchError(
+            f"cannot merge task {task_id}: branch {branch!r} does not "
+            f"exist in {repo_path}. This usually means the worktree "
+            f"was never created (per-task branch reuse bug, task "
+            f"#2488). Inspect dispatch logs — do NOT silently skip the "
+            f"merge: the agent's commits may have landed on an "
+            f"unexpected branch."
+        )
+
+    if target_ref is None:
+        target_ref = get_default_branch(repo_path)
+
+    checkout = git_run(["checkout", "-q", target_ref], repo_path, timeout=30)
+    if checkout.returncode != 0:
+        raise RuntimeError(
+            f"failed to checkout {target_ref!r} before merging "
+            f"{branch!r}: {checkout.stderr.strip()}"
+        )
+
+    merge_args = [
+        *_git_identity_args(),
+        "merge", "--no-ff",
+        "-m", f"merge {branch} (task {task_id})",
+        branch,
+    ]
+    return git_run(merge_args, repo_path, timeout=180)
 
 
 class DefaultBranchDetectionError(RuntimeError):
