@@ -561,6 +561,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     group.add_argument("--config-cmd", choices=["snapshot", "list", "diff", "rollback"],
                         metavar="VERB",
                         help="Config-versioning subcommand: snapshot|list|diff|rollback")
+    group.add_argument("--create-initiative", type=str, metavar="NAME",
+                        help="Create a new initiative (requires --initiative-project and "
+                             "--initiative-goal). Phase 1.")
+    group.add_argument("--list-initiatives", action="store_true",
+                        help="List active initiatives, optionally filtered by "
+                             "--initiative-project codename.")
 
     parser.add_argument("--qiao", choices=["on", "off", "default"], default="default",
                         help="Enable/disable the qiao experimental plugin for this invocation. "
@@ -611,6 +617,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--force", action="store_true",
                         help="Force --config-cmd rollback past dirty-file check")
 
+    # --- Initiative helpers (Phase 1) ---
+    parser.add_argument("--initiative-project", type=str, default=None,
+                        metavar="CODENAME",
+                        help="Project codename for --create-initiative / "
+                             "--list-initiatives filter")
+    parser.add_argument("--initiative-goal", type=str, default=None,
+                        metavar="TEXT",
+                        help="Goal statement for --create-initiative (locked at creation)")
+
     return parser
 
 
@@ -646,6 +661,107 @@ def _auto_snapshot_dispatch(
 async def run_mode_mcp_server(args: argparse.Namespace) -> None:
     """Run as MCP server (JSON-RPC over stdio)."""
     run_server()
+
+
+async def run_mode_create_initiative(args: argparse.Namespace) -> None:
+    """Insert a new row into ``initiatives`` and print the new id."""
+    name = (args.create_initiative or "").strip()
+    project_codename = (args.initiative_project or "").strip()
+    goal = (args.initiative_goal or "").strip()
+    if not name:
+        print("ERROR: --create-initiative requires a non-empty NAME")
+        sys.exit(2)
+    if not project_codename:
+        print(
+            "ERROR: --create-initiative requires --initiative-project "
+            "<codename>"
+        )
+        sys.exit(2)
+    if not goal:
+        print(
+            "ERROR: --create-initiative requires --initiative-goal <text>"
+        )
+        sys.exit(2)
+
+    from equipa.db import get_db_connection
+
+    conn = get_db_connection(write=True)
+    try:
+        row = conn.execute(
+            "SELECT id FROM projects WHERE codename = ? OR name = ?",
+            (project_codename, project_codename),
+        ).fetchone()
+        if row is None:
+            print(f"ERROR: no project matches codename/name '{project_codename}'")
+            sys.exit(1)
+        project_id = row[0]
+        cursor = conn.execute(
+            "INSERT INTO initiatives (project_id, name, goal) VALUES (?, ?, ?)",
+            (project_id, name, goal),
+        )
+        conn.commit()
+        new_id = cursor.lastrowid
+    finally:
+        conn.close()
+
+    print(f"Created initiative id={new_id} for project '{project_codename}' (id={project_id})")
+    print(f"  Name: {name}")
+    print(f"  Goal: {goal}")
+    print(
+        f"  Plan file will be created at "
+        f"<target-repo>/.equipa/initiative-{new_id}.md on first dispatch."
+    )
+
+
+async def run_mode_list_initiatives(args: argparse.Namespace) -> None:
+    """Print a readable table of initiatives, optionally project-filtered."""
+    from equipa.db import get_db_connection
+
+    project_codename = (args.initiative_project or "").strip() or None
+
+    conn = get_db_connection(write=False)
+    try:
+        if project_codename:
+            rows = conn.execute(
+                """
+                SELECT i.id, p.codename, i.name, i.status, i.created_at,
+                       (SELECT COUNT(*) FROM tasks t WHERE t.initiative_id = i.id)
+                FROM initiatives i
+                LEFT JOIN projects p ON p.id = i.project_id
+                WHERE p.codename = ? OR p.name = ?
+                ORDER BY i.status, i.created_at DESC
+                """,
+                (project_codename, project_codename),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT i.id, p.codename, i.name, i.status, i.created_at,
+                       (SELECT COUNT(*) FROM tasks t WHERE t.initiative_id = i.id)
+                FROM initiatives i
+                LEFT JOIN projects p ON p.id = i.project_id
+                ORDER BY i.status, i.created_at DESC
+                """,
+            ).fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        print("No initiatives found.")
+        return
+
+    header = f"{'ID':>4}  {'PROJECT':<16}  {'STATUS':<10}  {'TASKS':>5}  {'CREATED':<19}  NAME"
+    print(header)
+    print("-" * len(header))
+    for r in rows:
+        iid, codename, name, status, created_at, task_count = r
+        codename = (codename or "—")[:16]
+        status = (status or "")[:10]
+        created_at = (created_at or "")[:19]
+        print(
+            f"{iid:>4}  {codename:<16}  {status:<10}  "
+            f"{task_count:>5}  {created_at:<19}  {name}"
+        )
 
 
 # --- Config-Versioning Helpers ---
@@ -1458,6 +1574,10 @@ def _select_mode_handler(args: argparse.Namespace) -> "callable":
     """
     if args.mcp_server:
         return run_mode_mcp_server
+    if getattr(args, "create_initiative", None):
+        return run_mode_create_initiative
+    if getattr(args, "list_initiatives", False):
+        return run_mode_list_initiatives
     if getattr(args, "config_cmd", None):
         return run_mode_config
     if args.regenerate_manifest:
