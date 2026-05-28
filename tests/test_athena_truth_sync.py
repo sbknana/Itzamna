@@ -654,3 +654,96 @@ def test_drift_still_present_triggers_open_question(
             f"history was:\n{history_text}"
         )
         cursor = idx + len(prefix)
+
+
+# ---------------------------------------------------------------------------
+# Tests: untracked-files guard (task #2485 S2 MEDIUM).
+# ---------------------------------------------------------------------------
+def test_untracked_files_abort_run(tmp_path: Path):
+    """Task #2485 S2: an untracked file in the working tree must abort
+    the runner BEFORE Athena or any sync happens. The original guard
+    (#2483 S3) only inspected tracked-file diffs; an untracked file would
+    silently survive and could be incorporated by the regeneration step
+    or by the unexpected-paths guard's diff. The strengthened guard adds
+    a ``git status --porcelain --untracked-files=normal`` check and the
+    runner must refuse to continue when its output is non-empty.
+    """
+
+    # ---- Fake repo (only .git needed; runner does not run git init) -----------
+    repo = tmp_path / "repo"
+    (repo / "scripts").mkdir(parents=True)
+    (repo / ".git").mkdir()
+    (repo / "README.md").write_text(FIXTURE_README, encoding="utf-8")
+
+    # Drift checker self-test must pass (so guard precedes drift check).
+    (repo / "scripts" / "check_docs_drift.py").write_text(
+        "#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n",
+        encoding="utf-8",
+    )
+    (repo / "scripts" / "check_docs_drift.py").chmod(0o755)
+
+    # ---- Fake-git stub that simulates an untracked file -----------------------
+    # `git diff --quiet HEAD` exits 0 (no tracked diffs), but
+    # `git status --porcelain --untracked-files=normal` outputs "?? new.txt"
+    # so the new OR branch of the guard fires.
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "git").write_text(
+        textwrap.dedent(
+            """\
+            #!/usr/bin/env bash
+            case "$1" in
+              diff)
+                  # No tracked changes.
+                  exit 0 ;;
+              status)
+                  # Emit an untracked file marker; mimics
+                  # `git status --porcelain --untracked-files=normal`.
+                  echo "?? rogue_untracked.txt"
+                  exit 0 ;;
+              symbolic-ref) echo "origin/master"; exit 0 ;;
+              *)
+                  # We must not reach any further git calls: the guard
+                  # should abort before fetch / checkout / pull.
+                  echo "fake-git: guard escaped, unexpected: $*" >&2
+                  exit 99 ;;
+            esac
+            """
+        ),
+        encoding="utf-8",
+    )
+    (fake_bin / "git").chmod(0o755)
+    # flock passthrough so the runner's re-exec does not block.
+    import shutil
+
+    host_flock = shutil.which("flock")
+    if host_flock:
+        (fake_bin / "flock").symlink_to(host_flock)
+    else:
+        (fake_bin / "flock").write_text(
+            '#!/usr/bin/env bash\nwhile [[ "$1" == -* || "$1" == /* ]]; '
+            'do shift; done\nexec "$@"\n',
+            encoding="utf-8",
+        )
+        (fake_bin / "flock").chmod(0o755)
+
+    runner = REPO_ROOT / "scripts" / "athena_truth_sync.sh"
+    env = {
+        "PATH": f"{fake_bin}:/usr/bin:/bin",
+        "EQUIPA_REPO": str(repo),
+        "ATHENA_DIR": str(tmp_path / "athena_missing"),
+        "ATHENA_CLI": str(tmp_path / "athena_missing" / "cli.js"),
+        "PYTHON_BIN": sys.executable,
+        "HOME": str(tmp_path),
+    }
+    proc = subprocess.run(
+        ["bash", str(runner)], capture_output=True, text=True, env=env
+    )
+
+    assert proc.returncode == 1, (
+        f"expected runner to exit 1 on untracked-file detection, "
+        f"got {proc.returncode}\nSTDOUT:{proc.stdout}\nSTDERR:{proc.stderr}"
+    )
+    assert "uncommitted/untracked changes detected" in proc.stderr, (
+        f"expected guard message not in stderr:\n{proc.stderr}"
+    )

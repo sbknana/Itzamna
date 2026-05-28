@@ -232,9 +232,13 @@ main() {
         exit 1
     fi
 
-    # ---- Clean-checkout guard (task #2483 S3) --------------------------------
-    if ! git diff --quiet HEAD; then
-        err "uncommitted changes detected -- aborting"
+    # ---- Clean-checkout guard (task #2483 S3, tightened #2485 S2) ------------
+    # Reject BOTH uncommitted tracked-file changes AND any untracked files.
+    # An untracked file in the working tree could be silently incorporated
+    # by Athena's regeneration or by the unexpected-paths guard's diff, so
+    # we refuse to operate unless the worktree is fully clean.
+    if ! git diff --quiet HEAD || [[ -n "$(git status --porcelain --untracked-files=normal)" ]]; then
+        err "uncommitted/untracked changes detected -- aborting"
         exit 1
     fi
 
