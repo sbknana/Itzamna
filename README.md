@@ -107,7 +107,7 @@ spawn a separate worktree — it commits on a `forge-task-<id>` branch in the
 main checkout, so concurrent single-task dispatches against the same repo are
 not supported.
 
-Defensive invariants (task #2488):
+Defensive invariants (task #2488, hardened in #2490):
 - Worktree creation refuses to reuse an existing `forge-task-<id>` branch
   (`WorktreeBranchConflictError`) instead of silently committing onto the
   prior task's branch.
@@ -115,6 +115,16 @@ Defensive invariants (task #2488):
   in the parallel path) when the expected branch is missing, rather than
   reporting "no commits ahead of HEAD" — that silent skip is exactly how
   branch-reuse bugs masked themselves historically.
+- Conflict-handling policy (unified across `git_ops.create_task_worktree`
+  and `dispatch._create_isolation_worktrees`): on a branch-name conflict
+  the default behaviour is to **raise** `WorktreeBranchConflictError` and
+  route the task to the shared-dir fallback. Unmerged commit SHAs ahead
+  of the default branch are logged before raising so the operator can
+  recover via `git reflog`. The legacy "delete-and-retry" behaviour is
+  only available when the caller passes `force=True` explicitly — never
+  the default. Destroying unmerged commits silently is worse than the
+  branch-reuse bug it was trying to mask (task #2488 regression
+  hardening).
 
 ### Cost Controls
 Per-task budgets scale by complexity (simple/medium/complex/epic). Agents that waste turns reading without writing get warned and then killed. You set the limits, EQUIPA enforces them.

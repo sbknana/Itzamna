@@ -1332,6 +1332,26 @@ async def _create_isolation_worktrees(
                 project_dir, timeout=60,
             )
             if add_res.returncode != 0:
+                # Distinguish "branch already exists" (conflict — apply
+                # the safe-default raise policy) from other git failures
+                # (broken repo, disk full, etc — log warning + skip).
+                branch_exists_res = await git_run_async(
+                    ["rev-parse", "--verify", "--quiet",
+                     f"refs/heads/{branch_name}"],
+                    project_dir, timeout=10,
+                )
+                if branch_exists_res.returncode != 0:
+                    err_preview = (
+                        add_res.stderr[:200] if add_res.stderr
+                        else f"rc={add_res.returncode}"
+                    )
+                    print(
+                        f"  [Isolation] WARNING: Could not create worktree "
+                        f"for task #{task_id}, using shared dir "
+                        f"(worktree add failed: {err_preview})"
+                    )
+                    continue
+
                 # Conflict path. Log the unmerged-commit count on the
                 # pre-existing branch so the operator has a recovery
                 # anchor for `git reflog` even if force=True wipes the

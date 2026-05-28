@@ -154,3 +154,98 @@ def test_worktree_teardown_returns_main_to_master(tmp_git_repo: Path) -> None:
     assert head_ref.endswith("/master"), f"main checkout on {head_ref!r}, expected master"
     # Worktree directory gone.
     assert not wt.path.exists()
+
+
+# --- Task #2490: dispatch.py parallel-path conflict policy ---
+
+
+@pytest.fixture
+def tmp_git_repo_with_conflict(tmp_path: Path) -> Path:
+    """Repo where `forge-task-9999` exists with an unmerged commit.
+
+    Models the exact scenario task #2490 hardens against: dispatch tries
+    to create a worktree for a task whose branch already carries work
+    that has NOT yet been merged to master. The old code would
+    `git branch -D` that branch and destroy the work; the new policy
+    raises WorktreeBranchConflictError so the work survives.
+    """
+    repo = tmp_path / "repo_conflict"
+    _init_repo(repo)
+    _run(["git", "checkout", "-q", "-b", "forge-task-9999"], repo)
+    (repo / "unmerged.txt").write_text("important unmerged work\n", encoding="utf-8")
+    _run(["git", "add", "unmerged.txt"], repo)
+    _run(["git", "commit", "-q", "-m", "feat(9999): unmerged work"], repo)
+    _run(["git", "checkout", "-q", "master"], repo)
+    return repo
+
+
+def test_dispatch_conflict_preserves_unmerged_branch(
+    tmp_git_repo_with_conflict: Path,
+) -> None:
+    """The parallel-dispatch isolation helper must NOT force-delete a
+    pre-existing branch with unmerged commits.
+
+    Acceptance criterion 5 from task #2490:
+    - Setup: pre-create branch forge-task-9999 with one un-merged commit.
+    - Dispatch mock task #9999.
+    - Assert: branch forge-task-9999 STILL EXISTS with the un-merged
+      commit intact.
+    - Assert: dispatch raised WorktreeBranchConflictError OR routed to
+      shared-dir fallback (the new default).
+    """
+    import asyncio
+
+    from equipa.dispatch import _create_isolation_worktrees
+
+    head_before = _git_rev_parse("forge-task-9999", tmp_git_repo_with_conflict)
+    assert head_before is not None, "fixture must create forge-task-9999"
+
+    worktree_base = tmp_git_repo_with_conflict.parent / ".equipa-worktrees-9999"
+    result = asyncio.run(
+        _create_isolation_worktrees(
+            tasks=[{"id": 9999}],
+            project_dir=str(tmp_git_repo_with_conflict),
+            worktree_base=worktree_base,
+        )
+    )
+
+    # Routed to shared-dir fallback (task not present in result map).
+    assert 9999 not in result, (
+        f"task #9999 should have been routed to shared-dir fallback, "
+        f"got worktree_dirs={result!r}"
+    )
+
+    # Branch + unmerged commit intact.
+    head_after = _git_rev_parse("forge-task-9999", tmp_git_repo_with_conflict)
+    assert head_after == head_before, (
+        f"forge-task-9999 was destroyed or rewound: "
+        f"before={head_before!r} after={head_after!r}"
+    )
+
+
+def test_dispatch_conflict_force_true_still_deletes(
+    tmp_git_repo_with_conflict: Path,
+) -> None:
+    """When the caller explicitly passes force=True the legacy
+    delete-and-retry behaviour is preserved (escape hatch documented
+    in task #2490 acceptance criterion 3)."""
+    import asyncio
+
+    from equipa.dispatch import _create_isolation_worktrees
+
+    assert _git_rev_parse("forge-task-9999", tmp_git_repo_with_conflict) is not None
+
+    worktree_base = tmp_git_repo_with_conflict.parent / ".equipa-worktrees-9999-f"
+    result = asyncio.run(
+        _create_isolation_worktrees(
+            tasks=[{"id": 9999}],
+            project_dir=str(tmp_git_repo_with_conflict),
+            worktree_base=worktree_base,
+            force=True,
+        )
+    )
+
+    # With force=True the worktree IS created (legacy behaviour).
+    assert 9999 in result, (
+        f"force=True should recreate the worktree; got {result!r}"
+    )
