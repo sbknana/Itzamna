@@ -27,6 +27,12 @@ import sys
 from pathlib import Path
 
 
+# S3 hardening: CHECK constraints bound the two free-text fields at the
+# DB layer so a caller that bypasses the CLI guard
+# (equipa.cli._validate_initiative_input) cannot insert a multi-megabyte
+# goal that would later be injected into every sibling-task system prompt.
+# The cap values mirror the CLI constants INITIATIVE_NAME_MAX (200) and
+# INITIATIVE_GOAL_MAX (8192); keep them in sync if either changes.
 INITIATIVES_DDL = """
 CREATE TABLE IF NOT EXISTS initiatives (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -36,7 +42,8 @@ CREATE TABLE IF NOT EXISTS initiatives (
     status TEXT NOT NULL DEFAULT 'active',
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     completed_at DATETIME,
-    FOREIGN KEY (project_id) REFERENCES projects(id)
+    FOREIGN KEY (project_id) REFERENCES projects(id),
+    CHECK (length(name) <= 200 AND length(goal) <= 8192)
 );
 """
 

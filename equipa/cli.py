@@ -12,6 +12,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sqlite3
 import sys
 from pathlib import Path
@@ -663,6 +664,59 @@ async def run_mode_mcp_server(args: argparse.Namespace) -> None:
     run_server()
 
 
+# Length caps enforced both at the CLI boundary AND at the DB layer via
+# the CHECK constraint in scripts/migrate_initiative_schema.py. The CLI
+# layer exists to produce friendly error messages; the DB layer exists
+# to catch any caller that bypasses the CLI (raw SQL, future API, etc.).
+INITIATIVE_NAME_MAX = 200
+INITIATIVE_GOAL_MAX = 8192
+
+# Control characters are stripped at the plan-file boundary by
+# equipa.initiative._sanitize_agent_text, but we reject them here too so
+# the initiative row in TheForge stays clean and downstream displays
+# don't have to defend against terminal-control characters.
+_INITIATIVE_CTRL_CHARS_RE = re.compile(r"[\x00-\x08\x0B-\x1F\x7F]")
+
+
+def _validate_initiative_input(*, name: str, goal: str) -> str | None:
+    """Validate the two free-text fields the CLI inserts into ``initiatives``.
+
+    Returns ``None`` if both fields pass, or a single human-readable
+    error message describing the first violation. Cheap to call.
+    """
+    if len(name) > INITIATIVE_NAME_MAX:
+        return (
+            f"--create-initiative name exceeds {INITIATIVE_NAME_MAX} "
+            f"chars (got {len(name)})"
+        )
+    if len(goal) > INITIATIVE_GOAL_MAX:
+        return (
+            f"--initiative-goal exceeds {INITIATIVE_GOAL_MAX} chars "
+            f"(got {len(goal)})"
+        )
+    if _INITIATIVE_CTRL_CHARS_RE.search(name):
+        return (
+            "--create-initiative name contains ASCII control characters "
+            "(only newline and tab allowed)"
+        )
+    if _INITIATIVE_CTRL_CHARS_RE.search(goal):
+        return (
+            "--initiative-goal contains ASCII control characters "
+            "(only newline and tab allowed)"
+        )
+    if "<!--" in name:
+        return (
+            "--create-initiative name contains literal '<!--' "
+            "(HTML comment opener is reserved for orchestrator markers)"
+        )
+    if "<!--" in goal:
+        return (
+            "--initiative-goal contains literal '<!--' "
+            "(HTML comment opener is reserved for orchestrator markers)"
+        )
+    return None
+
+
 async def run_mode_create_initiative(args: argparse.Namespace) -> None:
     """Insert a new row into ``initiatives`` and print the new id."""
     name = (args.create_initiative or "").strip()
@@ -681,6 +735,19 @@ async def run_mode_create_initiative(args: argparse.Namespace) -> None:
         print(
             "ERROR: --create-initiative requires --initiative-goal <text>"
         )
+        sys.exit(2)
+
+    # S3 input validation. The CLI is the first writer to the initiatives
+    # row, which then feeds the plan-file header (via _render_initial_template)
+    # and the agent system prompt. Reject the same hostile inputs the
+    # downstream sanitiser would catch — fail fast at the CLI boundary
+    # rather than silently mangling state with truncation/escapes. The
+    # DB CHECK constraint enforces the length caps even if a future
+    # caller bypasses the CLI; keeping CLI errors clearer is the only
+    # reason for the duplicated guard here.
+    validation_error = _validate_initiative_input(name=name, goal=goal)
+    if validation_error is not None:
+        print(f"ERROR: {validation_error}")
         sys.exit(2)
 
     from equipa.db import get_db_connection
