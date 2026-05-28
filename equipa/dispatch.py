@@ -1289,6 +1289,8 @@ async def _create_isolation_worktrees(
     tasks: list[dict],
     project_dir: str,
     worktree_base: Path,
+    *,
+    force: bool = False,
 ) -> dict[int, str]:
     """Create per-task git worktrees for filesystem isolation.
 
@@ -1296,9 +1298,23 @@ async def _create_isolation_worktrees(
     worktree creation fails are omitted from the returned map (they will
     fall back to sharing project_dir).
 
+    Conflict-handling policy (task #2490, hardening of #2488):
+    When ``git worktree add -b`` reports that ``forge-task-<id>`` already
+    exists, the default behaviour is the SAFE one: raise
+    :class:`WorktreeBranchConflictError` (from :mod:`equipa.git_ops`) so
+    the caller can route the task to the shared-dir fallback explicitly.
+    Before raising, the unmerged-commit count on the conflicting branch
+    (``git rev-list --count <default>..<branch>``) is logged so the
+    operator can recover the work via ``git reflog`` if needed. The prior
+    destructive behaviour (``git branch -D``) is preserved only when the
+    caller passes ``force=True``; in that case the unmerged commits the
+    delete would discard are still logged first.
+
     Uses ``git_run_async`` so the per-task git invocations do not block
     the event loop while parallel task dispatch is queued.
     """
+    from equipa.git_ops import WorktreeBranchConflictError, get_default_branch
+
     worktree_dirs: dict[int, str] = {}
     worktree_base.mkdir(exist_ok=True)
     for t in tasks:
@@ -1316,18 +1332,68 @@ async def _create_isolation_worktrees(
                 project_dir, timeout=60,
             )
             if add_res.returncode != 0:
-                # Fallback: branch may already exist. Task #2488: log a
-                # WARNING before destroying it so the operator can see
-                # that a prior task's branch was reclaimed (the silent
-                # fallback was how the original branch-reuse bug masked
-                # itself). The branch is only force-deleted because we
-                # got past the `add_res != 0` check, meaning git refused
-                # to create a fresh worktree on this name.
+                # Conflict path. Log the unmerged-commit count on the
+                # pre-existing branch so the operator has a recovery
+                # anchor for `git reflog` even if force=True wipes the
+                # ref.
+                default_branch = get_default_branch(project_dir)
+                unmerged_count = "unknown"
+                unmerged_shas = ""
+                try:
+                    count_res = await git_run_async(
+                        ["rev-list", "--count",
+                         f"{default_branch}..{branch_name}"],
+                        project_dir, timeout=10,
+                    )
+                    if count_res.returncode == 0:
+                        unmerged_count = (count_res.stdout or "").strip() or "0"
+                    sha_res = await git_run_async(
+                        ["rev-list", f"{default_branch}..{branch_name}"],
+                        project_dir, timeout=10,
+                    )
+                    if sha_res.returncode == 0:
+                        unmerged_shas = (sha_res.stdout or "").strip()
+                except (subprocess.SubprocessError, OSError) as inspect_err:
+                    print(
+                        f"  [Isolation] WARNING: could not inspect "
+                        f"'{branch_name}' before conflict handling: "
+                        f"{inspect_err}"
+                    )
+
+                conflict_msg = (
+                    f"task #{task_id} branch '{branch_name}' already "
+                    f"exists with {unmerged_count} unmerged commit(s) "
+                    f"ahead of '{default_branch}'"
+                )
+                if unmerged_shas:
+                    print(
+                        f"  [Isolation] Unmerged SHAs for '{branch_name}' "
+                        f"(recoverable via reflog): "
+                        f"{unmerged_shas.replace(chr(10), ' ')}"
+                    )
+
+                if not force:
+                    # Safe default: raise so the caller routes to the
+                    # shared-dir fallback. Matches equipa.git_ops
+                    # create_task_worktree policy.
+                    print(
+                        f"  [Isolation] ERROR: {conflict_msg}; "
+                        f"refusing to force-delete (force=False). "
+                        f"Routing task to shared dir fallback."
+                    )
+                    raise WorktreeBranchConflictError(
+                        f"refusing to create worktree for task "
+                        f"{task_id}: branch '{branch_name}' already "
+                        f"exists with {unmerged_count} unmerged "
+                        f"commit(s). Pass force=True to override or "
+                        f"delete the branch manually after recovering "
+                        f"the commits."
+                    )
+
                 print(
-                    f"  [Isolation] WARNING: task #{task_id} branch "
-                    f"'{branch_name}' already exists — force-deleting "
-                    f"to recreate fresh worktree (stderr: "
-                    f"{add_res.stderr[:200]})"
+                    f"  [Isolation] WARNING: {conflict_msg}; "
+                    f"force=True, deleting branch and retrying "
+                    f"(stderr: {add_res.stderr[:200]})"
                 )
                 await git_run_async(
                     ["branch", "-D", branch_name], project_dir, timeout=10,
@@ -1354,6 +1420,11 @@ async def _create_isolation_worktrees(
                 worktree_dirs[task_id] = str(wt_path)
                 _copy_hooks_to_worktree(project_dir, str(wt_path))
                 print(f"  [Isolation] Task #{task_id} -> {wt_path.name}")
+        except WorktreeBranchConflictError:
+            # Safe-default conflict path: the WARNING/ERROR was already
+            # logged above. Skip the task (it will use shared dir) so
+            # the rest of the batch can still be isolated.
+            continue
         except (subprocess.SubprocessError, OSError) as e:
             print(
                 f"  [Isolation] WARNING: Worktree creation errored for "
