@@ -91,12 +91,20 @@ The truth-sync cron commits with `git commit -S` against a dedicated
 GPG key. The key is **never shared** with developer commits.
 
 * Identity: `EQUIPA truth-sync bot <athena-bot@forgeborn.dev>`
-* Fingerprint: documented at
-  `/srv/forge-share/AI_Stuff/Athena/keys/athena-bot.fingerprint` on
-  Claudinator.
+* **Pinned by long-format fingerprint, NOT by email** (task #2485 S3).
+  Email-based key selection is trivially spoofable: any imported key
+  whose UID lists the same email could be picked by gpg. The cron's
+  preflight rejects `ATHENA_SIGNING_KEY` unless it is a 40-hex
+  fingerprint, refuses to start if that fingerprint is not present in
+  the secret keyring, and refuses to start if it resolves to more than
+  one distinct primary key (defence against UID-collision swap).
+* **Current bot key fingerprint:**
+  `0000000000000000000000000000000000000000`
+  *(placeholder -- the real fingerprint must be set by the operator via
+  the `ATHENA_SIGNING_KEY` env var on the cron host; the default is a
+  fail-closed sentinel that is guaranteed not to resolve to any key).*
 * Imported under user `user`'s GPG keyring (`gpg --list-secret-keys
-  athena-bot@forgeborn.dev` must list it; the cron inherits `user`'s
-  environment).
+  <fingerprint>` must list it; the cron inherits `user`'s environment).
 
 The script does **not** generate the key. Generation/installation is
 operator-driven:
@@ -105,19 +113,58 @@ operator-driven:
 # One-time, on Claudinator, as `user`:
 gpg --quick-gen-key 'EQUIPA truth-sync bot <athena-bot@forgeborn.dev>' \
     ed25519 sign 2y
-gpg --list-secret-keys --keyid-format=long athena-bot@forgeborn.dev \
-    | tee /srv/forge-share/AI_Stuff/Athena/keys/athena-bot.fingerprint
+
+# Capture the long-format fingerprint (40 hex chars, no spaces):
+FPR="$(gpg --list-secret-keys --with-colons athena-bot@forgeborn.dev \
+       | awk -F: '/^fpr:/ {print $10; exit}')"
+echo "$FPR" | tee /srv/forge-share/AI_Stuff/Athena/keys/athena-bot.fingerprint
 
 # Verify git can sign:
-echo "test" | gpg --clearsign -u athena-bot@forgeborn.dev >/dev/null
+echo "test" | gpg --clearsign -u "$FPR" >/dev/null
+
+# Install the fingerprint into the cron environment (crontab or env file):
+#   export ATHENA_SIGNING_KEY=<fingerprint>
 
 # Upload the public key to GitHub under the bot account.
-gpg --armor --export athena-bot@forgeborn.dev | xclip -selection clipboard
+gpg --armor --export "$FPR" | xclip -selection clipboard
 ```
 
-If `gpg` is unavailable, the key is expired, or the keyring is
-inaccessible, the cron aborts with a clear log line -- it never falls
-back to an unsigned commit.
+If `gpg` is unavailable, the key is expired, the keyring is
+inaccessible, or the fingerprint is missing/ambiguous, the cron aborts
+with a clear log line -- it never falls back to an unsigned commit.
+
+### Key rotation
+
+When the bot key reaches expiry or is suspected of compromise:
+
+1. **Generate a replacement key** on Claudinator as `user`:
+   ```bash
+   gpg --quick-gen-key 'EQUIPA truth-sync bot <athena-bot@forgeborn.dev>' \
+       ed25519 sign 2y
+   NEW_FPR="$(gpg --list-secret-keys --with-colons athena-bot@forgeborn.dev \
+              | awk -F: '/^fpr:/ {print $10}' | tail -n1)"
+   ```
+2. **Confirm the new fingerprint is unique** in the keyring -- if the
+   old key has not yet been deleted, the preflight will reject the
+   ambiguous lookup. Either delete the old secret key first, or pass
+   the NEW fingerprint explicitly (which is what the preflight does).
+3. **Update the cron env**: edit the crontab line (or the env file the
+   cron sources) to set `ATHENA_SIGNING_KEY=$NEW_FPR`. The placeholder
+   default in the script intentionally fails closed, so a missing env
+   override is loud rather than silent.
+4. **Update this document**: replace the "Current bot key fingerprint"
+   value above with `$NEW_FPR`. Reviewers should grep
+   `ATHENA_SIGNING_KEY` in this file when auditing rotations.
+5. **Update GitHub** to trust the new public key under the bot account
+   (`gpg --armor --export $NEW_FPR | gh ssh-key add` or via the UI).
+6. **Revoke and delete the old secret** once the new key is verified
+   working end-to-end:
+   ```bash
+   gpg --gen-revoke <old-fpr>      # produce + publish revocation cert
+   gpg --delete-secret-keys <old-fpr>
+   ```
+7. **Run the cron manually once** to confirm the new key signs and
+   pushes cleanly (see "Manual force-run" below).
 
 ## When it runs
 
@@ -156,7 +203,7 @@ Override env vars:
 | `ATHENA_CLI`             | `${ATHENA_DIR}/dist/cli.js`                               |
 | `ATHENA_MODEL`           | `quality`                                                 |
 | `PYTHON_BIN`             | `python3`                                                 |
-| `ATHENA_SIGNING_KEY`     | `athena-bot@forgeborn.dev`                                |
+| `ATHENA_SIGNING_KEY`     | `0000...0` (40-hex fail-closed sentinel; operator MUST override with the bot key fingerprint) |
 | `ATHENA_BOT_NAME`        | `EQUIPA truth-sync bot`                                   |
 | `ATHENA_BOT_EMAIL`       | `athena-bot@forgeborn.dev`                                |
 | `ATHENA_LOCKFILE`        | `/tmp/athena-truth-sync.lock`                             |
@@ -203,7 +250,9 @@ sudo tee /etc/logrotate.d/athena-truth-sync <<'EOF'
 EOF
 
 # 3. Verify the GPG bot key is installed (see "Commit signing" above).
-gpg --list-secret-keys athena-bot@forgeborn.dev || exit 1
+#    Use the long-format fingerprint; the cron's preflight rejects
+#    email-based lookups.
+gpg --list-secret-keys "$ATHENA_SIGNING_KEY" || exit 1
 
 # 4. Add the cron entry.
 crontab -l > /tmp/cron.bak

@@ -562,6 +562,24 @@ def test_drift_still_present_triggers_open_question(
     (fake_bin / "git").chmod(0o755)
     (fake_bin / "node").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
     (fake_bin / "node").chmod(0o755)
+    # Fake gpg stub (task #2485 S3): the signing-key preflight asks
+    # gpg to confirm the configured fingerprint is in the secret keyring.
+    # We emit one synthetic sec+fpr pair that matches the supplied
+    # fingerprint in --with-colons format.
+    (fake_bin / "gpg").write_text(
+        textwrap.dedent(
+            """\
+            #!/usr/bin/env bash
+            # Last positional argument is the fingerprint being looked up.
+            fp="${@: -1}"
+            echo "sec:u:4096:1:${fp}:1700000000::u:::scESC:::::ed25519::"
+            echo "fpr:::::::::${fp}:"
+            exit 0
+            """
+        ),
+        encoding="utf-8",
+    )
+    (fake_bin / "gpg").chmod(0o755)
     # flock is needed in PATH so the runner's re-exec finds it. Use
     # the host flock if present; otherwise stub it as a passthrough.
     import shutil
@@ -606,6 +624,8 @@ def test_drift_still_present_triggers_open_question(
         "THEFORGE_DB": str(forge_db),
         "EQUIPA_PROJECT_ID": "23",
         "HOME": str(tmp_path),
+        # Task #2485 S3: signing-key preflight requires a 40-hex fingerprint.
+        "ATHENA_SIGNING_KEY": "ABCDEF0123456789ABCDEF0123456789ABCDEF01",
     }
     proc = subprocess.run(
         ["bash", str(runner)], capture_output=True, text=True, env=env
@@ -713,6 +733,21 @@ def test_untracked_files_abort_run(tmp_path: Path):
         encoding="utf-8",
     )
     (fake_bin / "git").chmod(0o755)
+    # Fake gpg stub (task #2485 S3): signing-key preflight precedes the
+    # clean-checkout guard, so we must let it pass to exercise the guard.
+    (fake_bin / "gpg").write_text(
+        textwrap.dedent(
+            """\
+            #!/usr/bin/env bash
+            fp="${@: -1}"
+            echo "sec:u:4096:1:${fp}:1700000000::u:::scESC:::::ed25519::"
+            echo "fpr:::::::::${fp}:"
+            exit 0
+            """
+        ),
+        encoding="utf-8",
+    )
+    (fake_bin / "gpg").chmod(0o755)
     # flock passthrough so the runner's re-exec does not block.
     import shutil
 
@@ -735,6 +770,8 @@ def test_untracked_files_abort_run(tmp_path: Path):
         "ATHENA_CLI": str(tmp_path / "athena_missing" / "cli.js"),
         "PYTHON_BIN": sys.executable,
         "HOME": str(tmp_path),
+        # Task #2485 S3: signing-key preflight needs a valid fingerprint.
+        "ATHENA_SIGNING_KEY": "ABCDEF0123456789ABCDEF0123456789ABCDEF01",
     }
     proc = subprocess.run(
         ["bash", str(runner)], capture_output=True, text=True, env=env
@@ -747,3 +784,134 @@ def test_untracked_files_abort_run(tmp_path: Path):
     assert "uncommitted/untracked changes detected" in proc.stderr, (
         f"expected guard message not in stderr:\n{proc.stderr}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Tests: signing-key preflight (task #2485 S3 MEDIUM).
+# ---------------------------------------------------------------------------
+def _stub_signing_key_repo(tmp_path: Path) -> tuple[Path, Path]:
+    """Build a minimal repo + fake bin tree shared by the S3 tests.
+
+    Returns ``(repo, fake_bin)``. Caller is responsible for adding the
+    gpg stub it needs for the scenario under test.
+    """
+
+    repo = tmp_path / "repo"
+    (repo / "scripts").mkdir(parents=True)
+    (repo / ".git").mkdir()
+    (repo / "README.md").write_text(FIXTURE_README, encoding="utf-8")
+    # drift checker self-test must pass (or we never reach signing preflight).
+    (repo / "scripts" / "check_docs_drift.py").write_text(
+        "#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n",
+        encoding="utf-8",
+    )
+    (repo / "scripts" / "check_docs_drift.py").chmod(0o755)
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "git").write_text(
+        "#!/usr/bin/env bash\ncase \"$1\" in diff|status) exit 0 ;; "
+        "symbolic-ref) echo origin/master; exit 0 ;; "
+        "*) echo \"fake-git: should not run: $*\" >&2; exit 9 ;; esac\n",
+        encoding="utf-8",
+    )
+    (fake_bin / "git").chmod(0o755)
+    import shutil
+
+    host_flock = shutil.which("flock")
+    if host_flock:
+        (fake_bin / "flock").symlink_to(host_flock)
+    else:
+        (fake_bin / "flock").write_text(
+            '#!/usr/bin/env bash\nwhile [[ "$1" == -* || "$1" == /* ]]; '
+            'do shift; done\nexec "$@"\n',
+            encoding="utf-8",
+        )
+        (fake_bin / "flock").chmod(0o755)
+    return repo, fake_bin
+
+
+def _run_signing_preflight(
+    tmp_path: Path, repo: Path, fake_bin: Path, signing_key: str
+) -> subprocess.CompletedProcess:
+    runner = REPO_ROOT / "scripts" / "athena_truth_sync.sh"
+    env = {
+        "PATH": f"{fake_bin}:/usr/bin:/bin",
+        "EQUIPA_REPO": str(repo),
+        "ATHENA_DIR": str(tmp_path / "athena_missing"),
+        "ATHENA_CLI": str(tmp_path / "athena_missing" / "cli.js"),
+        "PYTHON_BIN": sys.executable,
+        "HOME": str(tmp_path),
+        "ATHENA_SIGNING_KEY": signing_key,
+    }
+    return subprocess.run(
+        ["bash", str(runner)], capture_output=True, text=True, env=env
+    )
+
+
+def test_signing_key_must_be_40_hex_fingerprint(tmp_path: Path):
+    """ATHENA_SIGNING_KEY rejected when not a 40-hex GPG fingerprint."""
+
+    repo, fake_bin = _stub_signing_key_repo(tmp_path)
+    # Even if gpg succeeded, the format check is upstream and must fail.
+    (fake_bin / "gpg").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    (fake_bin / "gpg").chmod(0o755)
+
+    # Email-shaped value (the OLD default we just replaced) is rejected.
+    proc = _run_signing_preflight(
+        tmp_path, repo, fake_bin, "athena-bot@forgeborn.dev"
+    )
+    assert proc.returncode == 1, proc.stderr
+    assert "40-hex" in proc.stderr.lower() or "fingerprint" in proc.stderr.lower(), (
+        f"expected fingerprint format error, got:\n{proc.stderr}"
+    )
+
+
+def test_signing_key_missing_from_keyring_aborts(tmp_path: Path):
+    """A correctly-formatted fingerprint that gpg cannot find aborts the run."""
+
+    repo, fake_bin = _stub_signing_key_repo(tmp_path)
+    # gpg emits nothing => key not present.
+    (fake_bin / "gpg").write_text("#!/usr/bin/env bash\nexit 2\n", encoding="utf-8")
+    (fake_bin / "gpg").chmod(0o755)
+
+    proc = _run_signing_preflight(
+        tmp_path, repo, fake_bin,
+        "ABCDEF0123456789ABCDEF0123456789ABCDEF01",
+    )
+    assert proc.returncode == 1, proc.stderr
+    assert "not present" in proc.stderr.lower() or "not present in gpg" in proc.stderr.lower(), (
+        f"expected missing-key error, got:\n{proc.stderr}"
+    )
+
+
+def test_signing_key_multiple_matches_aborts(tmp_path: Path):
+    """Two distinct primary keys matching the search => refuse (UID-collision swap)."""
+
+    repo, fake_bin = _stub_signing_key_repo(tmp_path)
+    # Emit TWO different sec+fpr pairs => primary_fpr_count == 2.
+    (fake_bin / "gpg").write_text(
+        textwrap.dedent(
+            """\
+            #!/usr/bin/env bash
+            echo "sec:u:4096:1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:::"
+            echo "fpr:::::::::AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:"
+            echo "sec:u:4096:1:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB:::"
+            echo "fpr:::::::::BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB:"
+            exit 0
+            """
+        ),
+        encoding="utf-8",
+    )
+    (fake_bin / "gpg").chmod(0o755)
+
+    proc = _run_signing_preflight(
+        tmp_path, repo, fake_bin,
+        "ABCDEF0123456789ABCDEF0123456789ABCDEF01",
+    )
+    assert proc.returncode == 1, proc.stderr
+    assert (
+        "multiple" in proc.stderr.lower()
+        or "distinct secret keys" in proc.stderr.lower()
+        or "uid-collision" in proc.stderr.lower()
+    ), f"expected multiple-match error, got:\n{proc.stderr}"

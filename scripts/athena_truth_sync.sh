@@ -58,9 +58,13 @@ ATHENA_MODEL="${ATHENA_MODEL:-quality}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 # Commit signing -- mandatory. The cron host must have the bot key
-# imported under this fingerprint. See docs/ATHENA_TRUTH_SYNC.md for
-# key generation and installation. Fail-closed if signing fails.
-ATHENA_SIGNING_KEY="${ATHENA_SIGNING_KEY:-athena-bot@forgeborn.dev}"
+# imported under this LONG-FORMAT GPG fingerprint. Email-based UIDs are
+# trivially spoofable (any keyring import with a matching email can be
+# selected); pinning by 40-hex fingerprint resists UID-collision swap.
+# Override via env on the cron host with the real bot key fingerprint.
+# See docs/ATHENA_TRUTH_SYNC.md ("Key rotation") for installation steps.
+# Task #2485 S3 MEDIUM: pin by fingerprint instead of email.
+ATHENA_SIGNING_KEY="${ATHENA_SIGNING_KEY:-0000000000000000000000000000000000000000}"
 ATHENA_BOT_NAME="${ATHENA_BOT_NAME:-EQUIPA truth-sync bot}"
 ATHENA_BOT_EMAIL="${ATHENA_BOT_EMAIL:-athena-bot@forgeborn.dev}"
 
@@ -138,6 +142,60 @@ file_open_question() {
             --context "$summary"; then
         log "open_question insert failed (non-fatal)"
     fi
+}
+
+# ---------------------------------------------------------------------------
+# Signing-key preflight (task #2485 S3 MEDIUM).
+# Validate that ATHENA_SIGNING_KEY:
+#   * is a 40-hex-character long-format GPG fingerprint (not an email);
+#   * is present in the host gpg keyring;
+#   * matches EXACTLY ONE secret key (multiple matches => UID-collision
+#     swap defense; refuse to pick which one to use).
+# Fail-closed: any failure aborts the run BEFORE we touch the working
+# tree, so a missing/rotated key produces a loud error instead of an
+# unsigned commit attempt later.
+# ---------------------------------------------------------------------------
+verify_signing_key() {
+    if ! [[ "$ATHENA_SIGNING_KEY" =~ ^[A-Fa-f0-9]{40}$ ]]; then
+        err "ATHENA_SIGNING_KEY must be a 40-hex GPG long fingerprint, got '$ATHENA_SIGNING_KEY' -- aborting."
+        return 1
+    fi
+
+    if ! command -v gpg >/dev/null 2>&1; then
+        err "gpg not on PATH -- cannot verify signing key. Aborting."
+        return 1
+    fi
+
+    # --list-secret-keys with --with-colons emits stable, machine-parseable
+    # output. Count "sec" or "ssb" lines whose fingerprint (next "fpr" line)
+    # equals ATHENA_SIGNING_KEY. We rely on gpg's own matching against the
+    # full fingerprint, then double-check the result count.
+    local match_output
+    match_output="$(gpg --batch --with-colons --fingerprint --list-secret-keys "$ATHENA_SIGNING_KEY" 2>/dev/null || true)"
+    if [[ -z "$match_output" ]]; then
+        err "signing key '$ATHENA_SIGNING_KEY' not present in gpg secret keyring -- aborting."
+        return 1
+    fi
+
+    # Count distinct primary-key fingerprints (fpr lines that follow a sec
+    # line). Multiple matches indicate two different keys share the
+    # fingerprint prefix or the search hit was ambiguous -- refuse to
+    # pick one.
+    local primary_fpr_count
+    primary_fpr_count="$(printf '%s\n' "$match_output" \
+        | awk -F: 'prev=="sec" && $1=="fpr" {print $10} {prev=$1}' \
+        | sort -u \
+        | wc -l)"
+    if (( primary_fpr_count > 1 )); then
+        err "signing key fingerprint '$ATHENA_SIGNING_KEY' matched ${primary_fpr_count} distinct secret keys -- refusing (possible UID-collision swap). Aborting."
+        return 1
+    fi
+    if (( primary_fpr_count < 1 )); then
+        err "signing key '$ATHENA_SIGNING_KEY' did not resolve to a primary secret key -- aborting."
+        return 1
+    fi
+
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -229,6 +287,15 @@ main() {
 
     if ! verify_drift_checker; then
         err "safety guard failed -- aborting before any code/doc changes."
+        exit 1
+    fi
+
+    # ---- Signing-key preflight (task #2485 S3) -------------------------------
+    # Verify fingerprint format and keyring presence BEFORE any work, so
+    # we never run the expensive Athena step only to discover at commit
+    # time that the bot key is missing or has been rotated.
+    if ! verify_signing_key; then
+        err "signing key preflight failed -- aborting before any code/doc changes."
         exit 1
     fi
 
