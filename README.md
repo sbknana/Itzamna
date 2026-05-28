@@ -98,7 +98,23 @@ claude mcp add equipa python3 /path/to/equipa/equipa/mcp_server.py
 | World Builder | Game world and lore construction |
 
 ### Git Worktree Isolation
-Parallel tasks each get their own git branch. Changes are isolated — one task cannot break another. Successful work merges back automatically.
+Parallel tasks (`--tasks N,M,...`) each get their own `git worktree` rooted at
+`<repo>/.forge-worktrees/task-<id>` on a fresh `forge-task-<id>` branch.
+Working-tree changes are filesystem-isolated — one task cannot see or break
+another. Successful work merges back to the default branch automatically; the
+worktree is torn down on completion. Single-task `--dev-test` mode does NOT
+spawn a separate worktree — it commits on a `forge-task-<id>` branch in the
+main checkout, so concurrent single-task dispatches against the same repo are
+not supported.
+
+Defensive invariants (task #2488):
+- Worktree creation refuses to reuse an existing `forge-task-<id>` branch
+  (`WorktreeBranchConflictError`) instead of silently committing onto the
+  prior task's branch.
+- The merge step raises `MissingTaskBranchError` (and logs an explicit ERROR
+  in the parallel path) when the expected branch is missing, rather than
+  reporting "no commits ahead of HEAD" — that silent skip is exactly how
+  branch-reuse bugs masked themselves historically.
 
 ### Cost Controls
 Per-task budgets scale by complexity (simple/medium/complex/epic). Agents that waste turns reading without writing get warned and then killed. You set the limits, EQUIPA enforces them.

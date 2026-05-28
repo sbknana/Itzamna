@@ -1316,7 +1316,19 @@ async def _create_isolation_worktrees(
                 project_dir, timeout=60,
             )
             if add_res.returncode != 0:
-                # Fallback: branch may already exist — delete and retry.
+                # Fallback: branch may already exist. Task #2488: log a
+                # WARNING before destroying it so the operator can see
+                # that a prior task's branch was reclaimed (the silent
+                # fallback was how the original branch-reuse bug masked
+                # itself). The branch is only force-deleted because we
+                # got past the `add_res != 0` check, meaning git refused
+                # to create a fresh worktree on this name.
+                print(
+                    f"  [Isolation] WARNING: task #{task_id} branch "
+                    f"'{branch_name}' already exists — force-deleting "
+                    f"to recreate fresh worktree (stderr: "
+                    f"{add_res.stderr[:200]})"
+                )
                 await git_run_async(
                     ["branch", "-D", branch_name], project_dir, timeout=10,
                 )
@@ -1444,6 +1456,28 @@ async def _merge_task_branch(
             ["rev-parse", "HEAD"], project_dir, timeout=10,
         )
         pre_head = pre_head_res.stdout.strip()
+
+        # Task #2488: distinguish "branch missing" from "no commits ahead".
+        # Previously a missing branch produced empty `log HEAD..<branch>`
+        # output and was silently classified as "NO commits ahead — skipping
+        # merge", masking the underlying worktree-isolation bug (agent
+        # commits landing on the wrong branch). Surface it as a hard ERROR
+        # so the operator can investigate rather than treating a missing
+        # branch as a successful no-op.
+        branch_check = await git_run_async(
+            ["rev-parse", "--verify", "--quiet", f"refs/heads/{branch_name}"],
+            project_dir, timeout=10,
+        )
+        if branch_check.returncode != 0:
+            print(
+                f"  [Isolation] ERROR: Task #{task_id} branch "
+                f"'{branch_name}' does NOT exist in {project_dir}. "
+                f"This usually means the per-task worktree was never "
+                f"created (task #2488 — branch reuse / no-isolation bug). "
+                f"Agent commits may have landed on an unexpected branch. "
+                f"Do NOT treat as 'no commits ahead' — investigate."
+            )
+            return False
 
         ahead = await git_run_async(
             ["log", "--oneline", f"HEAD..{branch_name}"], project_dir, timeout=15,
