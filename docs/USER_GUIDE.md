@@ -845,6 +845,24 @@ Backups are stored in `.autoresearch-backups/` with timestamps.
 
 ---
 
+## Initiatives
+
+Multi-task long-horizon work uses an **initiative** — a first-class
+table with a per-initiative plan file (`.equipa/initiative-<id>.md`)
+checked into the target repo. The plan is shared working memory across
+sibling tasks: each dispatch reads the file at start, and the
+orchestrator appends a structured summary after every completion.
+
+Create one with `forge_orchestrator.py --create-initiative "<name>"
+--project <codename> --goal "<text>"`, list active initiatives with
+`--list-initiatives`. Tasks join an initiative by setting their
+`initiative_id` column; tasks without one behave exactly as today.
+See [INITIATIVES.md](./INITIATIVES.md) for the full operator guide and
+[INITIATIVE_PLAN_FORMAT.md](./INITIATIVE_PLAN_FORMAT.md) for the file
+format spec.
+
+---
+
 ## Troubleshooting
 
 ### synced storage sync corruption
