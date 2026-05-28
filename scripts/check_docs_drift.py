@@ -387,7 +387,21 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Skip the pytest test-count badge check.",
     )
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help=(
+            "Verify the module is importable and runnable, then exit 0. "
+            "Replaces the inline `python3 -c \"import ...\"` smoke test "
+            "that the Athena truth-sync runner used to perform (avoids "
+            "shell-quoted code interpolation into Python source)."
+        ),
+    )
     args = parser.parse_args(argv)
+
+    if args.self_test:
+        print("OK: check_docs_drift importable and runnable.")
+        return 0
 
     repo_root = args.repo_root.resolve()
     if not repo_root.is_dir():
