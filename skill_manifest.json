@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "generated_at": "2026-05-27T22:18:43Z",
+  "generated_at": "2026-05-28T16:55:17Z",
   "description": "SHA-256 hashes of prompt and skill files for integrity verification",
   "files": {
     "prompts/_common.md": "4efe8fa5c6b7d57697fb8fd7c88d47867e6d3c39008f5bd0676f50ded4fcb606",

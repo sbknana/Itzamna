@@ -65,6 +65,11 @@ SECURITY-REVIEW-*.md
 # each target repo. Ignore the whole directory wherever it appears.
 .equipa-artifacts/
 
+# Initiative lock files (per-process coordination only — see
+# equipa/initiative.py:_acquire_lock). The .lock file is a side effect
+# of POSIX fcntl.flock and must not be tracked in git.
+.equipa/*.lock
+
 # Autoresearch backups (prompt mutation history)
 .autoresearch-backups/
 

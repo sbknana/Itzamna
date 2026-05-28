@@ -385,6 +385,111 @@ async def cleanup_failed_attempt(
 # --- DB Scanning & Scoring ---
 
 
+def _maybe_record_initiative_completion(
+    task: dict,
+    project_dir: str,
+    outcome: str,
+    result: dict,
+    output: list[str] | None,
+) -> None:
+    """Append a sub-task entry to the initiative plan file, if applicable.
+
+    No-op (and never raises) when:
+      * ``task.initiative_id`` is NULL → backward-compat path
+      * ``project_dir`` is missing/empty
+      * The plan file or DB row is unavailable
+      * Anything goes wrong parsing the agent output
+
+    Best-effort by design: initiative tracking must NEVER block dispatch.
+    """
+    if not isinstance(task, dict):
+        return
+    initiative_id = task.get("initiative_id")
+    if not initiative_id:
+        return
+    if not project_dir:
+        return
+
+    try:
+        from pathlib import Path
+
+        from equipa.initiative import record_task_completion
+
+        branch = f"forge-task-{task['id']}"
+        agent_output = (result or {}).get("result_text", "") or ""
+        status_label = "done" if outcome != "early_completed_no_changes" else "done (no changes)"
+
+        success = record_task_completion(
+            repo_path=Path(project_dir),
+            initiative_id=int(initiative_id),
+            task_id=int(task["id"]),
+            title=str(task.get("title", "")),
+            status=status_label,
+            branch=branch,
+            agent_output=agent_output,
+        )
+
+        if success and output is not None:
+            output.append(
+                f"  [Initiative] Plan file updated for initiative={initiative_id} "
+                f"task={task['id']}",
+            )
+
+        # Commit the plan file change to the task's branch so it merges
+        # with the rest of the task's commits. Failure to commit is
+        # logged but never aborts dispatch.
+        if success:
+            _commit_initiative_plan(project_dir, int(initiative_id), int(task["id"]))
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception(
+            "Initiative completion hook failed (task=%s)", task.get("id"),
+        )
+
+
+def _commit_initiative_plan(project_dir: str, initiative_id: int, task_id: int) -> None:
+    """Stage and commit ``.equipa/initiative-<id>.md`` to the task branch."""
+    import subprocess
+    from pathlib import Path
+
+    plan_rel = f".equipa/initiative-{initiative_id}.md"
+    plan_abs = Path(project_dir) / plan_rel
+    if not plan_abs.exists():
+        return
+    try:
+        subprocess.run(
+            ["git", "add", plan_rel],
+            cwd=project_dir,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        # Only commit if there are staged changes for the plan file.
+        diff = subprocess.run(
+            ["git", "diff", "--cached", "--quiet", "--", plan_rel],
+            cwd=project_dir,
+            check=False,
+            capture_output=True,
+        )
+        if diff.returncode == 0:
+            return  # nothing to commit
+        subprocess.run(
+            [
+                "git", "commit",
+                "-m",
+                f"chore(initiative-{initiative_id}): record task #{task_id} completion",
+            ],
+            cwd=project_dir,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception(
+            "Failed to git-commit initiative plan for task=%s", task_id,
+        )
+
 
 async def run_dev_test_loop_with_autoresearch(
     task: dict,
@@ -447,6 +552,9 @@ async def run_dev_test_loop_with_autoresearch(
 
         # Success - break out of retry loop
         if outcome in ("tests_passed", "no_tests", "early_completed_no_changes"):
+            _maybe_record_initiative_completion(
+                task, project_dir, outcome, result, output,
+            )
             break
 
         # Capture reflection on failed attempt for cross-attempt memory

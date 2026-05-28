@@ -12,6 +12,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sqlite3
 import sys
 from pathlib import Path
@@ -561,6 +562,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     group.add_argument("--config-cmd", choices=["snapshot", "list", "diff", "rollback"],
                         metavar="VERB",
                         help="Config-versioning subcommand: snapshot|list|diff|rollback")
+    group.add_argument("--create-initiative", type=str, metavar="NAME",
+                        help="Create a new initiative (requires --initiative-project and "
+                             "--initiative-goal). Phase 1.")
+    group.add_argument("--list-initiatives", action="store_true",
+                        help="List active initiatives, optionally filtered by "
+                             "--initiative-project codename.")
 
     parser.add_argument("--qiao", choices=["on", "off", "default"], default="default",
                         help="Enable/disable the qiao experimental plugin for this invocation. "
@@ -611,6 +618,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--force", action="store_true",
                         help="Force --config-cmd rollback past dirty-file check")
 
+    # --- Initiative helpers (Phase 1) ---
+    parser.add_argument("--initiative-project", type=str, default=None,
+                        metavar="CODENAME",
+                        help="Project codename for --create-initiative / "
+                             "--list-initiatives filter")
+    parser.add_argument("--initiative-goal", type=str, default=None,
+                        metavar="TEXT",
+                        help="Goal statement for --create-initiative (locked at creation)")
+
     return parser
 
 
@@ -646,6 +662,197 @@ def _auto_snapshot_dispatch(
 async def run_mode_mcp_server(args: argparse.Namespace) -> None:
     """Run as MCP server (JSON-RPC over stdio)."""
     run_server()
+
+
+# Length caps enforced both at the CLI boundary AND at the DB layer via
+# the CHECK constraint in scripts/migrate_initiative_schema.py. The CLI
+# layer exists to produce friendly error messages; the DB layer exists
+# to catch any caller that bypasses the CLI (raw SQL, future API, etc.).
+INITIATIVE_NAME_MAX = 200
+INITIATIVE_GOAL_MAX = 8192
+
+# Control characters are stripped at the plan-file boundary by
+# equipa.initiative._sanitize_agent_text, but we reject them here too so
+# the initiative row in TheForge stays clean and downstream displays
+# don't have to defend against terminal-control characters.
+#
+# S2486-04 fix: also reject Unicode bidirectional override (U+202A–U+202E,
+# U+2066–U+2069) and zero-width characters (U+200B–U+200D, U+2060, U+FEFF).
+# These enable the "Trojan Source" / CVE-2021-42574 attack class.
+_INITIATIVE_CTRL_CHARS_RE = re.compile(
+    "["
+    "\x00-\x08\x0b-\x1f\x7f"
+    "\u202a-\u202e"  # bidi override: LRE, RLE, PDF, LRO, RLO
+    "\u2066-\u2069"  # bidi isolate: LRI, RLI, FSI, PDI
+    "\u200b-\u200d"  # zero-width: ZWSP, ZWNJ, ZWJ
+    "\u2060"          # word joiner
+    "\ufeff"          # zero-width no-break space / BOM
+    "]"
+)
+
+
+def _validate_initiative_input(*, name: str, goal: str) -> str | None:
+    """Validate the two free-text fields the CLI inserts into ``initiatives``.
+
+    Returns ``None`` if both fields pass, or a single human-readable
+    error message describing the first violation. Cheap to call.
+    """
+    if len(name) > INITIATIVE_NAME_MAX:
+        return (
+            f"--create-initiative name exceeds {INITIATIVE_NAME_MAX} "
+            f"chars (got {len(name)})"
+        )
+    if len(goal) > INITIATIVE_GOAL_MAX:
+        return (
+            f"--initiative-goal exceeds {INITIATIVE_GOAL_MAX} chars "
+            f"(got {len(goal)})"
+        )
+    if _INITIATIVE_CTRL_CHARS_RE.search(name):
+        return (
+            "--create-initiative name contains disallowed control "
+            "characters (ASCII C0/DEL, Unicode bidi-override, or "
+            "zero-width); only newline and tab are allowed"
+        )
+    if _INITIATIVE_CTRL_CHARS_RE.search(goal):
+        return (
+            "--initiative-goal contains disallowed control characters "
+            "(ASCII C0/DEL, Unicode bidi-override, or zero-width); "
+            "only newline and tab are allowed"
+        )
+    # S2486-05: literal '<!--' check is intentionally byte-exact. The
+    # orchestrator's END-marker recognition uses a literal str.find on
+    # "<!-- END ORCHESTRATOR-MANAGED -->", so only the exact 4-byte ASCII
+    # sequence \x3C\x21\x2D\x2D can spoof a marker. Unicode dash look-alikes
+    # (U+2010-U+2014, U+2212) cannot — they would not match the orchestrator's
+    # literal find either. Bidi-override and zero-width chars are already
+    # rejected by _INITIATIVE_CTRL_CHARS_RE above, so a hidden \x2D cannot be
+    # visually masked. Do NOT loosen this check without re-evaluating the
+    # orchestrator's marker recognition.
+    if "<!--" in name:
+        return (
+            "--create-initiative name contains literal '<!--' "
+            "(HTML comment opener is reserved for orchestrator markers)"
+        )
+    if "<!--" in goal:
+        return (
+            "--initiative-goal contains literal '<!--' "
+            "(HTML comment opener is reserved for orchestrator markers)"
+        )
+    return None
+
+
+async def run_mode_create_initiative(args: argparse.Namespace) -> None:
+    """Insert a new row into ``initiatives`` and print the new id."""
+    name = (args.create_initiative or "").strip()
+    project_codename = (args.initiative_project or "").strip()
+    goal = (args.initiative_goal or "").strip()
+    if not name:
+        print("ERROR: --create-initiative requires a non-empty NAME")
+        sys.exit(2)
+    if not project_codename:
+        print(
+            "ERROR: --create-initiative requires --initiative-project "
+            "<codename>"
+        )
+        sys.exit(2)
+    if not goal:
+        print(
+            "ERROR: --create-initiative requires --initiative-goal <text>"
+        )
+        sys.exit(2)
+
+    # S3 input validation. The CLI is the first writer to the initiatives
+    # row, which then feeds the plan-file header (via _render_initial_template)
+    # and the agent system prompt. Reject the same hostile inputs the
+    # downstream sanitiser would catch — fail fast at the CLI boundary
+    # rather than silently mangling state with truncation/escapes. The
+    # DB CHECK constraint enforces the length caps even if a future
+    # caller bypasses the CLI; keeping CLI errors clearer is the only
+    # reason for the duplicated guard here.
+    validation_error = _validate_initiative_input(name=name, goal=goal)
+    if validation_error is not None:
+        print(f"ERROR: {validation_error}")
+        sys.exit(2)
+
+    from equipa.db import get_db_connection
+
+    conn = get_db_connection(write=True)
+    try:
+        row = conn.execute(
+            "SELECT id FROM projects WHERE codename = ? OR name = ?",
+            (project_codename, project_codename),
+        ).fetchone()
+        if row is None:
+            print(f"ERROR: no project matches codename/name '{project_codename}'")
+            sys.exit(1)
+        project_id = row[0]
+        cursor = conn.execute(
+            "INSERT INTO initiatives (project_id, name, goal) VALUES (?, ?, ?)",
+            (project_id, name, goal),
+        )
+        conn.commit()
+        new_id = cursor.lastrowid
+    finally:
+        conn.close()
+
+    print(f"Created initiative id={new_id} for project '{project_codename}' (id={project_id})")
+    print(f"  Name: {name}")
+    print(f"  Goal: {goal}")
+    print(
+        f"  Plan file will be created at "
+        f"<target-repo>/.equipa/initiative-{new_id}.md on first dispatch."
+    )
+
+
+async def run_mode_list_initiatives(args: argparse.Namespace) -> None:
+    """Print a readable table of initiatives, optionally project-filtered."""
+    from equipa.db import get_db_connection
+
+    project_codename = (args.initiative_project or "").strip() or None
+
+    conn = get_db_connection(write=False)
+    try:
+        if project_codename:
+            rows = conn.execute(
+                """
+                SELECT i.id, p.codename, i.name, i.status, i.created_at,
+                       (SELECT COUNT(*) FROM tasks t WHERE t.initiative_id = i.id)
+                FROM initiatives i
+                LEFT JOIN projects p ON p.id = i.project_id
+                WHERE p.codename = ? OR p.name = ?
+                ORDER BY i.status, i.created_at DESC
+                """,
+                (project_codename, project_codename),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT i.id, p.codename, i.name, i.status, i.created_at,
+                       (SELECT COUNT(*) FROM tasks t WHERE t.initiative_id = i.id)
+                FROM initiatives i
+                LEFT JOIN projects p ON p.id = i.project_id
+                ORDER BY i.status, i.created_at DESC
+                """,
+            ).fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        print("No initiatives found.")
+        return
+
+    header = f"{'ID':>4}  {'PROJECT':<16}  {'STATUS':<10}  {'TASKS':>5}  {'CREATED':<19}  NAME"
+    print(header)
+    print("-" * len(header))
+    for r in rows:
+        iid, codename, name, status, created_at, task_count = r
+        codename = (codename or "—")[:16]
+        status = (status or "")[:10]
+        created_at = (created_at or "")[:19]
+        print(
+            f"{iid:>4}  {codename:<16}  {status:<10}  "
+            f"{task_count:>5}  {created_at:<19}  {name}"
+        )
 
 
 # --- Config-Versioning Helpers ---
@@ -1458,6 +1665,10 @@ def _select_mode_handler(args: argparse.Namespace) -> "callable":
     """
     if args.mcp_server:
         return run_mode_mcp_server
+    if getattr(args, "create_initiative", None):
+        return run_mode_create_initiative
+    if getattr(args, "list_initiatives", False):
+        return run_mode_list_initiatives
     if getattr(args, "config_cmd", None):
         return run_mode_config
     if args.regenerate_manifest:
