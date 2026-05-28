@@ -304,6 +304,149 @@ def test_missing_preserve_boundary_raises(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
+# Tests: markdown-only content allowlist (task #2483 S1 HIGH).
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    ("payload", "expected_substr"),
+    [
+        # 1. <script> injection
+        (
+            "## Architecture\n\n<script>alert(1)</script>\n",
+            "forbidden HTML tag",
+        ),
+        # 2. javascript: URI in markdown link target
+        (
+            "## Architecture\n\n[click](javascript:alert(1))\n",
+            "forbidden URI scheme",
+        ),
+        # 3. onclick event handler attribute
+        (
+            "## Architecture\n\n<a onclick=\"x()\">x</a>\n",
+            "event-handler attribute",
+        ),
+        # 4. Oversize block
+        (
+            "## Architecture\n\n" + ("A" * (50 * 1024 + 1)) + "\n",
+            "exceeds",
+        ),
+        # 5. Control character (NUL byte) in body
+        (
+            "## Architecture\n\nhello\x00world\n",
+            "control characters",
+        ),
+        # 6. Raw HTML <form> outside fence
+        (
+            "## Architecture\n\n<form action=\"/x\"><input name=\"y\"></form>\n",
+            "forbidden HTML tag",
+        ),
+        # 7. data:text/html base64 image
+        (
+            "## Architecture\n\n![pic](data:text/html;base64,PHNjcmlwdD4=)\n",
+            "forbidden URI scheme",
+        ),
+        # 8. Mismatched code fence breakout -- raw HTML <iframe> after a
+        #    naively-paired fence closure.
+        (
+            "## Architecture\n\n```\nfine\n```\n<iframe src=\"x\"></iframe>\n",
+            "forbidden HTML tag",
+        ),
+    ],
+)
+def test_validate_athena_content_rejects_attack_vectors(payload, expected_substr):
+    ok, reason = sync_mod.validate_athena_content(payload)
+    assert ok is False, f"payload should have been rejected: {payload!r}"
+    assert expected_substr.lower() in reason.lower(), (
+        f"reason {reason!r} should mention {expected_substr!r}"
+    )
+
+
+def test_validate_athena_content_accepts_clean_markdown():
+    """Plain markdown -- headings, lists, code fences, tables, links --
+    passes the allowlist."""
+
+    clean = textwrap.dedent(
+        """\
+        ## Architecture
+
+        ```
+        equipa/
+        |-- cli.py
+        |-- dispatch.py
+        ```
+
+        - `equipa/cli.py` -- command-line entry point
+        - `equipa/dispatch.py` -- task dispatch
+
+        | File | Purpose |
+        |------|---------|
+        | cli.py | entry |
+
+        See [the README](README.md) for more.
+
+        <!-- drift-ignore -->
+        Inline `code` is fine. *Italic* and **bold** too.
+        """
+    )
+    ok, reason = sync_mod.validate_athena_content(clean)
+    assert ok is True, f"clean markdown was rejected: {reason}"
+
+
+def test_architecture_replace_raises_on_poisoned_athena_section(
+    readme_file: Path, tmp_path: Path
+):
+    """A poisoned Athena replacement aborts the sync via
+    AthenaContentRejected before the splice writes anything."""
+
+    poisoned = tmp_path / "athena_bad.md"
+    poisoned.write_text(
+        "## Architecture\n\n<script>alert(1)</script>\n", encoding="utf-8"
+    )
+    with pytest.raises(sync_mod.AthenaContentRejected):
+        sync_mod.sync_readme(
+            readme_file,
+            athena_readme=poisoned,
+            test_count=10,
+            module_count=1,
+            line_count=1,
+        )
+
+
+def test_cli_returns_rc3_on_poisoned_content(tmp_path: Path):
+    """CLI wrapper exits with rc=3 (sentinel for content-allowlist
+    rejection) and leaves README.md untouched."""
+
+    readme = tmp_path / "README.md"
+    readme.write_text(FIXTURE_README, encoding="utf-8")
+    poisoned = tmp_path / "athena_bad.md"
+    poisoned.write_text(
+        "## Architecture\n\n<iframe src='x'></iframe>\n", encoding="utf-8"
+    )
+    mtime_before = readme.stat().st_mtime
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(SYNC_SCRIPT),
+            "--repo-root",
+            str(tmp_path),
+            "--readme",
+            str(readme),
+            "--athena-readme",
+            str(poisoned),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 3, (
+        f"expected rc=3, got {proc.returncode}; stderr:\n{proc.stderr}"
+    )
+    assert "allowlist" in proc.stderr.lower() or "rejected" in proc.stderr.lower()
+    # README must not have been written.
+    assert readme.stat().st_mtime == mtime_before
+    assert readme.read_text(encoding="utf-8") == FIXTURE_README
+
+
+# ---------------------------------------------------------------------------
 # Tests: drift-still-present path triggers the open_questions insert.
 # ---------------------------------------------------------------------------
 def test_drift_still_present_triggers_open_question(
@@ -324,12 +467,15 @@ def test_drift_still_present_triggers_open_question(
     (repo / "scripts").mkdir(parents=True)
     (repo / ".git").mkdir()  # the runner only requires the .git directory exist
     (repo / "README.md").write_text(FIXTURE_README, encoding="utf-8")
-    # Real sync script + real drift checker, but the checker will fail
-    # because the fixture README references files that do not exist.
+    # Real sync script + real open_question helper. The drift checker is
+    # a stub that supports --self-test (passes) and a normal run (fails),
+    # so the runner's preflight succeeds but the post-sync check fails.
     real_sync = REPO_ROOT / "scripts" / "athena_sync_readme.py"
-    real_drift = REPO_ROOT / "scripts" / "check_docs_drift.py"
+    real_open_q = REPO_ROOT / "scripts" / "athena_open_question.py"
     (repo / "scripts" / "athena_sync_readme.py").write_bytes(real_sync.read_bytes())
-    # Drift checker that always reports drift.
+    (repo / "scripts" / "athena_open_question.py").write_bytes(real_open_q.read_bytes())
+    (repo / "scripts" / "athena_open_question.py").chmod(0o755)
+    # Drift checker stub: --self-test exits 0; normal run exits 1.
     (repo / "scripts" / "check_docs_drift.py").write_text(
         textwrap.dedent(
             """\
@@ -338,6 +484,9 @@ def test_drift_still_present_triggers_open_question(
 
 
             def main():
+                if "--self-test" in sys.argv:
+                    print("OK: stub self-test")
+                    return 0
                 print("FAIL: synthetic drift", file=sys.stdout)
                 return 1
 
@@ -363,17 +512,23 @@ def test_drift_still_present_triggers_open_question(
               -C) shift 2; ;;  # discard `-C <path>` prefix
             esac
             case "$1" in
-              fetch|pull|checkout|push|add|commit) exit 0 ;;
-              diff)
-                  # `git diff --quiet --exit-code` -> "no changes" if
-                  # we just want to short-circuit.  Return 0 (no diff)
-                  # only if --quiet is present; otherwise echo nothing.
+              fetch|pull|checkout|push|add|reset) exit 0 ;;
+              commit)
+                  # Refuse unsigned commits in the shim too; the real
+                  # script always passes -S. Treat success silently.
                   exit 0 ;;
+              diff|status) exit 0 ;;
               symbolic-ref) echo "origin/master"; exit 0 ;;
               remote) echo "  HEAD branch: master"; exit 0 ;;
               rev-parse) exit 0 ;;
               show) exit 0 ;;
-              *) exit 0 ;;
+              *)
+                  # Tightened shim (task #2483 S10): unrecognized
+                  # subcommands FAIL LOUDLY so the test cannot silently
+                  # accept new git invocations the script grew without
+                  # the test author noticing.
+                  echo "fake-git: unrecognized subcommand: $*" >&2
+                  exit 2 ;;
             esac
             """
         ),
@@ -382,6 +537,20 @@ def test_drift_still_present_triggers_open_question(
     (fake_bin / "git").chmod(0o755)
     (fake_bin / "node").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
     (fake_bin / "node").chmod(0o755)
+    # flock is needed in PATH so the runner's re-exec finds it. Use
+    # the host flock if present; otherwise stub it as a passthrough.
+    import shutil
+
+    host_flock = shutil.which("flock")
+    if host_flock:
+        (fake_bin / "flock").symlink_to(host_flock)
+    else:
+        (fake_bin / "flock").write_text(
+            '#!/usr/bin/env bash\n# stub: drop -n <lockfile> and exec rest\n'
+            'while [[ "$1" == -* || "$1" == /* ]]; do shift; done\nexec "$@"\n',
+            encoding="utf-8",
+        )
+        (fake_bin / "flock").chmod(0o755)
 
     # ---- Stand up a TheForge DB with the open_questions table -----------------
     forge_db = tmp_path / "theforge.db"
@@ -433,3 +602,30 @@ def test_drift_still_present_triggers_open_question(
     assert inserted.stdout.strip() == "1", (
         f"expected 1 open_question, got {inserted.stdout!r}; runner stderr:\n{proc.stderr}"
     )
+
+    # ---- Explicit subcommand-sequence assertion (task #2483 S10) -------------
+    # Pin the order of git invocations the runner makes BEFORE the drift
+    # check fails. Any silent change to the script that reorders these
+    # (e.g. moving the clean-checkout guard, the branch detection, the
+    # fetch/pull) should break this assertion so the test author sees it.
+    git_history = git_log.read_text(encoding="utf-8").splitlines()
+    # First command after the flock re-exec should be the clean-checkout
+    # `diff --quiet HEAD` guard. Then the branch detection helpers, then
+    # fetch + checkout + pull. We assert prefixes so harmless flag
+    # tweaks (--quiet, --ff-only) do not break the test.
+    expected_prefixes = [
+        "diff --quiet HEAD",
+        "symbolic-ref",
+        "fetch origin master",
+        "checkout --quiet master",
+        "pull --ff-only origin master",
+    ]
+    history_text = "\n".join(git_history)
+    cursor = 0
+    for prefix in expected_prefixes:
+        idx = history_text.find(prefix, cursor)
+        assert idx != -1, (
+            f"expected git subcommand prefix {prefix!r} not found in order; "
+            f"history was:\n{history_text}"
+        )
+        cursor = idx + len(prefix)
