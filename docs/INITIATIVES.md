@@ -26,17 +26,20 @@ Adding initiative overhead to a single task is pure cost.
    ```
    python forge_orchestrator.py \
        --create-initiative "Initiative concept" \
-       --project equipa \
-       --goal "Phased rollout of multi-task initiatives"
+       --initiative-project equipa \
+       --initiative-goal "Phased rollout of multi-task initiatives"
    ```
 
-   The command prints the new initiative ID.
+   The command prints the new initiative ID. (The flags
+   `--initiative-project` / `--initiative-goal` are dedicated to this
+   sub-command to avoid colliding with the dispatch-side `--project`
+   integer arg and `--goal` Manager-mode flag.)
 
 2. **List** active initiatives:
 
    ```
    python forge_orchestrator.py --list-initiatives
-   python forge_orchestrator.py --list-initiatives --project equipa
+   python forge_orchestrator.py --list-initiatives --initiative-project equipa
    ```
 
 3. **Attach tasks** to the initiative by setting `tasks.initiative_id`

@@ -20,6 +20,7 @@ from __future__ import annotations
 import re
 import string
 import sys
+from pathlib import Path
 from typing import Any
 
 from equipa.config import is_feature_enabled
@@ -501,6 +502,35 @@ def build_system_prompt(
     # Append task-specific instructions (never trimmed)
     task_prompt = build_task_prompt(task, project_context, project_dir, delimiter=_untrusted_delimiter)
     dynamic_parts.append("---\n\n" + task_prompt)
+
+    # --- Initiative context (Phase 1) ---
+    # If this task belongs to an initiative, inject the per-initiative
+    # plan file as shared working memory plus the agent-output protocol
+    # instruction. Initiative-less tasks (initiative_id IS NULL) take
+    # the no-op branch and dispatch exactly as today.
+    if isinstance(task, dict):
+        initiative_id = task.get("initiative_id")
+        if initiative_id and project_dir:
+            try:
+                from equipa.initiative import build_initiative_prompt_section
+                from equipa.db import get_db_connection
+
+                conn = get_db_connection(write=False)
+                try:
+                    section = build_initiative_prompt_section(
+                        Path(project_dir), int(initiative_id), conn,
+                    )
+                finally:
+                    conn.close()
+                if section:
+                    dynamic_parts.append(section)
+            except Exception:
+                import logging
+                logging.getLogger(__name__).exception(
+                    "Failed to inject initiative context for task=%s "
+                    "initiative=%s; proceeding without it.",
+                    task.get("id"), initiative_id,
+                )
 
     # --- Language-specific prompt injection ---
     # Detect project language and load corresponding guidance if available
