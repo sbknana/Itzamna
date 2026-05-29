@@ -32,23 +32,44 @@ Copyright 2026 Forgeborn
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import logging
 import re
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Awaitable, Callable, Iterable, Sequence
+from typing import Awaitable, Callable, Iterable, Iterator, Sequence
 
-from equipa.initiative import BEGIN_MARKER, InitiativePlan
+from equipa.initiative import BEGIN_MARKER, InitiativePlan, _sanitize_agent_text
+from equipa.security import _make_untrusted_delimiter, wrap_untrusted
 
 logger = logging.getLogger(__name__)
 
 
 # Task statuses the runner treats as "still needs work" when selecting the
-# sub-tasks of an initiative. A task in any other status (e.g. ``done``,
-# ``cancelled``) is considered already satisfied and is skipped on resume.
-PENDING_STATUSES = ("todo", "blocked", "in_progress")
+# sub-tasks of an initiative on a NORMAL resume. ``in_progress`` is
+# deliberately excluded (S3): a task left ``in_progress`` is almost always a
+# crashed or still-live concurrent run, and re-selecting it would re-dispatch
+# the same wave against the same repo — the documented worktree-contamination
+# foot-gun. ``--force`` (see :data:`FORCE_PENDING_STATUSES`) opts back in.
+PENDING_STATUSES = ("todo", "blocked")
+
+# With ``--force`` we also re-select ``in_progress`` tasks (operator has
+# confirmed no other run is live and wants to reclaim a stuck task).
+FORCE_PENDING_STATUSES = ("todo", "blocked", "in_progress")
+
+# Default safety ceiling on the number of waves dispatched in one run (S7).
+# The accepted Phase 2 design defers a cost cap to Phase 3, so this wave cap
+# is the only automatic backstop against a pathological DAG dispatching an
+# unbounded number of waves (and unbounded spend). It is a halt-with-pause,
+# not a crash, and the operator can raise it explicitly via ``--max-waves``.
+DEFAULT_MAX_WAVES = 25
+
+# Max chars of an operator pause-marker reason that we persist / inject. The
+# reason is untrusted repo content (see :func:`_fence_untrusted_reason`).
+PAUSE_REASON_MAX_CHARS = 500
 
 # Outcomes that mean a dispatched sub-task SUCCEEDED. Anything else (blocked,
 # failed, error, security_review_blocked, cancelled, ...) halts the wave.
@@ -212,9 +233,21 @@ def compute_waves(tasks: Sequence[dict]) -> list[list[int]]:
 
 @dataclass(frozen=True)
 class PauseMarker:
-    """A parsed operator pause marker from the plan file."""
+    """A parsed operator pause marker from the plan file.
+
+    ``position`` is the marker's character offset within the human-editable
+    section. It is part of the de-dup identity (S4) so that two distinct
+    pause points sharing identical ``reason`` text (or both defaulting) are
+    treated as separate halts rather than collapsing to one.
+    """
 
     reason: str
+    position: int = 0
+
+    @property
+    def key(self) -> tuple[int, str]:
+        """Identity used to de-dup "already seen" markers within a run."""
+        return (self.position, self.reason)
 
 
 def parse_pause_markers(plan_text: str) -> list[PauseMarker]:
@@ -224,7 +257,9 @@ def parse_pause_markers(plan_text: str) -> list[PauseMarker]:
     scanned — markers inside the orchestrator-managed block (which the
     orchestrator itself writes) are ignored. Markers are returned in
     document order. A marker with no ``reason`` attribute yields a default
-    reason string so the pause is still self-describing.
+    reason string so the pause is still self-describing. Each marker carries
+    its character offset so identical-reason markers at different positions
+    remain distinct halts (S4).
     """
     if not plan_text:
         return []
@@ -232,8 +267,32 @@ def parse_pause_markers(plan_text: str) -> list[PauseMarker]:
     markers: list[PauseMarker] = []
     for m in PAUSE_MARKER_RE.finditer(human_section):
         reason = (m.group("reason") or "").strip()
-        markers.append(PauseMarker(reason=reason or "operator-set pause marker"))
+        markers.append(
+            PauseMarker(
+                reason=reason or "operator-set pause marker",
+                position=m.start(),
+            )
+        )
     return markers
+
+
+def _fence_untrusted_reason(reason: str) -> str:
+    """Sanitise + fence an untrusted pause-marker reason (S1).
+
+    The pause-marker ``reason`` is free text from the plan file, which lives
+    INSIDE the target repo and is therefore writable by any sub-task agent
+    that gets a worktree. Phase 1 fences ALL plan-file content injected into
+    prompts behind an unpredictable ``<<<UNTRUSTED_...>>>`` delimiter because
+    it is a cross-task prompt-injection channel. The reason text lands in
+    ``initiatives.pause_reason`` and in ``open_questions`` rows, both of
+    which are later surfaced into orchestrator/agent prompts, so it must get
+    the same treatment: strip the Unicode bidi / zero-width / control chars
+    (via Phase 1's :func:`_sanitize_agent_text`) and wrap the result in a
+    fresh per-call untrusted fence so injected instructions cannot escape
+    into a downstream model's context as trusted text.
+    """
+    safe = _sanitize_agent_text(reason, PAUSE_REASON_MAX_CHARS)
+    return wrap_untrusted(safe, _make_untrusted_delimiter())
 
 
 # ---------------------------------------------------------------------------
@@ -254,21 +313,26 @@ def fetch_initiative(conn: sqlite3.Connection, initiative_id: int) -> dict | Non
 
 
 def fetch_initiative_tasks(
-    conn: sqlite3.Connection, initiative_id: int
+    conn: sqlite3.Connection, initiative_id: int, *, force: bool = False
 ) -> list[dict]:
     """Return all unfinished sub-tasks of an initiative.
 
     Selects tasks where ``initiative_id`` matches and status is one of
-    :data:`PENDING_STATUSES`. ``done`` / ``cancelled`` tasks are excluded
-    so a resume run naturally skips already-completed work (idempotency).
+    :data:`PENDING_STATUSES` (``todo`` / ``blocked``). ``done`` / ``cancelled``
+    tasks are excluded so a resume run naturally skips already-completed work
+    (idempotency). ``in_progress`` tasks are excluded too unless ``force`` is
+    set (S3): a lingering ``in_progress`` task usually means a crashed or
+    still-live concurrent run, and re-selecting it would double-dispatch the
+    same wave. ``--force`` lets the operator reclaim such tasks deliberately.
     """
-    placeholders = ",".join("?" for _ in PENDING_STATUSES)
+    statuses = FORCE_PENDING_STATUSES if force else PENDING_STATUSES
+    placeholders = ",".join("?" for _ in statuses)
     rows = conn.execute(
         f"SELECT id, project_id, title, status, blocked_by, role, "
         f"initiative_id FROM tasks "
         f"WHERE initiative_id = ? AND status IN ({placeholders}) "
         f"ORDER BY id",
-        (initiative_id, *PENDING_STATUSES),
+        (initiative_id, *statuses),
     ).fetchall()
     return [dict(r) for r in rows]
 
@@ -421,6 +485,53 @@ DispatchFn = Callable[
 # The runner
 # ---------------------------------------------------------------------------
 
+class InitiativeLockError(InitiativeError):
+    """Raised when another live ``--initiative <id>`` run holds the lock (S3)."""
+
+
+@contextlib.contextmanager
+def _initiative_lock(
+    repo_path: str | Path | None, initiative_id: int
+) -> Iterator[None]:
+    """Hold an advisory lock for the duration of a live initiative run (S3).
+
+    Takes a non-blocking ``flock`` on a per-initiative lock file (the same
+    ``flock`` pattern the Athena truth-sync cron uses) so a second concurrent
+    ``--initiative <id>`` run on the same host refuses to start rather than
+    double-dispatching the same wave against the same repo. If the repo path
+    cannot be resolved the lock is a no-op (best-effort — locking must never
+    be the reason a legitimate run cannot start), but the in_progress-task
+    exclusion in :func:`fetch_initiative_tasks` still guards the common case.
+
+    Raises :class:`InitiativeLockError` if the lock is already held.
+    """
+    if repo_path is None:
+        yield
+        return
+    lock_path = Path(repo_path) / ".equipa" / f"initiative-{initiative_id}.lock"
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fh = open(lock_path, "w")
+    except OSError:
+        logger.exception("Could not open initiative lock file %s", lock_path)
+        yield
+        return
+    try:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise InitiativeLockError(
+                f"Initiative #{initiative_id} already has a live run "
+                f"(lock held on {lock_path}). Refusing concurrent dispatch."
+            ) from exc
+        try:
+            yield
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    finally:
+        fh.close()
+
+
 async def run_initiative(
     initiative_id: int,
     args: object,
@@ -429,6 +540,7 @@ async def run_initiative(
     conn: sqlite3.Connection | None = None,
     repo_path: str | Path | None = None,
     max_waves: int | None = None,
+    force: bool = False,
     now_fn: Callable[[], datetime] = _utcnow,
     log_fn: Callable[[str], None] = print,
 ) -> InitiativeRunResult:
@@ -445,7 +557,11 @@ async def run_initiative(
             if they pass it in.
         repo_path: target repo root (for plan-file pause-marker reads).
             Defaults to the initiative's resolved project directory.
-        max_waves: optional safety cap on the number of waves dispatched.
+        max_waves: safety cap on the number of waves dispatched. ``None``
+            applies :data:`DEFAULT_MAX_WAVES` (S7); pass an explicit int to
+            override.
+        force: re-select ``in_progress`` tasks on resume (S3). Off by
+            default so a crashed/concurrent run's tasks are not re-dispatched.
         now_fn / log_fn: injectable clock and logger for testing.
 
     Returns:
@@ -455,6 +571,7 @@ async def run_initiative(
     Raises:
         :class:`CycleError` if the dependency graph contains a cycle.
         :class:`InitiativeError` if the initiative id is unknown.
+        :class:`InitiativeLockError` if a concurrent run holds the lock.
     """
     owns_conn = conn is None
     if conn is None:
@@ -464,17 +581,28 @@ async def run_initiative(
     if dispatch_fn is None:
         dispatch_fn = _default_dispatch_wave
 
+    if max_waves is None:
+        max_waves = DEFAULT_MAX_WAVES
+
+    # Resolve the repo path once, up front, so we can both lock on it and
+    # read plan-file pause markers from it.
+    resolved_repo = _resolve_repo_path(
+        repo_path, fetch_initiative_tasks(conn, initiative_id, force=force), conn
+    )
+
     try:
-        return await _run_initiative_inner(
-            initiative_id=initiative_id,
-            args=args,
-            dispatch_fn=dispatch_fn,
-            conn=conn,
-            repo_path=repo_path,
-            max_waves=max_waves,
-            now_fn=now_fn,
-            log_fn=log_fn,
-        )
+        with _initiative_lock(resolved_repo, initiative_id):
+            return await _run_initiative_inner(
+                initiative_id=initiative_id,
+                args=args,
+                dispatch_fn=dispatch_fn,
+                conn=conn,
+                repo_path=resolved_repo,
+                max_waves=max_waves,
+                force=force,
+                now_fn=now_fn,
+                log_fn=log_fn,
+            )
     finally:
         if owns_conn:
             conn.close()
@@ -488,6 +616,7 @@ async def _run_initiative_inner(
     conn: sqlite3.Connection,
     repo_path: str | Path | None,
     max_waves: int | None,
+    force: bool = False,
     now_fn: Callable[[], datetime],
     log_fn: Callable[[str], None],
 ) -> InitiativeRunResult:
@@ -503,7 +632,7 @@ async def _run_initiative_inner(
         log_fn(f"[Initiative #{initiative_id}] already 'done' — nothing to do.")
         return result
 
-    tasks = fetch_initiative_tasks(conn, initiative_id)
+    tasks = fetch_initiative_tasks(conn, initiative_id, force=force)
 
     # Empty initiative (no unfinished sub-tasks) → graceful completion.
     if not tasks:
@@ -537,11 +666,14 @@ async def _run_initiative_inner(
     mark_in_progress(conn, initiative_id, now)
     result.status = "in_progress"
 
-    # Pause markers already seen in prior runs do not re-trigger. On a fresh
-    # run we record the current marker set as a baseline so only NEW markers
-    # halt — but on a resume after a marker-pause the operator is expected to
-    # have removed/edited the marker, so any marker still present is "new".
-    seen_markers: set[str] = set()
+    # Pause markers are de-duplicated WITHIN a single run by (position,
+    # reason) so the same marker is not re-evaluated on every wave check, but
+    # two distinct markers sharing identical reason text remain separate
+    # halts (S4). There is NO cross-run baseline: ``seen_markers`` starts
+    # empty, so on any run (fresh or resume) the FIRST marker still present in
+    # the plan file halts immediately. The operator is expected to remove or
+    # edit the marker before re-running ``--initiative`` to get past it.
+    seen_markers: set[tuple[int, str]] = set()
 
     for wave_index, wave in enumerate(waves):
         if max_waves is not None and wave_index >= max_waves:
@@ -555,7 +687,11 @@ async def _run_initiative_inner(
         # (a) Check for an active pause marker BEFORE dispatching the wave.
         marker = _active_pause_marker(resolved_repo, initiative_id, seen_markers)
         if marker is not None:
-            reason = f"operator pause marker: {marker.reason}"
+            # S1: the marker reason is untrusted repo content. Sanitise +
+            # fence it before it lands in any prompt-bound column
+            # (initiatives.pause_reason, open_questions.question/context).
+            fenced_reason = _fence_untrusted_reason(marker.reason)
+            reason = f"operator pause marker: {fenced_reason}"
             now = now_fn()
             mark_paused(conn, initiative_id, reason, now)
             result.status = "paused"
@@ -564,16 +700,17 @@ async def _run_initiative_inner(
             qid = file_open_question(
                 conn,
                 project_id,
-                f"Initiative #{initiative_id} paused at marker: {marker.reason}",
+                f"Initiative #{initiative_id} paused at operator pause marker",
                 f"Wave {wave_index + 1} ({', '.join(f'#{t}' for t in wave)}) "
-                f"not yet dispatched. Remove/resolve the pause-for-review "
-                f"marker in the plan file, then re-run "
+                f"not yet dispatched. Operator-supplied reason (untrusted "
+                f"plan-file content, fenced): {fenced_reason}. Remove/resolve "
+                f"the pause-for-review marker in the plan file, then re-run "
                 f"--initiative {initiative_id} to resume.",
             )
             result.open_question_id = qid
             log_fn(
                 f"[Initiative #{initiative_id}] HALTED before wave "
-                f"{wave_index + 1} — {reason}"
+                f"{wave_index + 1} — operator pause marker"
             )
             return result
 
@@ -690,12 +827,13 @@ def _is_awaitable(obj: object) -> bool:
 def _active_pause_marker(
     repo_path: str | Path | None,
     initiative_id: int,
-    seen_markers: set[str],
+    seen_markers: set[tuple[int, str]],
 ) -> PauseMarker | None:
     """Return the first not-yet-seen pause marker in the plan file, if any.
 
     Reads the plan file fresh each wave so an operator who edits the file
-    mid-run is respected. Newly-encountered markers (keyed by reason text)
+    mid-run is respected. Newly-encountered markers (keyed by ``(position,
+    reason)`` — S4, so identical reasons at different positions are distinct)
     trigger a halt; markers already seen this run do not re-fire. Any I/O
     error is swallowed — initiative tracking must never crash dispatch.
     """
@@ -713,8 +851,8 @@ def _active_pause_marker(
         )
         return None
     for marker in markers:
-        if marker.reason not in seen_markers:
-            seen_markers.add(marker.reason)
+        if marker.key not in seen_markers:
+            seen_markers.add(marker.key)
             return marker
     return None
 
