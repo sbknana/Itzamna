@@ -77,9 +77,12 @@ python forge_orchestrator.py --initiative 42
 What happens:
 
 1. **Sub-task selection** — every task with `initiative_id = 42` whose
-   status is `todo`, `blocked`, or `in_progress` is collected. Tasks
-   already `done`/`cancelled` are skipped (this is what makes resume
-   idempotent).
+   status is `todo` or `blocked` is collected. Tasks already
+   `done`/`cancelled` are skipped (this is what makes resume idempotent).
+   Tasks left `in_progress` are **also skipped by default** — a lingering
+   `in_progress` task usually means a crashed or still-live concurrent run,
+   and re-selecting it would double-dispatch the same wave against the same
+   repo. Pass `--force` to deliberately reclaim such tasks.
 2. **DAG + waves** — `tasks.blocked_by` (comma-separated task IDs) builds
    a dependency graph. Tasks with no remaining in-initiative dependency
    form **wave 1**; tasks whose deps are all in wave 1 form **wave 2**;
@@ -103,9 +106,21 @@ What happens:
 Flags:
 
 ```
-python forge_orchestrator.py --initiative 42 --dry-run    # print wave plan, dispatch nothing
-python forge_orchestrator.py --initiative 42 --max-waves 3 # safety cap on wave count
+python forge_orchestrator.py --initiative 42 --dry-run     # print wave plan, dispatch nothing
+python forge_orchestrator.py --initiative 42 --max-waves 3 # explicit safety cap on wave count
+python forge_orchestrator.py --initiative 42 --force       # reclaim stuck in_progress sub-tasks
 ```
+
+> **Wave ceiling (safety backstop).** Phase 2 tracks cost in
+> `initiatives.total_cost` but does **not** enforce a cost cap (deferred to
+> Phase 3). To avoid a pathological DAG dispatching an unbounded number of
+> waves with unbounded spend, a default ceiling of **25 waves** applies when
+> `--max-waves` is unset. Hitting it is a halt-with-pause (not a crash);
+> pass an explicit `--max-waves N` to raise or lower it.
+
+> **Concurrency.** A live `--initiative <id>` run takes an advisory lock for
+> that initiative. A second concurrent run of the same id on the same host
+> refuses to start rather than double-dispatching a wave.
 
 `--list-initiatives` now includes a `COST` column showing
 `initiatives.total_cost` per initiative.
@@ -132,9 +147,15 @@ marker into the **human-editable** section of the plan file (anywhere
 ```
 
 Before each wave, the orchestrator scans that section. A marker it has
-not seen yet halts the run: status → `paused`, `pause_reason` set to the
-marker's `reason` (or `operator-set pause marker` if omitted), and an
-`open_question` titled *"Initiative #N paused at marker: …"* is filed.
+not seen yet halts the run: status → `paused`, an `open_question` is filed,
+and the marker's `reason` is recorded in `pause_reason`. Because the plan
+file is repo content (writable by any sub-task agent with a worktree), the
+`reason` text is treated as **untrusted**: it is sanitised (Unicode
+bidi/zero-width control chars stripped) and wrapped in the standard
+`<<<UNTRUSTED_…>>>` fence before it is stored in any prompt-bound column —
+the same cross-task prompt-injection protection Phase 1 applies to plan
+content. Markers are de-duplicated within a run by **(position, reason)**,
+so two distinct checkpoints sharing the same reason text each halt once.
 Markers inside the orchestrator-managed block are ignored.
 
 > Pause markers are **operator-only** in Phase 2. Planner-agent insertion
