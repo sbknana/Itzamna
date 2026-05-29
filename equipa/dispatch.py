@@ -50,7 +50,7 @@ from equipa.db import (
     update_task_status,
 )
 from equipa.hooks import fire_async as fire_hook
-from equipa.git_ops import _is_git_repo, git_run_async
+from equipa.git_ops import _is_git_repo, get_default_branch, git_run_async
 from equipa.lessons import update_injected_episode_q_values_for_task
 from equipa.loops import (
     _count_findings_in_review_file,
@@ -1525,22 +1525,35 @@ async def _merge_task_branch(
                 f"{counts.get('HIGH', 0)} HIGH finding(s)."
             )
     try:
+        # Task #2493: always merge INTO the repo's DEFAULT branch, never the
+        # branch HEAD happens to sit on. In single-task (--task) mode the main
+        # checkout has HEAD ON the per-task branch, so the old "merge into the
+        # current branch / count HEAD..<branch>" logic produced an empty range
+        # and skipped the merge as a silent no-op (the never-merged bug). We
+        # resolve the default branch explicitly (do NOT hardcode master/main)
+        # and check it out first whenever HEAD is not already on it. This
+        # generalises the previous empty-current_branch fallback to also cover
+        # the single-task case, and matches parallel-mode behaviour (which
+        # already runs the main checkout on the default branch).
+        default_branch = get_default_branch(project_dir)
         current = await git_run_async(
             ["branch", "--show-current"], project_dir, timeout=10,
         )
         current_branch = current.stdout.strip()
-        if not current_branch:
-            for candidate in ["master", "main"]:
-                check = await git_run_async(
-                    ["show-ref", "--verify", f"refs/heads/{candidate}"],
-                    project_dir, timeout=10,
+        if current_branch != default_branch:
+            checkout_res = await git_run_async(
+                ["checkout", default_branch], project_dir, timeout=30,
+            )
+            if checkout_res.returncode != 0:
+                print(
+                    f"  [Isolation] ERROR: Task #{task_id}: could not check "
+                    f"out default branch '{default_branch}' before merge "
+                    f"(was on '{current_branch or 'DETACHED'}'): "
+                    f"{checkout_res.stderr[:200]}"
                 )
-                if check.returncode == 0:
-                    await git_run_async(
-                        ["checkout", candidate], project_dir, timeout=30,
-                    )
-                    current_branch = candidate
-                    break
+                print(f"  [Isolation] Branch '{branch_name}' PRESERVED")
+                return False
+            current_branch = default_branch
         print(f"  [Isolation] Merging on branch: {current_branch} in {project_dir}")
 
         pre_head_res = await git_run_async(
@@ -1570,13 +1583,20 @@ async def _merge_task_branch(
             )
             return False
 
+        # Task #2493: count commits-ahead against the DEFAULT branch, not
+        # HEAD. HEAD is now always the default branch here (checked out
+        # above), but naming the default branch explicitly keeps the count
+        # correct and intent-revealing regardless of which branch HEAD was on
+        # at entry. Mirrors the <default>..<branch> rev-list used elsewhere
+        # in this module.
         ahead = await git_run_async(
-            ["log", "--oneline", f"HEAD..{branch_name}"], project_dir, timeout=15,
+            ["log", "--oneline", f"{default_branch}..{branch_name}"],
+            project_dir, timeout=15,
         )
         if not ahead.stdout.strip():
             print(
                 f"  [Isolation] Task #{task_id}: branch '{branch_name}' has "
-                f"NO commits ahead of HEAD — skipping merge"
+                f"NO commits ahead of '{default_branch}' — skipping merge"
             )
             return False
 
