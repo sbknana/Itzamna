@@ -569,18 +569,19 @@ def _initiative_lock(
     # A world-readable path under /tmp lets another local user pre-hold the
     # flock (DoS the safety control) or own the file so open() raises and the
     # code fails open — silently dropping the S3 concurrency guard.
-    lock_dir = _initiative_lock_dir(repo_path)
-    lock_path = lock_dir / f"equipa-initiative-{initiative_id}-{repo_key}.lock"
     try:
+        lock_dir = _initiative_lock_dir(repo_path)
+        lock_path = (
+            lock_dir / f"equipa-initiative-{initiative_id}-{repo_key}.lock"
+        )
         fh = open(lock_path, "w")
     except OSError as exc:
-        # N3: fail CLOSED. If we cannot open the lock file we cannot prove no
-        # other run holds it, so refuse to dispatch rather than silently
-        # running with no concurrency protection.
+        # N3: fail CLOSED. If we cannot create the lock dir or open the lock
+        # file we cannot prove no other run holds it, so refuse to dispatch
+        # rather than silently running with no concurrency protection.
         raise InitiativeLockError(
-            f"Initiative #{initiative_id}: could not acquire lock file "
-            f"{lock_path} ({exc}). Refusing to run without concurrency "
-            f"protection."
+            f"Initiative #{initiative_id}: could not acquire lock "
+            f"({exc}). Refusing to run without concurrency protection."
         ) from exc
     try:
         try:

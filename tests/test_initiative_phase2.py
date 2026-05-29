@@ -557,6 +557,48 @@ def test_s2_isolation_clean_passes() -> None:
     assert ir.verify_wave_branch_isolation([1, 2], "/repo", run_git=fake_git) == {}
 
 
+# --- N1: zero-commit (doc-only/no-op) tasks must NOT trigger a false halt ---
+
+def test_n1_zero_commit_wave_not_flagged() -> None:
+    """Two no-op tasks both at the wave base must NOT be a violation."""
+    base = "basebasebase"
+
+    def fake_git(repo: str, gitargs: list[str]) -> str:
+        return base  # both branches still point at the wave base (no commits)
+
+    violations = ir.verify_wave_branch_isolation(
+        [1, 2], "/repo", wave_base=base, run_git=fake_git
+    )
+    assert violations == {}  # no spurious isolation_violation halt
+
+
+def test_n1_real_collision_past_base_still_flagged() -> None:
+    """A shared HEAD that ADVANCED past the base is still contamination."""
+    base = "basebasebase"
+
+    def fake_git(repo: str, gitargs: list[str]) -> str:
+        return "advancedcommit"  # both branches share a real, non-base commit
+
+    violations = ir.verify_wave_branch_isolation(
+        [1, 2], "/repo", wave_base=base, run_git=fake_git
+    )
+    assert 1 in violations and 2 in violations
+    assert "contamination" in violations[1]
+
+
+def test_n1_mixed_one_zero_one_advanced() -> None:
+    """One no-op task at base + one advanced task: neither is a violation."""
+    base = "basebasebase"
+
+    def fake_git(repo: str, gitargs: list[str]) -> str:
+        return base if gitargs[-1] == "forge-task-1" else "advancedcommit"
+
+    violations = ir.verify_wave_branch_isolation(
+        [1, 2], "/repo", wave_base=base, run_git=fake_git
+    )
+    assert violations == {}
+
+
 # --- S3: in_progress excluded on resume unless --force; concurrent lock ---
 
 def test_s3_in_progress_excluded_unless_force(conn: sqlite3.Connection) -> None:
@@ -582,6 +624,40 @@ def test_s3_concurrent_run_refused(tmp_path: Path) -> None:
     # Once released, the lock can be re-acquired.
     with ir._initiative_lock(repo, 7):
         pass
+
+
+def test_n2_lock_dir_is_private_not_world_tmp(tmp_path: Path, monkeypatch) -> None:
+    """N3: the lock dir is a private 0700 per-user dir, never world-shared /tmp."""
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    lock_dir = ir._initiative_lock_dir(str(repo))
+    # Falls back to the repo's .git dir (not /tmp) when XDG_RUNTIME_DIR unset.
+    assert lock_dir == repo / ".git" / "equipa-locks"
+    assert lock_dir.is_dir()
+    # Restrictive perms: owner-only.
+    assert (lock_dir.stat().st_mode & 0o777) == 0o700
+
+
+def test_n2_lock_dir_prefers_xdg_runtime(tmp_path: Path, monkeypatch) -> None:
+    """N3: XDG_RUNTIME_DIR is preferred when set."""
+    xdg = tmp_path / "run-user"
+    xdg.mkdir()
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(xdg))
+    lock_dir = ir._initiative_lock_dir(str(tmp_path / "repo"))
+    assert lock_dir == xdg / "equipa"
+    assert lock_dir.is_dir()
+
+
+def test_n3_lock_fails_closed_when_dir_unavailable(monkeypatch) -> None:
+    """N3: an OSError acquiring the lock fails CLOSED (refuses to run)."""
+    def boom(_repo_path: object) -> Path:
+        raise OSError("no usable lock directory")
+
+    monkeypatch.setattr(ir, "_initiative_lock_dir", boom)
+    with pytest.raises(ir.InitiativeLockError):
+        with ir._initiative_lock("/some/repo", 99):
+            pass  # pragma: no cover — must not be reached
 
 
 # --- S4: identical-reason markers at different positions stay distinct ---
