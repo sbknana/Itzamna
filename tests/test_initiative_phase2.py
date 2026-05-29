@@ -666,3 +666,108 @@ def test_s7_default_max_waves_applies(conn: sqlite3.Connection) -> None:
     assert result.halted is True
     assert result.waves_dispatched == ir.DEFAULT_MAX_WAVES
     assert "max-waves" in (result.halt_reason or "")
+
+
+# ---------------------------------------------------------------------------
+# --dry-run: print the wave plan, dispatch NOTHING (acceptance criterion #2)
+# ---------------------------------------------------------------------------
+
+class _NoCloseConn:
+    """Delegates to a real sqlite3 connection but swallows ``close()``.
+
+    The dry-run handler opens its own connection and closes it in a finally
+    block; this proxy lets the test keep querying the same in-memory DB after
+    the handler returns.
+    """
+
+    def __init__(self, real: sqlite3.Connection) -> None:
+        self._real = real
+
+    def close(self) -> None:  # no-op so the test retains the connection
+        pass
+
+    def __getattr__(self, name: str):
+        return getattr(self._real, name)
+
+def test_dry_run_prints_wave_plan_and_dispatches_nothing(
+    conn: sqlite3.Connection, monkeypatch, capsys
+) -> None:
+    """``--initiative <id> --dry-run`` must layer the DAG and print it, but
+    never enter the live dispatcher.
+
+    Covers the dry-run branch of ``run_mode_initiative``: it shares the same
+    DAG/wave layering as a live run, so a diamond (A -> B+C -> D) must render
+    as three waves while ``run_initiative`` is never invoked.
+    """
+    from equipa.cli import _build_arg_parser, run_mode_initiative
+
+    iid = _new_initiative(conn)
+    # Diamond: 1 -> {2, 3} -> 4.
+    _add_task(conn, iid, 1)
+    _add_task(conn, iid, 2, blocked_by="1")
+    _add_task(conn, iid, 3, blocked_by="1")
+    _add_task(conn, iid, 4, blocked_by="2,3")
+
+    # The dry-run handler opens its own connection and closes it; hand it the
+    # migrated test DB behind a no-close proxy so the test keeps querying it.
+    proxy = _NoCloseConn(conn)
+    monkeypatch.setattr(
+        "equipa.db.get_db_connection", lambda *a, **k: proxy, raising=True
+    )
+
+    # If the dry-run path ever reaches the live dispatcher this trips.
+    dispatched = {"called": False}
+
+    async def _must_not_dispatch(*a, **k):  # pragma: no cover - guard
+        dispatched["called"] = True
+        raise AssertionError("dry-run must not call run_initiative")
+
+    monkeypatch.setattr(ir, "run_initiative", _must_not_dispatch, raising=True)
+
+    parser = _build_arg_parser()
+    args = parser.parse_args(["--initiative", str(iid), "--dry-run"])
+    _run(run_mode_initiative(args))
+
+    out = capsys.readouterr().out
+    assert dispatched["called"] is False
+    assert "DRY RUN" in out
+    assert "Pending sub-tasks: 4" in out
+    # Diamond -> exactly three waves, with the parallel pair in wave 2.
+    assert "Wave 1:" in out and "Wave 2:" in out and "Wave 3:" in out
+    assert "#1:" in out and "#2:" in out and "#3:" in out and "#4:" in out
+
+    # A dry run must not mutate initiative state.
+    row = ir.fetch_initiative(conn, iid)
+    assert row["status"] == "active"
+    assert row["started_at"] is None
+
+
+def test_dry_run_reports_cycle_without_dispatch(
+    conn: sqlite3.Connection, monkeypatch, capsys
+) -> None:
+    """A cyclic DAG in dry-run mode reports the cycle and exits non-zero
+    rather than silently dispatching an impossible plan."""
+    from equipa.cli import _build_arg_parser, run_mode_initiative
+
+    iid = _new_initiative(conn)
+    # Cycle: 1 -> 2 -> 1.
+    _add_task(conn, iid, 1, blocked_by="2")
+    _add_task(conn, iid, 2, blocked_by="1")
+
+    proxy = _NoCloseConn(conn)
+    monkeypatch.setattr(
+        "equipa.db.get_db_connection", lambda *a, **k: proxy, raising=True
+    )
+
+    async def _must_not_dispatch(*a, **k):  # pragma: no cover - guard
+        raise AssertionError("dry-run must not call run_initiative")
+
+    monkeypatch.setattr(ir, "run_initiative", _must_not_dispatch, raising=True)
+
+    parser = _build_arg_parser()
+    args = parser.parse_args(["--initiative", str(iid), "--dry-run"])
+    with pytest.raises(SystemExit) as excinfo:
+        _run(run_mode_initiative(args))
+
+    assert excinfo.value.code == 1
+    assert "CYCLE DETECTED" in capsys.readouterr().out
