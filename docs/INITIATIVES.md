@@ -5,6 +5,10 @@ EQUIPA-dispatched tasks. Phase 1 introduces shared working memory across
 those tasks so each successive dispatch can build on what its siblings
 already learned.
 
+> **Note.** The EQUIPA default branch is now `main` (renamed from
+> `master` on 2026-05-29). Worktree task branches fork from `main` and
+> merges land back on `main`.
+
 ## When to use one
 
 Use an initiative when:
