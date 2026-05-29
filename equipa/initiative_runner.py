@@ -489,6 +489,50 @@ class InitiativeLockError(InitiativeError):
     """Raised when another live ``--initiative <id>`` run holds the lock (S3)."""
 
 
+def _initiative_lock_dir(repo_path: str | Path) -> Path:
+    """Return a private, per-user directory to hold initiative lock files (N3).
+
+    Preference order:
+      1. ``$XDG_RUNTIME_DIR/equipa`` — the standard per-user runtime dir,
+         already 0700 and owned by the current user on systemd hosts.
+      2. ``<repo>/.git/equipa-locks`` — inside the repo's git dir, which is
+         not part of the working tree (so ``git add`` cannot stage it) and is
+         owned by the user who owns the checkout.
+      3. ``<tmp>/equipa-locks-<uid>`` — last resort, but namespaced by uid and
+         created 0700 so it is NOT a world-shared path another user can
+         pre-create or hijack.
+
+    The returned directory is created with mode 0700 if absent.
+    """
+    import os
+    import tempfile
+
+    candidates: list[Path] = []
+    xdg = os.environ.get("XDG_RUNTIME_DIR")
+    if xdg:
+        candidates.append(Path(xdg) / "equipa")
+    candidates.append(Path(repo_path) / ".git" / "equipa-locks")
+    candidates.append(
+        Path(tempfile.gettempdir()) / f"equipa-locks-{os.getuid()}"
+    )
+
+    for candidate in candidates:
+        try:
+            candidate.mkdir(mode=0o700, parents=True, exist_ok=True)
+            # Re-assert restrictive perms in case the dir pre-existed with a
+            # looser mode (mkdir's mode is ignored when the dir already exists).
+            candidate.chmod(0o700)
+            return candidate
+        except OSError:
+            logger.debug("Lock dir candidate unusable: %s", candidate, exc_info=True)
+            continue
+    # Every candidate failed — surface it so the caller fails closed.
+    raise OSError(
+        f"No usable per-user lock directory for repo {repo_path} "
+        f"(tried: {', '.join(str(c) for c in candidates)})"
+    )
+
+
 @contextlib.contextmanager
 def _initiative_lock(
     repo_path: str | Path | None, initiative_id: int
@@ -508,24 +552,36 @@ def _initiative_lock(
     if repo_path is None:
         yield
         return
-    # Lock file lives in the system temp dir (NOT the target repo) so it can
-    # never be accidentally committed by a sub-task agent running `git add`.
-    # It is keyed on the resolved repo path + initiative id so two different
-    # repos with the same initiative id do not collide.
+    # The lock file lives in a PER-USER runtime directory (see
+    # :func:`_initiative_lock_dir`), NEVER in the target repo (so a sub-task
+    # agent running ``git add`` can never commit it) and NEVER in world-shared
+    # /tmp. It is keyed on the resolved repo path + initiative id so two
+    # different repos with the same initiative id do not collide.
     import hashlib
-    import tempfile
 
-    repo_key = hashlib.sha1(str(repo_path).encode("utf-8")).hexdigest()[:12]
-    lock_path = (
-        Path(tempfile.gettempdir())
-        / f"equipa-initiative-{initiative_id}-{repo_key}.lock"
-    )
+    # N2: blake2b (not sha1) for the lock-file name. This is a naming use, not
+    # a security use, but semgrep blocks bare sha1 — blake2b is unflagged and
+    # equally fine for deriving a short, stable filename token.
+    repo_key = hashlib.blake2b(
+        str(repo_path).encode("utf-8"), digest_size=8
+    ).hexdigest()
+    # N3: place the lock in a PER-USER runtime dir, never world-shared /tmp.
+    # A world-readable path under /tmp lets another local user pre-hold the
+    # flock (DoS the safety control) or own the file so open() raises and the
+    # code fails open — silently dropping the S3 concurrency guard.
+    lock_dir = _initiative_lock_dir(repo_path)
+    lock_path = lock_dir / f"equipa-initiative-{initiative_id}-{repo_key}.lock"
     try:
         fh = open(lock_path, "w")
-    except OSError:
-        logger.exception("Could not open initiative lock file %s", lock_path)
-        yield
-        return
+    except OSError as exc:
+        # N3: fail CLOSED. If we cannot open the lock file we cannot prove no
+        # other run holds it, so refuse to dispatch rather than silently
+        # running with no concurrency protection.
+        raise InitiativeLockError(
+            f"Initiative #{initiative_id}: could not acquire lock file "
+            f"{lock_path} ({exc}). Refusing to run without concurrency "
+            f"protection."
+        ) from exc
     try:
         try:
             fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -949,6 +1005,7 @@ def verify_wave_branch_isolation(
     task_ids: list[int],
     repo_path: str | None,
     *,
+    wave_base: str | None = None,
     run_git: Callable[[str, list[str]], str] = _run_git,
 ) -> dict[int, str]:
     """Independently verify per-task worktree/branch isolation (S2).
@@ -961,6 +1018,18 @@ def verify_wave_branch_isolation(
     dispatched task has its own ``forge-task-<id>`` branch, and no two tasks'
     branches resolve to the IDENTICAL commit (a tell-tale of leaked shared
     working-tree state where one task's commit landed on another's branch).
+
+    ``wave_base`` is the recorded pre-wave HEAD (the commit every task branch
+    was forked from). A task that legitimately makes NO commits (doc-only or
+    no-op tasks, dispatched regularly by this project) leaves its branch tip
+    pointing AT the base. Two such zero-commit tasks in the same wave would
+    otherwise collide on an identical HEAD and be spuriously flagged as
+    contamination — a false halt of a healthy wave (N1). So a shared HEAD that
+    equals ``wave_base`` is NOT contamination: those branches simply committed
+    nothing. Only a shared HEAD that has ADVANCED PAST the base (i.e. a real
+    commit landed on more than one branch) is a true isolation violation. When
+    ``wave_base`` is ``None`` the check falls back to the conservative
+    "any shared HEAD is a violation" behaviour.
 
     Returns ``{task_id: violation_message}`` for each task that fails the
     invariant (empty dict = clean). Best-effort: if the repo path is missing
@@ -990,9 +1059,17 @@ def verify_wave_branch_isolation(
         head_by_task[tid] = head
 
     # Two distinct tasks resolving to the same commit means a commit landed
-    # on the wrong branch (or branches share a tip) — contamination.
+    # on the wrong branch (or branches share a tip) — contamination. EXCEPT
+    # when that shared commit is the wave base itself: branches that committed
+    # nothing (doc-only / no-op tasks) all legitimately point at the base, so
+    # an identical-base HEAD is expected, not contamination (N1).
+    base = (wave_base or "").strip()
     by_head: dict[str, list[int]] = {}
     for tid, head in head_by_task.items():
+        if base and head == base:
+            # Zero-commit task: branch tip == base, committed nothing. Not a
+            # violation and excluded from collision detection.
+            continue
         by_head.setdefault(head, []).append(tid)
     for head, tids in by_head.items():
         if len(tids) > 1:
@@ -1021,8 +1098,6 @@ async def _default_dispatch_wave(
     from equipa.dispatch import run_parallel_tasks
     from equipa.db import get_db_connection
 
-    await run_parallel_tasks(list(task_ids), args)
-
     repo_path = _resolve_repo_path(getattr(args, "repo_path", None), [], None)
     if repo_path is None:
         # Best-effort: derive from the first task so the isolation check has
@@ -1040,9 +1115,28 @@ async def _default_dispatch_wave(
             conn_lookup.close()
         repo_path = _resolve_repo_path(None, rows, None)
 
+    # N1: record the pre-wave HEAD (the commit every task branch forks from)
+    # BEFORE dispatch, so the isolation check can tell a zero-commit task
+    # (branch tip == base) apart from a real cross-branch collision.
+    wave_base: str | None = None
+    if repo_path:
+        try:
+            from equipa.git_ops import get_default_branch
+
+            default_branch = get_default_branch(repo_path)
+            wave_base = _run_git(
+                repo_path, ["rev-parse", "--verify", "--quiet", default_branch]
+            ).strip() or None
+        except Exception:  # noqa: BLE001 — base capture is best-effort
+            logger.debug("Could not record pre-wave base HEAD", exc_info=True)
+
+    await run_parallel_tasks(list(task_ids), args)
+
     # S2: independently verify per-task branch isolation BEFORE trusting the
     # dispatch results. A violation downgrades the task so the runner halts.
-    isolation_violations = verify_wave_branch_isolation(list(task_ids), repo_path)
+    isolation_violations = verify_wave_branch_isolation(
+        list(task_ids), repo_path, wave_base=wave_base
+    )
 
     results: list[WaveTaskResult] = []
     conn = get_db_connection(write=False)
