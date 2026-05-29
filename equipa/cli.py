@@ -633,7 +633,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         help="Goal statement for --create-initiative (locked at creation)")
     parser.add_argument("--max-waves", type=int, default=None, metavar="N",
                         help="Safety cap on the number of waves dispatched in "
-                             "--initiative mode (default: unlimited)")
+                             "--initiative mode. Unset applies a default "
+                             "backstop of 25 waves (a halt-with-pause, not a "
+                             "crash); pass an explicit N to raise/lower it. "
+                             "Note: there is no automatic cost cap in Phase 2 "
+                             "— cost is tracked, not enforced.")
 
     return parser
 
@@ -882,6 +886,7 @@ async def run_mode_initiative(args: argparse.Namespace) -> None:
     from equipa.initiative_runner import (
         CycleError,
         InitiativeError,
+        InitiativeLockError,
         compute_waves,
         fetch_initiative,
         fetch_initiative_tasks,
@@ -898,7 +903,9 @@ async def run_mode_initiative(args: argparse.Namespace) -> None:
             if initiative is None:
                 print(f"ERROR: no initiative with id={initiative_id}")
                 sys.exit(1)
-            tasks = fetch_initiative_tasks(conn, initiative_id)
+            tasks = fetch_initiative_tasks(
+                conn, initiative_id, force=getattr(args, "force", False)
+            )
         finally:
             conn.close()
 
@@ -930,7 +937,13 @@ async def run_mode_initiative(args: argparse.Namespace) -> None:
             initiative_id,
             args,
             max_waves=args.max_waves,
+            force=getattr(args, "force", False),
         )
+    except InitiativeLockError as exc:
+        # S3: another live --initiative run holds the lock. Refuse rather
+        # than double-dispatch the same wave against the same repo.
+        print(f"ERROR: {exc}")
+        sys.exit(1)
     except CycleError as exc:
         print(f"ERROR: {exc}")
         sys.exit(1)
@@ -1771,7 +1784,10 @@ def _select_mode_handler(args: argparse.Namespace) -> "callable":
         return run_mode_create_initiative
     if getattr(args, "list_initiatives", False):
         return run_mode_list_initiatives
-    if getattr(args, "initiative", None):
+    # S6: select on "is not None", not truthiness — otherwise --initiative 0
+    # (a falsy but valid-shaped id) would silently fall through to another
+    # mode (e.g. manifest regeneration) instead of running the initiative.
+    if getattr(args, "initiative", None) is not None:
         return run_mode_initiative
     if getattr(args, "config_cmd", None):
         return run_mode_config

@@ -508,9 +508,19 @@ def _initiative_lock(
     if repo_path is None:
         yield
         return
-    lock_path = Path(repo_path) / ".equipa" / f"initiative-{initiative_id}.lock"
+    # Lock file lives in the system temp dir (NOT the target repo) so it can
+    # never be accidentally committed by a sub-task agent running `git add`.
+    # It is keyed on the resolved repo path + initiative id so two different
+    # repos with the same initiative id do not collide.
+    import hashlib
+    import tempfile
+
+    repo_key = hashlib.sha1(str(repo_path).encode("utf-8")).hexdigest()[:12]
+    lock_path = (
+        Path(tempfile.gettempdir())
+        / f"equipa-initiative-{initiative_id}-{repo_key}.lock"
+    )
     try:
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
         fh = open(lock_path, "w")
     except OSError:
         logger.exception("Could not open initiative lock file %s", lock_path)
@@ -895,6 +905,106 @@ def _read_task_cost(conn: sqlite3.Connection, task_id: int) -> float:
     return _safe_float(row[0] if row else 0.0)
 
 
+def _read_task_gate_outcome(conn: sqlite3.Connection, task_id: int) -> str:
+    """Return the most-recent ``agent_runs.outcome`` for a task (S5).
+
+    This is an INDEPENDENT signal from ``tasks.status``: the orchestrator
+    records the dispatch outcome (including ``security_review_blocked`` when
+    the security gate fired) on the ``agent_runs`` row. Reading it lets the
+    runner cross-check that a task whose ``status`` flipped to ``done`` was
+    not in fact gate-blocked by the upstream merge-bug class tracked in
+    open_question #2451. Best-effort: returns ``""`` if unavailable.
+    """
+    try:
+        row = conn.execute(
+            "SELECT outcome FROM agent_runs WHERE task_id = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+    except sqlite3.Error:
+        return ""
+    return (row[0] if row and row[0] else "") or ""
+
+
+def _run_git(repo_path: str, args: list[str]) -> str:
+    """Run a read-only ``git`` command in ``repo_path`` and return stdout.
+
+    Raises ``subprocess.CalledProcessError`` on non-zero exit so callers can
+    decide whether a missing branch is a violation. Kept tiny and injectable
+    so :func:`verify_wave_branch_isolation` is unit-testable without a repo.
+    """
+    import subprocess
+
+    completed = subprocess.run(
+        ["git", "-C", repo_path, *args],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    return completed.stdout.strip()
+
+
+def verify_wave_branch_isolation(
+    task_ids: list[int],
+    repo_path: str | None,
+    *,
+    run_git: Callable[[str, list[str]], str] = _run_git,
+) -> dict[int, str]:
+    """Independently verify per-task worktree/branch isolation (S2).
+
+    The wave dispatcher trusts ``run_parallel_tasks`` to isolate each task on
+    its own ``forge-task-<id>`` branch. That isolation has regressed before
+    (open_question 2026-05-18: local-branch contamination under concurrent
+    same-repo dispatch). Rather than trust it blindly, after each wave we
+    assert the invariant the #2488/#2490 worktree fix establishes: every
+    dispatched task has its own ``forge-task-<id>`` branch, and no two tasks'
+    branches resolve to the IDENTICAL commit (a tell-tale of leaked shared
+    working-tree state where one task's commit landed on another's branch).
+
+    Returns ``{task_id: violation_message}`` for each task that fails the
+    invariant (empty dict = clean). Best-effort: if the repo path is missing
+    or git is unavailable, returns ``{}`` (cannot prove a violation, so do
+    not manufacture a halt). The caller downgrades violating tasks so the
+    initiative halts instead of advancing on contaminated work.
+    """
+    if not repo_path or not task_ids:
+        return {}
+
+    violations: dict[int, str] = {}
+    head_by_task: dict[int, str] = {}
+    for tid in task_ids:
+        branch = f"forge-task-{tid}"
+        try:
+            head = run_git(repo_path, ["rev-parse", "--verify", "--quiet", branch])
+        except Exception:  # noqa: BLE001 — any git error = unverifiable branch
+            violations[tid] = (
+                f"isolation check: branch '{branch}' not found after dispatch "
+                f"(expected per-task branch from worktree isolation)"
+            )
+            continue
+        head = (head or "").strip()
+        if not head:
+            violations[tid] = f"isolation check: branch '{branch}' has no HEAD"
+            continue
+        head_by_task[tid] = head
+
+    # Two distinct tasks resolving to the same commit means a commit landed
+    # on the wrong branch (or branches share a tip) — contamination.
+    by_head: dict[str, list[int]] = {}
+    for tid, head in head_by_task.items():
+        by_head.setdefault(head, []).append(tid)
+    for head, tids in by_head.items():
+        if len(tids) > 1:
+            collision = ", ".join(f"#{t}" for t in sorted(tids))
+            for tid in tids:
+                violations[tid] = (
+                    f"isolation check: tasks {collision} share identical HEAD "
+                    f"{head[:12]} — cross-branch commit contamination"
+                )
+    return violations
+
+
 async def _default_dispatch_wave(
     task_ids: list[int], args: object
 ) -> list[WaveTaskResult]:
@@ -913,6 +1023,27 @@ async def _default_dispatch_wave(
 
     await run_parallel_tasks(list(task_ids), args)
 
+    repo_path = _resolve_repo_path(getattr(args, "repo_path", None), [], None)
+    if repo_path is None:
+        # Best-effort: derive from the first task so the isolation check has
+        # a repo to inspect even when args carries no explicit path.
+        conn_lookup = get_db_connection(write=False)
+        try:
+            rows = [
+                dict(r)
+                for r in conn_lookup.execute(
+                    "SELECT id, project_id FROM tasks WHERE id = ?",
+                    (task_ids[0],),
+                ).fetchall()
+            ] if task_ids else []
+        finally:
+            conn_lookup.close()
+        repo_path = _resolve_repo_path(None, rows, None)
+
+    # S2: independently verify per-task branch isolation BEFORE trusting the
+    # dispatch results. A violation downgrades the task so the runner halts.
+    isolation_violations = verify_wave_branch_isolation(list(task_ids), repo_path)
+
     results: list[WaveTaskResult] = []
     conn = get_db_connection(write=False)
     try:
@@ -920,6 +1051,27 @@ async def _default_dispatch_wave(
             status = _read_task_status(conn, tid)
             cost = _read_task_cost(conn, tid)
             outcome = "done" if status == "done" else (status or "unknown")
+
+            # S5: cross-check the independent gate signal. A task can read
+            # back as ``done`` yet have been gate-blocked (open_question
+            # #2451). Treat done-but-gate-blocked as a halt, never a success.
+            if outcome in SUCCESS_OUTCOMES:
+                gate = _read_task_gate_outcome(conn, tid)
+                if gate == "security_review_blocked":
+                    logger.warning(
+                        "Task #%s status=%s but gate outcome=%s — halting",
+                        tid, status, gate,
+                    )
+                    outcome = "security_review_blocked"
+
+            # S2: a branch-isolation violation overrides any success outcome.
+            if tid in isolation_violations:
+                logger.error(
+                    "Task #%s isolation violation: %s",
+                    tid, isolation_violations[tid],
+                )
+                outcome = "isolation_violation"
+
             results.append(
                 WaveTaskResult(task_id=tid, outcome=outcome, cost=cost)
             )
