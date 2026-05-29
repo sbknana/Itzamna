@@ -194,7 +194,9 @@ def test_merge_task_branch_no_commits_returns_false(tmp_path, capsys):
 
     assert ok is False
     out = capsys.readouterr().out
-    assert "NO commits ahead of HEAD" in out
+    # Task #2493: the skip message now names the DEFAULT branch instead of
+    # HEAD, since commits-ahead is computed against <default>..<branch>.
+    assert "NO commits ahead of" in out
 
 
 def test_merge_task_branch_missing_branch_logs_explicitly(tmp_path, capsys):
