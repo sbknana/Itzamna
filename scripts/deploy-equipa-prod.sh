@@ -24,7 +24,7 @@ set -euo pipefail
 PROD_DIR="${EQUIPA_PROD_DIR:-/srv/forge-share/AI_Stuff/Equipa-prod}"
 SOURCE_REPO_MARKER="forge_orchestrator.py"   # file that must exist in source CWD
 UPSTREAM_REMOTE="${EQUIPA_UPSTREAM_REMOTE:-origin}"
-UPSTREAM_BRANCH="${EQUIPA_UPSTREAM_BRANCH:-master}"
+UPSTREAM_BRANCH="${EQUIPA_UPSTREAM_BRANCH:-main}"
 
 # Files that exist ONLY in production. Keep this list in sync with
 # .deploy-allowlist (canonical machine-readable form) and docs/PROD_ONLY.md.example.
