@@ -26,7 +26,7 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 THEFORGE_DB = os.environ.get(
     "THEFORGE_DB",
-    str(Path(__file__).resolve().parent / "theforge.db"),
+    str(Path(__file__).resolve().parent.parent / "theforge.db"),
 )
 PROMPTS_DIR = SCRIPT_DIR / "prompts"
 
