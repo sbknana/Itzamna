@@ -96,6 +96,8 @@ def test_migration_creates_initiatives_table(db_conn):
     assert cols == {
         "id", "project_id", "name", "goal", "status",
         "created_at", "completed_at",
+        # Phase 2 (#2489) additive columns.
+        "total_cost", "started_at", "paused_at", "pause_reason",
     }
 
     task_cols = {row[1] for row in describe_table(db_conn, "tasks")}
