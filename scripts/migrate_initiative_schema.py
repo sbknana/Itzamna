@@ -65,6 +65,24 @@ CREATE INDEX IF NOT EXISTS idx_tasks_initiative
     ON tasks(initiative_id) WHERE initiative_id IS NOT NULL;
 """
 
+# Phase 2 additive columns on ``initiatives``. These are pure ADD COLUMN
+# operations — safe and far cheaper than a table rebuild. SQLite supports
+# ALTER TABLE ADD COLUMN with a literal DEFAULT (total_cost) and with no
+# default (the three nullable DATETIME/TEXT columns). Each is guarded by a
+# column-existence check so re-running the migration is a no-op.
+#
+# Mapping (name -> DDL fragment appended after "ADD COLUMN"):
+#   total_cost   accumulated cost (USD) across every dispatched sub-task
+#   started_at   first time --initiative <id> dispatched the spine
+#   paused_at    most recent pause (failure, gate-block, or pause marker)
+#   pause_reason free-text reason captured at the pause point
+PHASE2_INITIATIVE_COLUMNS: list[tuple[str, str]] = [
+    ("total_cost", "REAL NOT NULL DEFAULT 0.0"),
+    ("started_at", "DATETIME"),
+    ("paused_at", "DATETIME"),
+    ("pause_reason", "TEXT"),
+]
+
 
 def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
     """Return True if ``table.column`` already exists in the database."""
@@ -91,6 +109,7 @@ def apply_migration(conn: sqlite3.Connection) -> dict[str, bool]:
         "initiatives_table_created": False,
         "initiative_id_column_added": False,
         "initiatives_check_added": False,
+        "initiatives_phase2_columns_added": [],
     }
 
     if not _table_exists(conn, "tasks"):
@@ -138,6 +157,18 @@ def apply_migration(conn: sqlite3.Connection) -> dict[str, bool]:
                 """
             )
             report["initiatives_check_added"] = True
+
+    # Phase 2: additive columns for orchestration + cost tracking. Done
+    # AFTER any rebuild above so the columns land on the rebuilt table.
+    # ALTER TABLE ADD COLUMN is preferred over a rebuild for additive-only
+    # changes (cheaper, preserves existing rows verbatim) per the Phase 2
+    # acceptance criteria.
+    for column, ddl_fragment in PHASE2_INITIATIVE_COLUMNS:
+        if not _column_exists(conn, "initiatives", column):
+            conn.execute(
+                f"ALTER TABLE initiatives ADD COLUMN {column} {ddl_fragment}"
+            )
+            report["initiatives_phase2_columns_added"].append(column)
 
     if not _column_exists(conn, "tasks", "initiative_id"):
         # SQLite ALTER TABLE ADD COLUMN: nullable column with FK reference.
@@ -190,6 +221,11 @@ def main(argv: list[str]) -> int:
     print(
         "  tasks.initiative_id column added: "
         f"{report['initiative_id_column_added']}"
+    )
+    phase2_added = report.get("initiatives_phase2_columns_added") or []
+    print(
+        "  initiatives Phase 2 columns added: "
+        f"{', '.join(phase2_added) if phase2_added else 'none (already present)'}"
     )
 
     # Re-open in read mode to verify final shape (describe_table)
