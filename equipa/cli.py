@@ -568,6 +568,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     group.add_argument("--list-initiatives", action="store_true",
                         help="List active initiatives, optionally filtered by "
                              "--initiative-project codename.")
+    group.add_argument("--initiative", type=int, metavar="ID",
+                        help="Run an entire initiative end-to-end: walk the "
+                             "sub-task DAG, dispatch in waves, halt on failure "
+                             "or operator pause marker, track cost. Phase 2. "
+                             "Combine with --max-waves N or --dry-run.")
 
     parser.add_argument("--qiao", choices=["on", "off", "default"], default="default",
                         help="Enable/disable the qiao experimental plugin for this invocation. "
@@ -626,6 +631,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--initiative-goal", type=str, default=None,
                         metavar="TEXT",
                         help="Goal statement for --create-initiative (locked at creation)")
+    parser.add_argument("--max-waves", type=int, default=None, metavar="N",
+                        help="Safety cap on the number of waves dispatched in "
+                             "--initiative mode (default: unlimited)")
 
     return parser
 
@@ -816,7 +824,8 @@ async def run_mode_list_initiatives(args: argparse.Namespace) -> None:
             rows = conn.execute(
                 """
                 SELECT i.id, p.codename, i.name, i.status, i.created_at,
-                       (SELECT COUNT(*) FROM tasks t WHERE t.initiative_id = i.id)
+                       (SELECT COUNT(*) FROM tasks t WHERE t.initiative_id = i.id),
+                       i.total_cost
                 FROM initiatives i
                 LEFT JOIN projects p ON p.id = i.project_id
                 WHERE p.codename = ? OR p.name = ?
@@ -828,7 +837,8 @@ async def run_mode_list_initiatives(args: argparse.Namespace) -> None:
             rows = conn.execute(
                 """
                 SELECT i.id, p.codename, i.name, i.status, i.created_at,
-                       (SELECT COUNT(*) FROM tasks t WHERE t.initiative_id = i.id)
+                       (SELECT COUNT(*) FROM tasks t WHERE t.initiative_id = i.id),
+                       i.total_cost
                 FROM initiatives i
                 LEFT JOIN projects p ON p.id = i.project_id
                 ORDER BY i.status, i.created_at DESC
@@ -841,18 +851,110 @@ async def run_mode_list_initiatives(args: argparse.Namespace) -> None:
         print("No initiatives found.")
         return
 
-    header = f"{'ID':>4}  {'PROJECT':<16}  {'STATUS':<10}  {'TASKS':>5}  {'CREATED':<19}  NAME"
+    header = (
+        f"{'ID':>4}  {'PROJECT':<16}  {'STATUS':<11}  {'TASKS':>5}  "
+        f"{'COST':>9}  {'CREATED':<19}  NAME"
+    )
     print(header)
     print("-" * len(header))
     for r in rows:
-        iid, codename, name, status, created_at, task_count = r
+        iid, codename, name, status, created_at, task_count, total_cost = r
         codename = (codename or "—")[:16]
-        status = (status or "")[:10]
+        status = (status or "")[:11]
         created_at = (created_at or "")[:19]
+        cost_str = f"${(total_cost or 0.0):.4f}"
         print(
-            f"{iid:>4}  {codename:<16}  {status:<10}  "
-            f"{task_count:>5}  {created_at:<19}  {name}"
+            f"{iid:>4}  {codename:<16}  {status:<11}  "
+            f"{task_count:>5}  {cost_str:>9}  {created_at:<19}  {name}"
         )
+
+
+async def run_mode_initiative(args: argparse.Namespace) -> None:
+    """Run an entire initiative end-to-end (Phase 2).
+
+    Walks the sub-task DAG, dispatches in waves, halts on the first failure
+    or operator pause marker, and accumulates cost into
+    ``initiatives.total_cost``. A pause is the EXPECTED outcome of any
+    failure — this handler exits 0 on a pause and only lets unexpected
+    exceptions propagate non-zero.
+    """
+    from equipa.db import get_db_connection
+    from equipa.initiative_runner import (
+        CycleError,
+        InitiativeError,
+        compute_waves,
+        fetch_initiative,
+        fetch_initiative_tasks,
+        run_initiative,
+    )
+
+    initiative_id = int(args.initiative)
+
+    # --dry-run: print the wave plan, dispatch nothing.
+    if args.dry_run:
+        conn = get_db_connection(write=False)
+        try:
+            initiative = fetch_initiative(conn, initiative_id)
+            if initiative is None:
+                print(f"ERROR: no initiative with id={initiative_id}")
+                sys.exit(1)
+            tasks = fetch_initiative_tasks(conn, initiative_id)
+        finally:
+            conn.close()
+
+        print(f"\n--- DRY RUN (Initiative #{initiative_id}) ---")
+        print(f"Name:   {initiative['name']}")
+        print(f"Status: {initiative['status']}")
+        print(f"Pending sub-tasks: {len(tasks)}")
+        if not tasks:
+            print("  (none — running would mark the initiative 'done')")
+        else:
+            try:
+                waves = compute_waves(tasks)
+            except CycleError as exc:
+                print(f"  CYCLE DETECTED: {exc}")
+                sys.exit(1)
+            title_by_id = {int(t["id"]): t.get("title", "") for t in tasks}
+            for i, wave in enumerate(waves):
+                print(f"  Wave {i + 1}:")
+                for tid in wave:
+                    print(f"    - #{tid}: {title_by_id.get(tid, '')}")
+        if args.max_waves is not None:
+            print(f"Max waves cap: {args.max_waves}")
+        print("--- END DRY RUN ---")
+        return
+
+    # Live run. run_initiative owns its own write connection.
+    try:
+        result = await run_initiative(
+            initiative_id,
+            args,
+            max_waves=args.max_waves,
+        )
+    except CycleError as exc:
+        print(f"ERROR: {exc}")
+        sys.exit(1)
+    except InitiativeError as exc:
+        print(f"ERROR: {exc}")
+        sys.exit(1)
+
+    print(f"\n{'#' * 60}")
+    print(f"INITIATIVE #{initiative_id} — {result.status.upper()}")
+    print(f"{'#' * 60}")
+    print(f"Waves dispatched: {result.waves_dispatched}/{len(result.waves_planned)}")
+    print(f"Sub-tasks completed this run: {len(result.tasks_completed)}")
+    if result.tasks_failed:
+        print(f"Sub-tasks failed/blocked: "
+              f"{', '.join(f'#{t}' for t in result.tasks_failed)}")
+    print(f"Cost added this run: ${result.total_cost_added:.4f}")
+    if result.halted:
+        print(f"HALTED: {result.halt_reason}")
+        if result.open_question_id is not None:
+            print(f"Filed open_question #{result.open_question_id}.")
+        print("Fix the blocker / resolve the pause marker, then re-run "
+              f"--initiative {initiative_id} to resume.")
+    print(f"{'#' * 60}")
+    # A pause is an EXPECTED outcome, not an error — exit 0.
 
 
 # --- Config-Versioning Helpers ---
@@ -1669,6 +1771,8 @@ def _select_mode_handler(args: argparse.Namespace) -> "callable":
         return run_mode_create_initiative
     if getattr(args, "list_initiatives", False):
         return run_mode_list_initiatives
+    if getattr(args, "initiative", None):
+        return run_mode_initiative
     if getattr(args, "config_cmd", None):
         return run_mode_config
     if args.regenerate_manifest:
