@@ -150,6 +150,35 @@ def load_config():
             "evolution_lookback_days": 30,
         },
         "rubric_version": 1,
+        "prompt_patch": {
+            # Manual gate (mirrors config_tune being gated to manual). When
+            # False, prompt patches are recorded for manual review and NOT
+            # written to disk. Default OFF after the 2026-06-10 incident where
+            # an auto-applied patch tampered a prod prompt and the
+            # skill-integrity gate killed every dispatch. See bug #2532 (4).
+            "auto_apply": False,
+            # Path segments that mark a deployed (prod) checkout. ForgeSmith
+            # must patch the source repo (Equipa-repo), never prod-direct, so
+            # any prompt file resolving under one of these is refused.
+            "prod_path_markers": ["Equipa-prod"],
+            # Regenerate skill_manifest.json after a legit patch so the
+            # skill-integrity gate does not flag the file as TAMPERED.
+            "regenerate_manifest": True,
+        },
+        "opro": {
+            "enabled": True,
+            "model": "sonnet",
+            # Raised from the previous hard-coded 120s default: the Claude
+            # call routinely needs longer than 2 min to return proposals,
+            # yielding 0 proposals every night. See bug #2532.
+            "timeout_seconds": 300,
+            "max_proposals_per_role": 3,
+            "min_runs_for_proposal": 5,
+            "min_predicted_improvement": 0.10,
+            # Cap the embedded current-prompt size to keep the meta-prompt
+            # small enough to generate within the timeout.
+            "max_prompt_chars": 12000,
+        },
     }
     if CONFIG_FILE.exists():
         with open(CONFIG_FILE) as f:
@@ -766,6 +795,18 @@ def apply_prompt_patch(role, patch_text, rationale, run_id, cfg, dry_run=False):
         return None
 
     target = str(prompt_file)
+    patch_cfg = cfg.get("prompt_patch", {})
+
+    # Guard (c): never patch a deployed (prod) checkout. ForgeSmith must edit
+    # the source repo (Equipa-repo); prod is regenerated from source on deploy.
+    resolved = str(prompt_file.resolve())
+    prod_markers = patch_cfg.get("prod_path_markers", ["Equipa-prod"])
+    for marker in prod_markers:
+        if marker and marker in resolved:
+            log(f"  [BLOCKED] Prompt patch for {role} targets a prod checkout "
+                f"({marker}) — patches must go to Equipa-repo (source-is-truth). "
+                f"Refusing prod-direct edit.")
+            return None
 
     # Run impact analysis before applying
     assessment = run_impact_analysis(
@@ -778,6 +819,26 @@ def apply_prompt_patch(role, patch_text, rationale, run_id, cfg, dry_run=False):
                 "old_value": "", "new_value": patch_text,
                 "rationale": rationale, "run_id": run_id,
                 "impact_assessment": assessment}
+
+    # Guard (a): manual gate. Like config_tune, prompt patches do not auto-apply
+    # unless explicitly enabled; otherwise record for manual review and stop.
+    if not patch_cfg.get("auto_apply", False):
+        log(f"  [MANUAL-GATE] Prompt patch for {role} recorded for manual "
+            f"review (auto_apply disabled)")
+        conn = get_db(write=True)
+        conn.execute(
+            """INSERT INTO forgesmith_changes
+               (run_id, change_type, target_file, old_value, new_value,
+                rationale, evidence, impact_assessment)
+               VALUES (?, 'prompt_patch', ?, '', ?, ?, ?, ?)""",
+            (run_id, target, patch_text,
+             f"[MANUAL-GATE] {rationale}",
+             f"ForgeSmith prompt patch at {datetime.now().isoformat()}",
+             json.dumps(assessment, default=str)),
+        )
+        conn.commit()
+        conn.close()
+        return None
 
     if assessment["blocked"]:
         log(f"  [BLOCKED] Prompt patch for {role} — HIGH risk, "
@@ -822,6 +883,16 @@ def apply_prompt_patch(role, patch_text, rationale, run_id, cfg, dry_run=False):
     prompt_file.write_text(content, encoding="utf-8")
 
     log(f"  [APPLIED] Prompt patch for {role}")
+
+    # Guard (b): regenerate the skill manifest so the skill-integrity gate
+    # does not flag the patched file as TAMPERED on the next dispatch.
+    if patch_cfg.get("regenerate_manifest", True):
+        try:
+            from equipa.security import write_skill_manifest
+            write_skill_manifest()
+            log(f"  [MANIFEST] Regenerated skill_manifest.json after patch")
+        except Exception as exc:  # noqa: BLE001 — must not lose the applied patch
+            log(f"  [MANIFEST] WARNING: failed to regenerate manifest: {exc}")
 
     # Record change with impact assessment
     conn = get_db(write=True)
@@ -2415,6 +2486,35 @@ def collect_recent_reflections(cfg, role=None, limit=10):
     return [dict(r) for r in rows]
 
 
+def truncate_opro_prompt(current_prompt, max_prompt_chars=12000):
+    """Cap the embedded current prompt so the OPRO meta-prompt stays small.
+
+    Large role prompts were a primary cause of the 2-min Claude timeout
+    returning 0 proposals (bug #2532). When ``current_prompt`` exceeds
+    ``max_prompt_chars`` we keep a head and tail slice and drop the middle,
+    inserting a marker noting how many characters were omitted.
+
+    A falsy ``max_prompt_chars`` (0 or None) disables truncation. The result
+    is never longer than ``max_prompt_chars`` plus the marker length, so the
+    meta-prompt size stays bounded regardless of input size.
+
+    This is a pure string transform (no DB / no network) so it can be unit
+    tested directly without the Claude CLI or a populated database.
+    """
+    if not max_prompt_chars or len(current_prompt) <= max_prompt_chars:
+        return current_prompt
+
+    head = max_prompt_chars // 2
+    tail = max_prompt_chars - head
+    omitted = len(current_prompt) - max_prompt_chars
+    return (
+        current_prompt[:head]
+        + "\n\n...[prompt truncated for OPRO context — "
+        f"{omitted} chars omitted]...\n\n"
+        + current_prompt[-tail:]
+    )
+
+
 def build_opro_prompt(role, current_prompt, metrics, reflections, cfg):
     """Construct the OPRO meta-prompt for Claude to propose prompt modifications.
 
@@ -2423,6 +2523,12 @@ def build_opro_prompt(role, current_prompt, metrics, reflections, cfg):
     """
     opro_cfg = cfg.get("opro", {})
     max_proposals = opro_cfg.get("max_proposals_per_role", 3)
+
+    # Truncate the embedded current prompt so the meta-prompt stays small
+    # enough to generate within the OPRO timeout (bug #2532).
+    current_prompt = truncate_opro_prompt(
+        current_prompt, opro_cfg.get("max_prompt_chars", 12000)
+    )
 
     # Format metrics summary
     role_metrics = metrics.get(role, {})
@@ -2565,7 +2671,7 @@ def call_claude_for_proposals(prompt, cfg):
     """
     opro_cfg = cfg.get("opro", {})
     model = opro_cfg.get("model", "sonnet")
-    timeout = opro_cfg.get("timeout_seconds", 120)
+    timeout = opro_cfg.get("timeout_seconds", 300)
 
     cmd = [
         "claude",
@@ -3163,19 +3269,23 @@ def run_full(cfg, dry_run=False):
     # LITM: Self-tuning Lost-in-the-Middle attention weights (weekly)
     if not dry_run:
         log(f"\nPHASE 4.9: LITM WEIGHT AUDIT")
-        litm_report = run_litm_audit(
-            db_path=THEFORGE_DB,
-            dispatch_config_path=DISPATCH_CONFIG,
-            lookback_days=cfg.get("lookback_days", 7),
-            threshold=5,
-            dry_run=False
-        )
-        if litm_report["changes"]:
-            log(f"  LITM: {len(litm_report['changes'])} weight adjustments")
-            for change in litm_report["changes"]:
-                log(f"    {change}")
-        else:
-            log(f"  LITM: No adjustments needed ({litm_report['total_misses']} misses)")
+        try:
+            litm_report = run_litm_audit(
+                db_path=THEFORGE_DB,
+                dispatch_config_path=DISPATCH_CONFIG,
+                lookback_days=cfg.get("lookback_days", 7),
+                threshold=5,
+                dry_run=False
+            )
+            if litm_report["changes"]:
+                log(f"  LITM: {len(litm_report['changes'])} weight adjustments")
+                for change in litm_report["changes"]:
+                    log(f"    {change}")
+            else:
+                log(f"  LITM: No adjustments needed ({litm_report['total_misses']} misses)")
+        except sqlite3.Error as exc:
+            # Schema drift or DB issue must not crash the whole nightly run.
+            log(f"  LITM: SKIPPED — database error: {exc}")
 
     # Log the run
     if not dry_run:
