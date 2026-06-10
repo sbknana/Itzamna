@@ -1162,6 +1162,42 @@ def verify_wave_branch_isolation(
                     f"isolation check: tasks {collision} share identical HEAD "
                     f"{head[:12]} — cross-branch commit contamination"
                 )
+
+    # S2-INIT-03: identical-HEAD only catches the case where two branches end
+    # at the SAME commit. It misses content-level contamination where a commit
+    # leaks onto another task's branch but that branch then commits further on
+    # top — the HEADs differ, yet a commit is shared. Deepen the check: for
+    # every task branch, enumerate the commits it adds beyond the wave base
+    # (``base..branch``) and flag any commit SHA that appears in MORE THAN ONE
+    # task's range. A legitimately-isolated wave shares no non-base commits.
+    # Requires a known base; with ``wave_base`` unknown we cannot bound the
+    # range, so the conservative identical-HEAD result above stands alone.
+    if base:
+        commits_by_task: dict[int, set[str]] = {}
+        for tid in head_by_task:
+            branch = f"forge-task-{tid}"
+            try:
+                raw = run_git(repo_path, ["rev-list", f"{base}..{branch}"])
+            except Exception:  # noqa: BLE001 — range unavailable, skip this task
+                continue
+            commits_by_task[tid] = {
+                line.strip() for line in raw.splitlines() if line.strip()
+            }
+        owners_by_commit: dict[str, list[int]] = {}
+        for tid, commits in commits_by_task.items():
+            for sha in commits:
+                owners_by_commit.setdefault(sha, []).append(tid)
+        for sha, owners in owners_by_commit.items():
+            if len(owners) > 1:
+                shared = ", ".join(f"#{t}" for t in sorted(owners))
+                for tid in owners:
+                    # Do not clobber a more-specific identical-HEAD message.
+                    violations.setdefault(
+                        tid,
+                        f"isolation check: tasks {shared} share commit "
+                        f"{sha[:12]} on distinct branches — content-level "
+                        f"cross-branch contamination",
+                    )
     return violations
 
 
