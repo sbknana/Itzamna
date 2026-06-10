@@ -1185,7 +1185,11 @@ def verify_wave_branch_isolation(
     # range, so the conservative identical-HEAD result above stands alone.
     if base:
         commits_by_task: dict[int, set[str]] = {}
-        for tid in head_by_task:
+        for tid, head in head_by_task.items():
+            # Zero-commit tasks (branch tip == base) added nothing, so their
+            # base..branch range is empty by definition — skip them (N1).
+            if head == base:
+                continue
             branch = f"forge-task-{tid}"
             try:
                 raw = run_git(repo_path, ["rev-list", f"{base}..{branch}"])
