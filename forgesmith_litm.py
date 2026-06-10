@@ -8,11 +8,21 @@ Default weights (Claude): alpha=0.92 (start), beta=0.50 (middle), gamma=0.88 (en
 """
 
 import json
+import logging
 import re
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Tuple
+
+logger = logging.getLogger(__name__)
+
+# Columns this audit needs from agent_runs to detect text-based attention
+# misses. The schema drifted (agent_runs never had a free-text output column),
+# so we introspect at runtime and skip gracefully when they are absent rather
+# than crashing the nightly run with `sqlite3.OperationalError: no such column`.
+REQUIRED_EVIDENCE_COLUMNS = ("output",)
+OPTIONAL_EVIDENCE_COLUMNS = ("tool_calls",)
 
 
 # --- Weight Bounds ---
@@ -69,6 +79,12 @@ def save_litm_weights(dispatch_config_path: Path, weights: Dict[str, Dict[str, f
         json.dump(config, f, indent=2)
 
 
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    """Return the set of column names for a table (empty set if absent)."""
+    cursor = conn.execute(f"PRAGMA table_info({table})")
+    return {row[1] for row in cursor.fetchall()}
+
+
 def detect_middle_attention_misses(db_path: str, lookback_days: int = 7) -> List[Tuple[str, str, str]]:
     """Detect missed-attention events from agent output.
 
@@ -77,33 +93,61 @@ def detect_middle_attention_misses(db_path: str, lookback_days: int = 7) -> List
     Evidence types:
     - 're_read': Agent re-reads a file already in compaction history
     - 'clarification': Agent asks question answered in mid-prompt context
+
+    The detection relies on a free-text ``output`` column on ``agent_runs``.
+    That column does not exist in the current schema (schema drift), so we
+    introspect the table first and skip the audit gracefully — returning an
+    empty list — when the required evidence columns are missing. This keeps
+    the nightly ``--auto`` run from crashing at PHASE 4.9.
     """
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
 
-    cutoff = datetime.now() - timedelta(days=lookback_days)
+    try:
+        columns = _table_columns(conn, "agent_runs")
+        if not columns:
+            logger.warning("LITM audit skipped: agent_runs table not found in %s", db_path)
+            return []
 
-    # Query agent runs from the past week
-    cursor.execute("""
-        SELECT
-            ar.id,
-            ar.model,
-            ar.output,
-            ar.tool_calls
-        FROM agent_runs ar
-        WHERE ar.created_at >= ?
-          AND ar.status IN ('completed', 'early_terminated')
-          AND ar.output IS NOT NULL
-    """, (cutoff.isoformat(),))
+        missing = [c for c in REQUIRED_EVIDENCE_COLUMNS if c not in columns]
+        if missing:
+            logger.warning(
+                "LITM audit skipped: agent_runs is missing evidence column(s) %s "
+                "(schema drift — text-based attention detection unavailable)",
+                ", ".join(missing),
+            )
+            return []
+
+        # Build the SELECT from columns that actually exist, so optional
+        # evidence (tool_calls) and the status filter degrade gracefully.
+        select_cols = ["ar.id", "ar.model", "ar.output"]
+        has_tool_calls = "tool_calls" in columns
+        if has_tool_calls:
+            select_cols.append("ar.tool_calls")
+
+        where_clauses = ["ar.created_at >= ?", "ar.output IS NOT NULL"]
+        if "status" in columns:
+            where_clauses.append("ar.status IN ('completed', 'early_terminated')")
+
+        query = (
+            f"SELECT {', '.join(select_cols)} FROM agent_runs ar "
+            f"WHERE {' AND '.join(where_clauses)}"
+        )
+
+        cutoff = datetime.now() - timedelta(days=lookback_days)
+        cursor = conn.execute(query, (cutoff.isoformat(),))
+        rows = cursor.fetchall()
+    finally:
+        conn.close()
 
     misses = []
 
-    for row in cursor.fetchall():
+    for row in rows:
         agent_run_id = row["id"]
         model = row["model"] or "sonnet"
         output = row["output"] or ""
-        tool_calls = row["tool_calls"] or ""
+        tool_calls = row["tool_calls"] if "tool_calls" in row.keys() else ""
+        tool_calls = tool_calls or ""
 
         # Pattern 1: Re-reading files mentioned in compaction checkpoint
         # Look for "compaction checkpoint" or "anti-compaction" references
@@ -127,7 +171,6 @@ def detect_middle_attention_misses(db_path: str, lookback_days: int = 7) -> List
                 misses.append((model, agent_run_id, "clarification"))
                 break
 
-    conn.close()
     return misses
 
 
