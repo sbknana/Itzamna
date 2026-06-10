@@ -268,6 +268,110 @@ def test_full_audit_with_apply():
     print("✓ test_full_audit_with_apply passed")
 
 
+def create_drifted_db():
+    """Create a DB whose agent_runs matches the REAL (drifted) schema.
+
+    The production agent_runs table has NO output/tool_calls/status columns —
+    only the structured run-metrics columns. This is the schema-drift case
+    that crashed PHASE 4.9 (bug #2532). The audit must skip it gracefully.
+    """
+    db_fd, db_path = tempfile.mkstemp(suffix=".db")
+    conn = sqlite3.connect(db_path)
+    conn.execute("""
+        CREATE TABLE agent_runs (
+            id INTEGER PRIMARY KEY,
+            task_id INTEGER,
+            role TEXT NOT NULL,
+            model TEXT NOT NULL,
+            outcome TEXT,
+            success INTEGER DEFAULT 0,
+            error_summary TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.execute(
+        "INSERT INTO agent_runs (model, role, outcome, success) "
+        "VALUES ('sonnet', 'developer', 'tests_passed', 1)"
+    )
+    conn.commit()
+    conn.close()
+    return db_path
+
+
+def test_drifted_schema_no_output_column_skips_gracefully():
+    """detect_middle_attention_misses must not crash when output column absent."""
+    db_path = create_drifted_db()
+    try:
+        misses = detect_middle_attention_misses(db_path, lookback_days=7)
+        assert misses == [], f"Expected empty list on drifted schema, got {misses}"
+    finally:
+        Path(db_path).unlink()
+    print("✓ test_drifted_schema_no_output_column_skips_gracefully passed")
+
+
+def test_missing_agent_runs_table_skips_gracefully():
+    """Audit must skip (return []) when agent_runs table does not exist."""
+    db_fd, db_path = tempfile.mkstemp(suffix=".db")
+    try:
+        # Empty DB — no agent_runs table at all.
+        misses = detect_middle_attention_misses(db_path, lookback_days=7)
+        assert misses == [], f"Expected empty list when table missing, got {misses}"
+    finally:
+        Path(db_path).unlink()
+    print("✓ test_missing_agent_runs_table_skips_gracefully passed")
+
+
+def test_full_audit_on_drifted_schema_no_crash():
+    """run_litm_audit must complete (no changes) on the drifted prod schema."""
+    db_path = create_drifted_db()
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        config_path = Path(f.name)
+        json.dump({}, f)
+    try:
+        report = run_litm_audit(
+            db_path=db_path,
+            dispatch_config_path=config_path,
+            lookback_days=7,
+            threshold=3,
+            dry_run=False,
+        )
+        assert report["total_misses"] == 0
+        assert report["changes"] == []
+        # Weights untouched because there were no misses.
+        assert load_litm_weights(config_path) == DEFAULT_WEIGHTS
+    finally:
+        Path(db_path).unlink()
+        config_path.unlink()
+    print("✓ test_full_audit_on_drifted_schema_no_crash passed")
+
+
+def test_missing_status_column_still_detects():
+    """When status column is absent but output exists, detection still runs."""
+    db_fd, db_path = tempfile.mkstemp(suffix=".db")
+    conn = sqlite3.connect(db_path)
+    conn.execute("""
+        CREATE TABLE agent_runs (
+            id INTEGER PRIMARY KEY,
+            model TEXT,
+            output TEXT,
+            created_at TEXT
+        )
+    """)
+    conn.execute(
+        "INSERT INTO agent_runs (model, output, created_at) VALUES (?, ?, ?)",
+        ("opus", "I need to clarify what you mean.",
+         (datetime.now() - timedelta(days=1)).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+    try:
+        misses = detect_middle_attention_misses(db_path, lookback_days=7)
+        assert any(m[2] == "clarification" for m in misses), misses
+    finally:
+        Path(db_path).unlink()
+    print("✓ test_missing_status_column_still_detects passed")
+
+
 if __name__ == "__main__":
     test_detect_middle_attention_misses()
     test_analyze_miss_distribution()
@@ -276,4 +380,8 @@ if __name__ == "__main__":
     test_load_save_weights()
     test_full_audit_dry_run()
     test_full_audit_with_apply()
+    test_drifted_schema_no_output_column_skips_gracefully()
+    test_missing_agent_runs_table_skips_gracefully()
+    test_full_audit_on_drifted_schema_no_crash()
+    test_missing_status_column_still_detects()
     print("\n✅ All LITM tuner tests passed!")
