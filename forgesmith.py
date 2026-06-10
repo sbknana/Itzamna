@@ -150,6 +150,21 @@ def load_config():
             "evolution_lookback_days": 30,
         },
         "rubric_version": 1,
+        "prompt_patch": {
+            # Manual gate (mirrors config_tune being gated to manual). When
+            # False, prompt patches are recorded for manual review and NOT
+            # written to disk. Default OFF after the 2026-06-10 incident where
+            # an auto-applied patch tampered a prod prompt and the
+            # skill-integrity gate killed every dispatch. See bug #2532 (4).
+            "auto_apply": False,
+            # Path segments that mark a deployed (prod) checkout. ForgeSmith
+            # must patch the source repo (Equipa-repo), never prod-direct, so
+            # any prompt file resolving under one of these is refused.
+            "prod_path_markers": ["Equipa-prod"],
+            # Regenerate skill_manifest.json after a legit patch so the
+            # skill-integrity gate does not flag the file as TAMPERED.
+            "regenerate_manifest": True,
+        },
         "opro": {
             "enabled": True,
             "model": "sonnet",
@@ -780,6 +795,18 @@ def apply_prompt_patch(role, patch_text, rationale, run_id, cfg, dry_run=False):
         return None
 
     target = str(prompt_file)
+    patch_cfg = cfg.get("prompt_patch", {})
+
+    # Guard (c): never patch a deployed (prod) checkout. ForgeSmith must edit
+    # the source repo (Equipa-repo); prod is regenerated from source on deploy.
+    resolved = str(prompt_file.resolve())
+    prod_markers = patch_cfg.get("prod_path_markers", ["Equipa-prod"])
+    for marker in prod_markers:
+        if marker and marker in resolved:
+            log(f"  [BLOCKED] Prompt patch for {role} targets a prod checkout "
+                f"({marker}) — patches must go to Equipa-repo (source-is-truth). "
+                f"Refusing prod-direct edit.")
+            return None
 
     # Run impact analysis before applying
     assessment = run_impact_analysis(
@@ -792,6 +819,26 @@ def apply_prompt_patch(role, patch_text, rationale, run_id, cfg, dry_run=False):
                 "old_value": "", "new_value": patch_text,
                 "rationale": rationale, "run_id": run_id,
                 "impact_assessment": assessment}
+
+    # Guard (a): manual gate. Like config_tune, prompt patches do not auto-apply
+    # unless explicitly enabled; otherwise record for manual review and stop.
+    if not patch_cfg.get("auto_apply", False):
+        log(f"  [MANUAL-GATE] Prompt patch for {role} recorded for manual "
+            f"review (auto_apply disabled)")
+        conn = get_db(write=True)
+        conn.execute(
+            """INSERT INTO forgesmith_changes
+               (run_id, change_type, target_file, old_value, new_value,
+                rationale, evidence, impact_assessment)
+               VALUES (?, 'prompt_patch', ?, '', ?, ?, ?, ?)""",
+            (run_id, target, patch_text,
+             f"[MANUAL-GATE] {rationale}",
+             f"ForgeSmith prompt patch at {datetime.now().isoformat()}",
+             json.dumps(assessment, default=str)),
+        )
+        conn.commit()
+        conn.close()
+        return None
 
     if assessment["blocked"]:
         log(f"  [BLOCKED] Prompt patch for {role} — HIGH risk, "
@@ -836,6 +883,16 @@ def apply_prompt_patch(role, patch_text, rationale, run_id, cfg, dry_run=False):
     prompt_file.write_text(content, encoding="utf-8")
 
     log(f"  [APPLIED] Prompt patch for {role}")
+
+    # Guard (b): regenerate the skill manifest so the skill-integrity gate
+    # does not flag the patched file as TAMPERED on the next dispatch.
+    if patch_cfg.get("regenerate_manifest", True):
+        try:
+            from equipa.security import write_skill_manifest
+            write_skill_manifest()
+            log(f"  [MANIFEST] Regenerated skill_manifest.json after patch")
+        except Exception as exc:  # noqa: BLE001 — must not lose the applied patch
+            log(f"  [MANIFEST] WARNING: failed to regenerate manifest: {exc}")
 
     # Record change with impact assessment
     conn = get_db(write=True)
