@@ -295,6 +295,37 @@ def _fence_untrusted_reason(reason: str) -> str:
     return wrap_untrusted(safe, _make_untrusted_delimiter())
 
 
+# Matches a trailing untrusted closing fence: <<<END_UNTRUSTED_deadbeef>>>
+_END_FENCE_RE = re.compile(r"<<<END_[A-Za-z0-9_]+>>>\s*$")
+
+
+def _truncate_preserving_fence(text: str, limit: int) -> str:
+    """Truncate ``text`` to ``limit`` chars without severing a closing fence.
+
+    S2-INIT-04: a pause reason is fenced (:func:`_fence_untrusted_reason`)
+    BEFORE it is stored, but downstream column writes (e.g.
+    :func:`mark_paused`) still cap the string length. A naive ``text[:limit]``
+    can sever the trailing ``<<<END_UNTRUSTED_...>>>`` delimiter, leaving the
+    untrusted block UNCLOSED — exactly the prompt-injection escape the fence
+    exists to prevent. This truncates the body but re-attaches the closing
+    fence so an opened untrusted block is always closed.
+    """
+    if len(text) <= limit:
+        return text
+    match = _END_FENCE_RE.search(text)
+    truncated = text[:limit]
+    if match is None:
+        # No closing fence to protect — plain truncation is safe.
+        return truncated
+    closing = match.group(0).strip()
+    if closing in truncated:
+        # The closing fence survived the cut intact.
+        return truncated
+    # Re-attach the closing delimiter, trimming the body to make room.
+    keep = max(0, limit - len(closing) - 1)
+    return f"{text[:keep].rstrip()}\n{closing}"
+
+
 # ---------------------------------------------------------------------------
 # DB access — thin, all parameterised
 # ---------------------------------------------------------------------------
@@ -384,7 +415,7 @@ def mark_paused(
     conn.execute(
         "UPDATE initiatives SET status = 'paused', paused_at = ?, "
         "pause_reason = ? WHERE id = ?",
-        (_fmt(now), reason[:2000], initiative_id),
+        (_fmt(now), _truncate_preserving_fence(reason, 2000), initiative_id),
     )
     conn.commit()
 
