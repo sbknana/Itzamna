@@ -2486,6 +2486,35 @@ def collect_recent_reflections(cfg, role=None, limit=10):
     return [dict(r) for r in rows]
 
 
+def truncate_opro_prompt(current_prompt, max_prompt_chars=12000):
+    """Cap the embedded current prompt so the OPRO meta-prompt stays small.
+
+    Large role prompts were a primary cause of the 2-min Claude timeout
+    returning 0 proposals (bug #2532). When ``current_prompt`` exceeds
+    ``max_prompt_chars`` we keep a head and tail slice and drop the middle,
+    inserting a marker noting how many characters were omitted.
+
+    A falsy ``max_prompt_chars`` (0 or None) disables truncation. The result
+    is never longer than ``max_prompt_chars`` plus the marker length, so the
+    meta-prompt size stays bounded regardless of input size.
+
+    This is a pure string transform (no DB / no network) so it can be unit
+    tested directly without the Claude CLI or a populated database.
+    """
+    if not max_prompt_chars or len(current_prompt) <= max_prompt_chars:
+        return current_prompt
+
+    head = max_prompt_chars // 2
+    tail = max_prompt_chars - head
+    omitted = len(current_prompt) - max_prompt_chars
+    return (
+        current_prompt[:head]
+        + "\n\n...[prompt truncated for OPRO context — "
+        f"{omitted} chars omitted]...\n\n"
+        + current_prompt[-tail:]
+    )
+
+
 def build_opro_prompt(role, current_prompt, metrics, reflections, cfg):
     """Construct the OPRO meta-prompt for Claude to propose prompt modifications.
 
@@ -2496,18 +2525,10 @@ def build_opro_prompt(role, current_prompt, metrics, reflections, cfg):
     max_proposals = opro_cfg.get("max_proposals_per_role", 3)
 
     # Truncate the embedded current prompt so the meta-prompt stays small
-    # enough to generate within the OPRO timeout. Large role prompts were a
-    # primary cause of the 2-min timeout returning 0 proposals (bug #2532).
-    max_prompt_chars = opro_cfg.get("max_prompt_chars", 12000)
-    if max_prompt_chars and len(current_prompt) > max_prompt_chars:
-        head = max_prompt_chars // 2
-        tail = max_prompt_chars - head
-        current_prompt = (
-            current_prompt[:head]
-            + "\n\n...[prompt truncated for OPRO context — "
-            f"{len(current_prompt) - max_prompt_chars} chars omitted]...\n\n"
-            + current_prompt[-tail:]
-        )
+    # enough to generate within the OPRO timeout (bug #2532).
+    current_prompt = truncate_opro_prompt(
+        current_prompt, opro_cfg.get("max_prompt_chars", 12000)
+    )
 
     # Format metrics summary
     role_metrics = metrics.get(role, {})
