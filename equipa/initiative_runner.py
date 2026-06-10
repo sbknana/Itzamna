@@ -794,9 +794,19 @@ async def _run_initiative_inner(
         result.waves_dispatched += 1
 
         # (c) Accumulate cost for EVERY task in the wave, even on halt.
+        # S2-INIT-06: sum the wave's valid per-task costs and persist them in a
+        # SINGLE add_cost call (one UPDATE + commit) instead of one commit per
+        # task, avoiding N+1 commits per wave. add_cost already drops
+        # non-positive / non-finite values, so the wave total is the sum of the
+        # same per-value filter applied here for the in-memory result tally.
+        wave_cost = 0.0
         for tr in wave_results:
-            add_cost(conn, initiative_id, tr.cost)
-            result.total_cost_added += max(0.0, _safe_float(tr.cost))
+            value = _safe_float(tr.cost)
+            if value > 0:
+                wave_cost += value
+        if wave_cost > 0:
+            add_cost(conn, initiative_id, wave_cost)
+        result.total_cost_added += wave_cost
 
         # (d) Halt if ANY task in the wave failed / was gate-blocked.
         failed = [tr for tr in wave_results if not tr.succeeded]
@@ -949,14 +959,55 @@ def _read_task_status(conn: sqlite3.Connection, task_id: int) -> str:
     return (row[0] if row else "") or ""
 
 
-def _read_task_cost(conn: sqlite3.Connection, task_id: int) -> float:
-    """Sum recorded ``agent_runs.cost_usd`` for a task (best-effort)."""
+def _read_task_cost_high_water(conn: sqlite3.Connection, task_id: int) -> int:
+    """Return the current max ``agent_runs.id`` for a task (0 if none).
+
+    Captured BEFORE a (re)dispatch so the post-wave cost read can sum only
+    the rows this wave actually created. Without this, a retried task whose
+    prior attempts already left ``agent_runs`` rows would have its full
+    historical cost re-added to ``initiatives.total_cost`` every wave
+    (S2-INIT-02 double-count on resume).
+    """
     try:
         row = conn.execute(
-            "SELECT COALESCE(SUM(cost_usd), 0.0) FROM agent_runs "
-            "WHERE task_id = ?",
+            "SELECT COALESCE(MAX(id), 0) FROM agent_runs WHERE task_id = ?",
             (task_id,),
         ).fetchone()
+    except sqlite3.Error:
+        return 0
+    try:
+        return int(row[0]) if row and row[0] is not None else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def _read_task_cost(
+    conn: sqlite3.Connection,
+    task_id: int,
+    *,
+    since_run_id: int = 0,
+) -> float:
+    """Sum recorded ``agent_runs.cost_usd`` for a task (best-effort).
+
+    When ``since_run_id`` is supplied (a pre-dispatch high-water mark from
+    :func:`_read_task_cost_high_water`), only rows created AFTER that mark are
+    summed — i.e. the cost delta of the current wave. This prevents a task
+    that was retried across waves from re-adding its prior attempts' cost to
+    the initiative total each time (S2-INIT-02).
+    """
+    try:
+        if since_run_id > 0:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(cost_usd), 0.0) FROM agent_runs "
+                "WHERE task_id = ? AND id > ?",
+                (task_id, since_run_id),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(cost_usd), 0.0) FROM agent_runs "
+                "WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
     except sqlite3.Error:
         return 0.0
     return _safe_float(row[0] if row else 0.0)
@@ -1131,6 +1182,18 @@ async def _default_dispatch_wave(
         except Exception:  # noqa: BLE001 — base capture is best-effort
             logger.debug("Could not record pre-wave base HEAD", exc_info=True)
 
+    # S2-INIT-02: snapshot each task's agent_runs high-water mark BEFORE
+    # dispatch so the post-wave cost read sums only this wave's NEW rows. A
+    # retried task already carries prior-attempt rows; without this delta the
+    # initiative total would re-absorb that historical cost on every wave.
+    pre_wave_high_water: dict[int, int] = {}
+    conn_hw = get_db_connection(write=False)
+    try:
+        for tid in task_ids:
+            pre_wave_high_water[tid] = _read_task_cost_high_water(conn_hw, tid)
+    finally:
+        conn_hw.close()
+
     await run_parallel_tasks(list(task_ids), args)
 
     # S2: independently verify per-task branch isolation BEFORE trusting the
@@ -1144,7 +1207,9 @@ async def _default_dispatch_wave(
     try:
         for tid in task_ids:
             status = _read_task_status(conn, tid)
-            cost = _read_task_cost(conn, tid)
+            cost = _read_task_cost(
+                conn, tid, since_run_id=pre_wave_high_water.get(tid, 0)
+            )
             outcome = "done" if status == "done" else (status or "unknown")
 
             # S5: cross-check the independent gate signal. A task can read
