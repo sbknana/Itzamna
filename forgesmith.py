@@ -150,6 +150,20 @@ def load_config():
             "evolution_lookback_days": 30,
         },
         "rubric_version": 1,
+        "opro": {
+            "enabled": True,
+            "model": "sonnet",
+            # Raised from the previous hard-coded 120s default: the Claude
+            # call routinely needs longer than 2 min to return proposals,
+            # yielding 0 proposals every night. See bug #2532.
+            "timeout_seconds": 300,
+            "max_proposals_per_role": 3,
+            "min_runs_for_proposal": 5,
+            "min_predicted_improvement": 0.10,
+            # Cap the embedded current-prompt size to keep the meta-prompt
+            # small enough to generate within the timeout.
+            "max_prompt_chars": 12000,
+        },
     }
     if CONFIG_FILE.exists():
         with open(CONFIG_FILE) as f:
@@ -2424,6 +2438,20 @@ def build_opro_prompt(role, current_prompt, metrics, reflections, cfg):
     opro_cfg = cfg.get("opro", {})
     max_proposals = opro_cfg.get("max_proposals_per_role", 3)
 
+    # Truncate the embedded current prompt so the meta-prompt stays small
+    # enough to generate within the OPRO timeout. Large role prompts were a
+    # primary cause of the 2-min timeout returning 0 proposals (bug #2532).
+    max_prompt_chars = opro_cfg.get("max_prompt_chars", 12000)
+    if max_prompt_chars and len(current_prompt) > max_prompt_chars:
+        head = max_prompt_chars // 2
+        tail = max_prompt_chars - head
+        current_prompt = (
+            current_prompt[:head]
+            + "\n\n...[prompt truncated for OPRO context — "
+            f"{len(current_prompt) - max_prompt_chars} chars omitted]...\n\n"
+            + current_prompt[-tail:]
+        )
+
     # Format metrics summary
     role_metrics = metrics.get(role, {})
     metrics_text = json.dumps(role_metrics, indent=2) if role_metrics else "No metrics available."
@@ -2565,7 +2593,7 @@ def call_claude_for_proposals(prompt, cfg):
     """
     opro_cfg = cfg.get("opro", {})
     model = opro_cfg.get("model", "sonnet")
-    timeout = opro_cfg.get("timeout_seconds", 120)
+    timeout = opro_cfg.get("timeout_seconds", 300)
 
     cmd = [
         "claude",
