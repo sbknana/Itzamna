@@ -790,8 +790,11 @@ async def run_mode_create_initiative(args: argparse.Namespace) -> None:
 
     conn = get_db_connection(write=True)
     try:
+        # UX (#2491): match codename/name case-insensitively so the docs
+        # example `--initiative-project equipa` resolves the `Equipa` project.
         row = conn.execute(
-            "SELECT id FROM projects WHERE codename = ? OR name = ?",
+            "SELECT id FROM projects "
+            "WHERE LOWER(codename) = LOWER(?) OR LOWER(name) = LOWER(?)",
             (project_codename, project_codename),
         ).fetchone()
         if row is None:
@@ -832,7 +835,7 @@ async def run_mode_list_initiatives(args: argparse.Namespace) -> None:
                        i.total_cost
                 FROM initiatives i
                 LEFT JOIN projects p ON p.id = i.project_id
-                WHERE p.codename = ? OR p.name = ?
+                WHERE LOWER(p.codename) = LOWER(?) OR LOWER(p.name) = LOWER(?)
                 ORDER BY i.status, i.created_at DESC
                 """,
                 (project_codename, project_codename),
