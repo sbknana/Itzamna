@@ -358,8 +358,19 @@ def fetch_initiative_tasks(
     """
     statuses = FORCE_PENDING_STATUSES if force else PENDING_STATUSES
     placeholders = ",".join("?" for _ in statuses)
+    # Schema-drift guard (#2491): ``tasks.role`` is NOT part of the canonical
+    # schema (schema.sql + initiative migration) and is absent from production
+    # DBs built from it. Every other call site treats role as optional
+    # (``task.get("role") or "developer"``). A hard ``SELECT ... role`` here
+    # therefore raised "no such column: role" on any clean DB. Select it only
+    # when the column exists; otherwise expose ``role = None`` so downstream
+    # defaulting is unchanged. tests/test_schema_drift.py pins this contract.
+    has_role = any(
+        r[1] == "role" for r in conn.execute("PRAGMA table_info(tasks)")
+    )
+    role_select = "role" if has_role else "NULL AS role"
     rows = conn.execute(
-        f"SELECT id, project_id, title, status, blocked_by, role, "
+        f"SELECT id, project_id, title, status, blocked_by, {role_select}, "
         f"initiative_id FROM tasks "
         f"WHERE initiative_id = ? AND status IN ({placeholders}) "
         f"ORDER BY id",
