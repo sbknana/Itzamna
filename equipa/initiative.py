@@ -250,6 +250,19 @@ def _acquire_lock(lock_path: Path) -> Iterator[None]:
     Windows — a corruption-prone fallback is worse than a clear error
     at import time when someone tries to run EQUIPA orchestrator on a
     platform we have not validated.
+
+    LIMITATION (S2-INIT-05): ``fcntl.flock`` is HOST-LOCAL. It serialises
+    concurrent initiative runs that share the same kernel/filesystem (the
+    normal single-host orchestrator deployment), but it provides NO mutual
+    exclusion across DIFFERENT hosts pointing at the same repo over a
+    network/shared filesystem (NFS flock semantics are unreliable, and two
+    separate machines do not share a lock table at all). If EQUIPA is ever
+    run from multiple hosts against one repo, two initiative dispatches can
+    both acquire "the" lock and race on plan-file writes / wave dispatch.
+    Cross-host mutual exclusion would require a DB advisory lock (e.g. a row
+    in TheForge claimed with an atomic compare-and-set on ``initiatives``)
+    layered ON TOP of this host-local flock — not yet implemented because the
+    current deployment is single-host.
     """
     try:
         import fcntl  # POSIX-only
