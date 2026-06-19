@@ -73,4 +73,3 @@
 ```yaml
 # CI-ready rule
 ```
-

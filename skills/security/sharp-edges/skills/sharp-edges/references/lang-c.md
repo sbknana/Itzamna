@@ -203,4 +203,3 @@ Search for these patterns in C/C++ code:
 | `malloc` without overflow check on size | Integer overflow |
 | Arithmetic on `int` near INT_MAX | Signed overflow UB |
 | `strncpy` without explicit null termination | Missing terminator |
-

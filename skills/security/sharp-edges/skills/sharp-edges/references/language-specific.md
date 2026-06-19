@@ -586,4 +586,3 @@ params.require(:user).permit(:name, :email)  # Explicitly allowlist
 | JS/TS | == coercion, prototype pollution, ReDoS, parseInt radix |
 | Python | Mutable defaults, eval/exec/pickle, late binding, is vs == |
 | Ruby | eval/send/constantize, YAML.load, mass assignment |
-

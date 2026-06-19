@@ -263,4 +263,3 @@ obj.process()  // "member" - members always win
 | `by lazy(LazyThreadSafetyMode.NONE)` | Thread safety |
 | `asSequence()` without terminal op | Nothing executes |
 | Extension function same name as member | Extension never called |
-

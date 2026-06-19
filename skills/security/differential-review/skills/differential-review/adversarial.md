@@ -201,4 +201,3 @@ Step 3: Accounting mismatch exploited
 ---
 
 **Next:** Document all findings in final report (see [reporting.md](reporting.md))
-

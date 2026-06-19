@@ -283,4 +283,3 @@ formatter.Deserialize(untrustedStream);  // RCE vulnerability
 | `lock (this)` or `lock (typeof(...))` | Deadlock risk |
 | `BinaryFormatter` | Deserialization RCE |
 | Event subscription without unsubscription | Memory leak |
-

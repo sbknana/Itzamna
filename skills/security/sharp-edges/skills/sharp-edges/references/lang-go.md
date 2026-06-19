@@ -268,4 +268,3 @@ defer func() {
 | Closure in loop capturing loop var | Capture bug (pre-1.22) |
 | `map` access from multiple goroutines | Data race |
 | `_, err :=` instead of `_, err =` | Error shadowing |
-

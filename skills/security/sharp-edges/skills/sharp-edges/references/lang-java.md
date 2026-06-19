@@ -261,4 +261,3 @@ factory.setExpandEntityReferences(false);
 | Resources without try-with-resources | Resource leak |
 | `new BigDecimal(double)` | Precision loss |
 | `DocumentBuilderFactory.newInstance()` | XXE vulnerability |
-

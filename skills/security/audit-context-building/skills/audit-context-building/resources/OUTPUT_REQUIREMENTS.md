@@ -69,4 +69,3 @@ A complete micro-analysis MUST identify:
 - Use code blocks (` ```solidity `) for code snippets
 - Reference line numbers: `L45`, `lines 98-102`
 - Separate blocks with `---` horizontal rules for readability
-

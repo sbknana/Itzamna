@@ -329,4 +329,3 @@ if __name__ == "__main__":
     print("\nTop 5 rules:")
     for rule, count in sorted(stats["by_rule"].items(), key=lambda x: -x[1])[:5]:
         print(f"  {rule}: {count}")
-

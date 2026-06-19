@@ -250,4 +250,3 @@ For authentication APIs, verify:
 - [ ] **Rate limiting**: Brute force protection on all auth endpoints
 - [ ] **Authorization centralized**: Not scattered across endpoints
 - [ ] **MFA in backend**: Not bypassable by skipping frontend
-

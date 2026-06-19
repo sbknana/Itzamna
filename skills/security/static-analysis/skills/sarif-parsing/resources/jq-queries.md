@@ -160,4 +160,3 @@ jq -e '[.runs[].results[]] | length > 0' results.sarif && echo "Has results" || 
 # Verify all results have locations
 jq '[.runs[].results[] | select(.locations | length == 0)] | length' results.sarif
 ```
-

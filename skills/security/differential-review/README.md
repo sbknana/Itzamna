@@ -107,4 +107,3 @@ git diff main..feature/auth-changes
 
 - `context-building` - Used for baseline context analysis
 - `issue-writer` - Transform findings into formal audit reports
-

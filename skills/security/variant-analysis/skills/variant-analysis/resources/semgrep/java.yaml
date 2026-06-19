@@ -59,4 +59,3 @@ rules:
           $RET $METHOD(..., HttpServletRequest $REQ, ...) {
             ...
           }
-

@@ -267,4 +267,3 @@ function isAdmin(user: User): user is Admin {
 | `as Type` assertions | Runtime type mismatch |
 | `!` non-null assertion | Null pointer crash |
 | Missing `await` before async call | Race condition |
-

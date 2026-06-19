@@ -243,4 +243,3 @@ session_regenerate_id(true);  // true deletes old session
 | `"0e\d+" == "0e\d+"` | Magic hash comparison |
 | `session_id($_GET` | Session fixation |
 | Missing `===` for security checks | Type confusion bypass |
-

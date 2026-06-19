@@ -270,4 +270,3 @@ double!(x + 1)  // Doesn't do what you expect
 | `extern "C" fn` without catch_unwind | UB on panic |
 | Drop impl with panic | Double panic = abort |
 | Complex deref chains | Method resolution confusion |
-

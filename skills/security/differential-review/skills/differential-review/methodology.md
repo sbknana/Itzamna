@@ -232,4 +232,3 @@ git diff <range> | grep "^-.*require.*amount > 0"
 **Next steps:**
 - For HIGH RISK changes, proceed to [adversarial.md](adversarial.md)
 - For report generation, see [reporting.md](reporting.md)
-

@@ -140,4 +140,3 @@ Ready-to-use templates in `resources/`:
 - `python.yaml`, `javascript.yaml`, `java.yaml`, `go.yaml`, `cpp.yaml`
 
 **Report**: `resources/variant-report-template.md`
-

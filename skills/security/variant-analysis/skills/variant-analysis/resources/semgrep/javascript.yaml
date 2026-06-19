@@ -58,4 +58,3 @@ rules:
           - pattern: child_process.exec(...)
       - pattern-not: eval("...")
       - pattern-not: Function("...")
-

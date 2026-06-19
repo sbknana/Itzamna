@@ -61,4 +61,3 @@ rules:
           - pattern: exec.Command(...)
           - pattern: $DB.Query($Q, ...)
       - pattern-not: exec.Command("...")
-

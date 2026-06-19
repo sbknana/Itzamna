@@ -188,4 +188,3 @@ For cryptographic APIs, verify:
 - [ ] **Constant-time comparison**: Default or only comparison method
 - [ ] **Uniform errors**: Same error for all decryption failures
 - [ ] **KDF for passwords**: Argon2/scrypt/bcrypt, not raw hashes
-

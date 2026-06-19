@@ -56,4 +56,3 @@ It exists solely to build deep understanding before the vulnerability-hunting ph
 - `issue-writer` - Write up findings after context is built
 - `differential-review` - Uses context-building for baseline analysis
 - `spec-compliance` - Compare understood behavior to documentation
-

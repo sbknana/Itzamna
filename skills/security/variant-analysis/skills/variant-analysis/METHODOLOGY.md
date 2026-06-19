@@ -325,4 +325,3 @@ if order.owner_id == current_user.id:
 8. **Expand vulnerability classes**: One root cause has many manifestations
 9. **Check semantics**: Verify code matches documentation intent
 10. **Test edge cases**: Null values and boundary conditions reveal hidden bugs
-

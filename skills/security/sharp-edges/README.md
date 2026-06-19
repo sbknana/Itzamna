@@ -41,9 +41,12 @@ The skill identifies six categories of misuse-prone designs:
 | Silent Failures | Verification returns `False` instead of throwing; ignored return values |
 | Stringly-Typed Security | Permissions as comma-separated strings; SQL from concatenation |
 
+## Agent
+
+The `sharp-edges-analyzer` agent runs the full analysis workflow autonomously in a subagent context. Use it when you want a dedicated, isolated analysis of APIs, configurations, or interfaces for misuse resistance.
+
 ## Related Skills
 
 - [constant-time-analysis](../constant-time-analysis) - Detect timing side-channels in cryptographic code
 - [differential-review](../differential-review) - Security-focused code change review
 - [audit-context-building](../audit-context-building) - Deep architectural analysis before auditing
-

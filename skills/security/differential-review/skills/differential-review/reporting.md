@@ -367,4 +367,3 @@ If file write fails:
 4. Notify user to save manually
 
 **Always prioritize persistent artifact generation over ephemeral chat output.**
-
