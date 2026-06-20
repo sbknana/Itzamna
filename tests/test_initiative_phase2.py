@@ -268,7 +268,8 @@ def _write_plan(repo: Path, iid: int, *, pause_reason: str | None) -> None:
     if pause_reason is not None:
         human += f'<!-- pause-for-review reason="{pause_reason}" -->\n\n'
     plan.write_text(
-        human + f"{HUMAN_EDIT_HINT}\n{BEGIN_MARKER}\n\n{END_MARKER}\n"
+        human + f"{HUMAN_EDIT_HINT}\n{BEGIN_MARKER}\n\n{END_MARKER}\n",
+        encoding="utf-8",
     )
 
 
@@ -633,10 +634,16 @@ def test_n2_lock_dir_is_private_not_world_tmp(tmp_path: Path, monkeypatch) -> No
     (repo / ".git").mkdir(parents=True)
     lock_dir = ir._initiative_lock_dir(str(repo))
     # Falls back to the repo's .git dir (not /tmp) when XDG_RUNTIME_DIR unset.
+    # This location check is the cross-platform privacy property (the dir lives
+    # under the user-owned repo, never a world-shared /tmp).
     assert lock_dir == repo / ".git" / "equipa-locks"
     assert lock_dir.is_dir()
-    # Restrictive perms: owner-only.
-    assert (lock_dir.stat().st_mode & 0o777) == 0o700
+    # Restrictive perms: owner-only. POSIX mode bits only — on Windows chmod()
+    # does not set the 0o777 group/other bits (privacy is provided by NTFS ACLs
+    # inherited from the user profile + the per-user location above), so the
+    # numeric-mode assertion is POSIX-only.
+    if sys.platform != "win32":
+        assert (lock_dir.stat().st_mode & 0o777) == 0o700
 
 
 def test_n2_lock_dir_prefers_xdg_runtime(tmp_path: Path, monkeypatch) -> None:
@@ -686,7 +693,8 @@ def test_s4_active_marker_keyed_on_position(tmp_path: Path) -> None:
         '<!-- pause-for-review reason="dup" -->\n'
         "x\n"
         '<!-- pause-for-review reason="dup" -->\n'
-        f"{BEGIN_MARKER}\n{END_MARKER}\n"
+        f"{BEGIN_MARKER}\n{END_MARKER}\n",
+        encoding="utf-8",
     )
     seen: set[tuple[int, str]] = set()
     first = ir._active_pause_marker(str(tmp_path), iid, seen)

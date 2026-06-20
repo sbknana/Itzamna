@@ -75,6 +75,24 @@ except ImportError:  # Windows
         _msvcrt.locking(fh.fileno(), _msvcrt.LK_UNLCK, 1)
 
 
+def _user_token() -> str:
+    """Stable per-user token for namespacing the last-resort tmp lock dir (N3).
+
+    POSIX uses the numeric uid (``os.getuid``). Windows has no ``getuid``, so we
+    fall back to the sanitized login name. Either way the tmp lock dir stays
+    per-user, so another local user cannot pre-create or hijack it.
+    """
+    import os
+
+    getuid = getattr(os, "getuid", None)
+    if getuid is not None:
+        return str(getuid())
+    import getpass
+
+    name = getpass.getuser() or "unknown"
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", name)
+
+
 # Task statuses the runner treats as "still needs work" when selecting the
 # sub-tasks of an initiative on a NORMAL resume. ``in_progress`` is
 # deliberately excluded (S3): a task left ``in_progress`` is almost always a
@@ -582,7 +600,7 @@ def _initiative_lock_dir(repo_path: str | Path) -> Path:
         candidates.append(Path(xdg) / "equipa")
     candidates.append(Path(repo_path) / ".git" / "equipa-locks")
     candidates.append(
-        Path(tempfile.gettempdir()) / f"equipa-locks-{os.getuid()}"
+        Path(tempfile.gettempdir()) / f"equipa-locks-{_user_token()}"
     )
 
     for candidate in candidates:
@@ -989,7 +1007,7 @@ def _active_pause_marker(
         path = InitiativePlan.plan_path(Path(repo_path), initiative_id)
         if not path.exists():
             return None
-        markers = parse_pause_markers(path.read_text())
+        markers = parse_pause_markers(path.read_text(encoding="utf-8"))
     except OSError:
         logger.exception(
             "Failed to read plan file for pause markers (initiative=%s)",
