@@ -33,7 +33,6 @@ Copyright 2026 Forgeborn
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import logging
 import re
 import sqlite3
@@ -46,6 +45,34 @@ from equipa.initiative import BEGIN_MARKER, InitiativePlan, _sanitize_agent_text
 from equipa.security import _make_untrusted_delimiter, wrap_untrusted
 
 logger = logging.getLogger(__name__)
+
+
+# --- Cross-platform advisory file locking -------------------------------------
+# The initiative concurrency guard takes an exclusive, non-blocking lock and is
+# deliberately fail-CLOSED: if the lock is already held it raises OSError, which
+# the caller converts to InitiativeLockError and refuses to dispatch. POSIX uses
+# fcntl.flock; Windows (no fcntl) uses msvcrt.locking. Both raise OSError on
+# contention, preserving the fail-closed semantics on every platform.
+try:
+    import fcntl as _fcntl
+
+    def _lock_exclusive_nonblocking(fh) -> None:
+        _fcntl.flock(fh.fileno(), _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+
+    def _unlock(fh) -> None:
+        _fcntl.flock(fh.fileno(), _fcntl.LOCK_UN)
+except ImportError:  # Windows
+    import msvcrt as _msvcrt
+
+    def _lock_exclusive_nonblocking(fh) -> None:
+        fh.seek(0)
+        # Lock 1 byte at offset 0 (region may extend past EOF on Windows).
+        # LK_NBLCK = exclusive, non-blocking; raises OSError if already held.
+        _msvcrt.locking(fh.fileno(), _msvcrt.LK_NBLCK, 1)
+
+    def _unlock(fh) -> None:
+        fh.seek(0)
+        _msvcrt.locking(fh.fileno(), _msvcrt.LK_UNLCK, 1)
 
 
 # Task statuses the runner treats as "still needs work" when selecting the
@@ -627,7 +654,7 @@ def _initiative_lock(
         ) from exc
     try:
         try:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _lock_exclusive_nonblocking(fh)
         except OSError as exc:
             raise InitiativeLockError(
                 f"Initiative #{initiative_id} already has a live run "
@@ -636,7 +663,7 @@ def _initiative_lock(
         try:
             yield
         finally:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            _unlock(fh)
     finally:
         fh.close()
 
