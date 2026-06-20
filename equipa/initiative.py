@@ -329,7 +329,7 @@ class InitiativePlan:
         path = cls.plan_path(repo_path, initiative_id)
         if not path.exists():
             raise FileNotFoundError(f"Initiative plan not found: {path}")
-        return cls(path=path, initiative_id=initiative_id, raw_text=path.read_text())
+        return cls(path=path, initiative_id=initiative_id, raw_text=path.read_text(encoding="utf-8"))
 
     @classmethod
     def ensure_exists(
@@ -448,7 +448,7 @@ class InitiativePlan:
         lock_path = self._lock_path(self.path)
         with _acquire_lock(lock_path):
             # Re-read inside the lock so we don't clobber a sibling append.
-            current = self.path.read_text() if self.path.exists() else self.raw_text
+            current = self.path.read_text(encoding="utf-8") if self.path.exists() else self.raw_text
             updated = _insert_before_end_marker(current, entry)
             _atomic_write(self.path, updated)
             self.raw_text = updated
@@ -606,7 +606,10 @@ def _atomic_write(path: Path, content: str) -> None:
         dir=str(path.parent),
     )
     try:
-        with os.fdopen(fd, "w") as fh:
+        # encoding="utf-8" (not the platform default, which is cp1252 on
+        # Windows): the plan carries untrusted, possibly non-Latin/bidi content,
+        # so it must round-trip as UTF-8 on every platform.
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(content)
             fh.flush()
             os.fsync(fh.fileno())
