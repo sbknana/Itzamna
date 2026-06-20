@@ -22,7 +22,6 @@ from equipa.constants import (
     DEFAULT_MAX_RETRIES,
     DEFAULT_MAX_TURNS,
     DEFAULT_MODEL,
-    EARLY_TERM_EXEMPT_ROLES,
     MAX_DEV_TEST_CYCLES,
     MAX_MANAGER_ROUNDS,
     MCP_CONFIG,
@@ -1649,7 +1648,8 @@ async def run_mode_task(args: argparse.Namespace) -> None:
 
     else:
         # Single-agent mode (Phase 1 — with model tiering)
-        use_streaming = args.role not in EARLY_TERM_EXEMPT_ROLES
+        from equipa.role_resolver import is_role_early_term_exempt
+        use_streaming = not is_role_early_term_exempt(args.role, project_dir)
         role_turns_max = get_role_turns(args.role, args, task=task)
         role_model = get_role_model(args.role, args, task=task)
         # Dynamic budget for single-agent mode

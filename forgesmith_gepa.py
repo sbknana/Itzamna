@@ -342,7 +342,16 @@ def episodes_to_dspy_examples(episodes):
 # STEP 2: Define DSPy Module for prompt evolution
 # ============================================================
 
-class RolePromptModule(dspy.Module):
+# dspy is optional. When it is not installed, `dspy` is None (see import guard
+# above) and this module is still imported transitively by forgesmith ->
+# build_system_prompt on every task dispatch. Fall back to `object` so the class
+# definition does not crash at import time; GEPA's entry points (run_gepa /
+# run_gepa_for_role) already bail out early when dspy is None, so this class is
+# never instantiated in that state.
+_DspyModuleBase = dspy.Module if dspy is not None else object
+
+
+class RolePromptModule(_DspyModuleBase):
     """DSPy Module that wraps a EQUIPA role prompt.
 
     GEPA evolves the instruction text of the inner Predict component.
