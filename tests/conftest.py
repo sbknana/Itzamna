@@ -16,6 +16,16 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
+# Also expose scripts/ so modules relocated there during repo cleanup (e.g.
+# forgesmith_simba, forgesmith_impact) import by bare name in tests, exactly as
+# forgesmith.py already arranges them at runtime. This makes `from
+# forgesmith_simba import ...` resolve to scripts/forgesmith_simba.py on every
+# platform, with no reliance on the repo-root symlink that Windows checkouts
+# (core.symlinks=false) materialize as a broken text file.
+_SCRIPTS_DIR = REPO_ROOT / "scripts"
+if _SCRIPTS_DIR.is_dir():
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+
 
 def _ensure_full_schema():
     """Apply schema.sql to the test database, creating any missing tables.
