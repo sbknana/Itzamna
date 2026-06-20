@@ -161,7 +161,15 @@ def _discover_roles() -> None:
         discovered[role_name] = md_file
 
     if discovered:
-        _equipa_constants.ROLE_PROMPTS = discovered
+        # Mutate the existing dict in place rather than rebinding the attribute.
+        # Modules like equipa.prompts do `from equipa.constants import ROLE_PROMPTS`,
+        # which snapshots the original dict object at import time. Rebinding
+        # `_equipa_constants.ROLE_PROMPTS` would leave those snapshots pointing at
+        # the stale dict, so file-based role discovery (e.g. design-engineer.md)
+        # would never reach build_system_prompt. Clearing + updating the same
+        # object keeps every importer in sync.
+        _equipa_constants.ROLE_PROMPTS.clear()
+        _equipa_constants.ROLE_PROMPTS.update(discovered)
 
 
 def _accumulate_cost(
