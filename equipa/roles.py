@@ -23,6 +23,23 @@ from equipa.constants import (
 )
 
 
+def _resolve_role_cfg(role: str, task: dict | None):
+    """Best-effort RoleConfig for (role, the task's project). Never raises.
+
+    Resolution is project-aware: a role defined in the task's project overlay
+    (``<project_dir>/.equipa/roles/<role>.md``) shadows the base role of the
+    same name. Returns None if nothing resolves or anything goes wrong, so
+    callers cleanly fall back to base defaults.
+    """
+    try:
+        from equipa.role_resolver import resolve_role
+        from equipa.tasks import resolve_project_dir
+        project_dir = resolve_project_dir(task) if task else None
+        return resolve_role(role, project_dir)
+    except Exception:
+        return None
+
+
 def get_role_turns(
     role: str,
     args: object,
@@ -51,8 +68,15 @@ def get_role_turns(
         if cli_turns != DEFAULT_MAX_TURNS:
             base_turns = cli_turns
         else:
-            # Fall back to per-role defaults
-            base_turns = DEFAULT_ROLE_TURNS.get(role, DEFAULT_MAX_TURNS)
+            # Fall back to per-role defaults. A project role's frontmatter
+            # `turns` (resolved against the task's project) wins over the base
+            # DEFAULT_ROLE_TURNS dict, so project roles tune their budget
+            # without editing base constants.py.
+            rc = _resolve_role_cfg(role, task)
+            if rc and rc.turns:
+                base_turns = rc.turns
+            else:
+                base_turns = DEFAULT_ROLE_TURNS.get(role, DEFAULT_MAX_TURNS)
 
     # Apply complexity multiplier
     if task:
@@ -140,6 +164,12 @@ def get_role_model(
             return routed_model
         raise CircuitOpenError(role=role, tier_attempted="haiku")
 
+    # Frontmatter `model` on a project role is a DEFAULT-level fallback (below
+    # dispatch-config / CLI / auto-routing), letting project roles pick a model
+    # without a base constants.py edit.
+    rc = _resolve_role_cfg(role, task)
+    if rc and rc.model:
+        return rc.model
     return DEFAULT_ROLE_MODELS.get(role, DEFAULT_MODEL)
 
 

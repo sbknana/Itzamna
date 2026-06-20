@@ -373,30 +373,40 @@ def build_system_prompt(
         def get_relevant_lessons(role=None, error_type=None, limit=5):
             return []
 
-    common_path = PROMPTS_DIR / "_common.md"
-    role_path = ROLE_PROMPTS.get(role)
+    from equipa.role_resolver import resolve_role
 
-    if not role_path:
-        print(f"ERROR: Unknown role '{role}'. Available: {', '.join(ROLE_PROMPTS.keys())}")
+    common_path = PROMPTS_DIR / "_common.md"
+
+    # Project-scoped role resolution: a role defined in the dispatching
+    # project's overlay (<project_dir>/.equipa/roles/<role>.md) shadows the base
+    # role of the same name; otherwise the shared base prompt is used. Two
+    # projects' same-named roles never collide — resolution is keyed on
+    # project_dir and holds no process-global state.
+    role_cfg = resolve_role(role, project_dir)
+    if role_cfg is None:
+        avail = ", ".join(sorted(ROLE_PROMPTS.keys()))
+        print(f"ERROR: Unknown role '{role}'. Available base roles: {avail}. "
+              f"Project-specific roles live in <project_dir>/.equipa/roles/.")
         sys.exit(1)
+    role_path = role_cfg.path
+    role_text = role_cfg.body  # frontmatter (if any) already stripped
 
     if not common_path.exists():
         print(f"ERROR: Common prompt not found at {common_path}")
         sys.exit(1)
 
-    if not role_path.exists():
-        print(f"ERROR: Role prompt not found at {role_path}")
-        sys.exit(1)
-
     # A/B prompt version selection: try GEPA-evolved prompt if available
     # Gated by gepa_ab_testing feature flag
+    # GEPA A/B evolution applies only to base roles, not project overlays.
     prompt_version = "baseline"
-    if is_feature_enabled(dispatch_config, "gepa_ab_testing"):
+    if not role_cfg.is_project_role and is_feature_enabled(dispatch_config, "gepa_ab_testing"):
         try:
             from forgesmith_gepa import get_ab_prompt_for_role
+            from equipa.role_resolver import parse_frontmatter
             selected_path, prompt_version = get_ab_prompt_for_role(role)
             if selected_path.exists() and prompt_version != "baseline":
                 role_path = selected_path
+                role_text = parse_frontmatter(selected_path.read_text(encoding="utf-8"))[1]
         except ImportError:
             pass  # forgesmith_gepa not available, use baseline
 
@@ -421,7 +431,7 @@ def build_system_prompt(
     # that would make every dispatch unique and defeat prompt caching.
     # =========================================================================
     common_text = common_path.read_text(encoding="utf-8")
-    role_text = role_path.read_text(encoding="utf-8")
+    # role_text was resolved above (project overlay or base, frontmatter stripped).
     standing_orders = load_standing_orders(role)
     static_prefix = common_text + "\n\n---\n\n" + role_text + standing_orders
 

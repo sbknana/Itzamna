@@ -38,7 +38,6 @@ from equipa.constants import (
     COMPACTION_CONSOLIDATION_MAX_WORDS,
     COST_ESTIMATE_PER_TURN,
     COST_LIMITS,
-    EARLY_TERM_EXEMPT_ROLES,
     FINDING_DESCRIPTION_MAX_CHARS,
     MAX_CONTINUATIONS,
     MAX_DEV_TEST_CYCLES,
@@ -1860,7 +1859,8 @@ async def run_dev_test_loop(
                 error_type=state.last_error_type,
                 max_turns=dev_turns_allocated,
             )
-            use_streaming = task_role not in EARLY_TERM_EXEMPT_ROLES
+            from equipa.role_resolver import is_role_early_term_exempt
+            use_streaming = not is_role_early_term_exempt(task_role, project_dir)
             # --- Lifecycle hooks: pre_agent_start ---
             await fire_hook(
                 "pre_agent_start",

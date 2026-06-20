@@ -142,7 +142,6 @@ from equipa.abort_controller import AbortController, create_child_abort_controll
 from equipa.bash_security import check_bash_command
 from equipa.config import is_feature_enabled, load_dispatch_config
 from equipa.constants import (
-    EARLY_TERM_EXEMPT_ROLES,
     EARLY_TERM_FINAL_WARN_TURNS,
     EARLY_TERM_KILL_TURNS,
     EARLY_TERM_WARN_TURNS,
@@ -694,7 +693,8 @@ async def _run_agent_streaming_impl(
     """
     effective_timeout = timeout or PROCESS_TIMEOUT
     start_time = time.time()
-    is_exempt = role in EARLY_TERM_EXEMPT_ROLES
+    from equipa.role_resolver import is_role_early_term_exempt
+    is_exempt = is_role_early_term_exempt(role, project_dir)
 
     # Task #2314 Phase A3: capture HEAD before any agent work so that the
     # post-run git-diff cross-check measures ONLY commits this cycle made.
@@ -1755,7 +1755,8 @@ async def dispatch_agent(
                 }
 
     # Default: Claude via run_agent_streaming (with retry wrapper)
-    use_streaming = role not in EARLY_TERM_EXEMPT_ROLES
+    from equipa.role_resolver import is_role_early_term_exempt
+    use_streaming = not is_role_early_term_exempt(role, project_dir)
     if use_streaming:
         # Wrap streaming with retry logic
         return await run_agent_streaming_with_retry(
