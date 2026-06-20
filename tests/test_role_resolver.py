@@ -144,3 +144,30 @@ def test_early_term_exempt_falls_back_to_base_set(tmp_path, monkeypatch, base_di
     monkeypatch.setattr(rr, "EARLY_TERM_EXEMPT_ROLES", {"planner"})
     assert rr.is_role_early_term_exempt("planner", None) is True
     assert rr.is_role_early_term_exempt("developer", None) is False
+
+
+# --------------------------------------------------------------------------- #
+# shipped opt-in example pack
+# --------------------------------------------------------------------------- #
+
+def test_example_role_pack_parses(tmp_path):
+    """Every examples/roles/*.md parses cleanly with the expected frontmatter."""
+    from pathlib import Path
+
+    pack = Path(__file__).resolve().parent.parent / "examples" / "roles"
+    files = [p for p in pack.glob("*.md") if p.name != "README.md"]
+    assert files, "expected example role files under examples/roles/"
+    for f in files:
+        # Copy into a throwaway project overlay and resolve it through the real path.
+        proj = tmp_path / f.stem
+        _write_role(proj, f.stem, "")  # ensure dir exists
+        (proj / ".equipa" / "roles" / f.name).write_text(
+            f.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+        rc = rr.resolve_role(f.stem, str(proj))
+        assert rc is not None, f.name
+        assert rc.model == "opus"
+        assert rc.turns == 35
+        assert rc.early_term_exempt is True
+        # frontmatter must be stripped from the body
+        assert not rc.body.lstrip().startswith("---")
