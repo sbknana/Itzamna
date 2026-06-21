@@ -597,8 +597,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         f.stem for f in prompts_dir.glob("*.md")
         if not f.name.startswith("_")
     ]) if prompts_dir.exists() else ["developer", "tester", "security-reviewer"]
-    parser.add_argument("--role", default="developer", choices=_available_roles,
-                        help=f"Agent role (available: {', '.join(_available_roles)}) (default: developer)")
+    # NOTE: no argparse `choices=` here. Project-overlay roles
+    # (<project_dir>/.equipa/roles/) are unknown at parse time because the
+    # project dir is only known after a task is resolved, so a hard choices list
+    # would reject valid project roles. The role is validated post-parse against
+    # the project-aware resolver (see run_mode_task) and by build_system_prompt.
+    parser.add_argument("--role", default="developer",
+                        help=f"Agent role. Base roles: {', '.join(_available_roles)}. "
+                             f"Project roles in <project_dir>/.equipa/roles/ are also accepted. "
+                             f"(default: developer)")
     parser.add_argument("--retries", type=int, default=DEFAULT_MAX_RETRIES, help=f"Max retry attempts (default: {DEFAULT_MAX_RETRIES})")
     parser.add_argument("--dev-test", action="store_true", help="Enable Dev+Tester iteration loop mode")
     parser.add_argument("--security-review", action="store_true", default=None,
@@ -1319,6 +1326,17 @@ async def run_mode_task(args: argparse.Namespace) -> None:
         print(f"ERROR: Could not find project directory for '{task.get('project_name', 'Unknown')}'")
         print("Known projects:", ", ".join(sorted(_equipa_constants.PROJECT_DIRS.keys())))
         sys.exit(1)
+
+    # Validate --role now that project_dir is known. argparse can't enforce this
+    # (project-overlay roles in <project_dir>/.equipa/roles/ are unknown at parse
+    # time), so --role accepts any string and we check it project-aware here.
+    role_arg = getattr(args, "role", None)
+    if role_arg:
+        from equipa.role_resolver import role_exists, available_roles
+        if not role_exists(role_arg, project_dir):
+            print(f"ERROR: Unknown role '{role_arg}'. "
+                  f"Available for this project: {', '.join(available_roles(project_dir))}")
+            sys.exit(1)
 
     # Auto-clone ForgeScaffold for empty/missing scaffold-based projects.
     try:

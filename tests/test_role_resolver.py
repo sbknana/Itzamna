@@ -171,3 +171,37 @@ def test_example_role_pack_parses(tmp_path):
         assert rc.early_term_exempt is True
         # frontmatter must be stripped from the body
         assert not rc.body.lstrip().startswith("---")
+
+
+# --------------------------------------------------------------------------- #
+# available_roles — drives CLI dispatch validation for project-overlay roles
+# (regression for: project roles rejected by argparse `choices=` before the
+# project dir was known — they must survive the CLI layer and be dispatchable)
+# --------------------------------------------------------------------------- #
+
+def test_available_roles_includes_project_overlay(tmp_path, base_dir):
+    (base_dir / "developer.md").write_text("base dev", encoding="utf-8")
+    proj = tmp_path / "projA"
+    _write_role(proj, "scilab-engineer", "body", {"model": "opus", "turns": 40})
+
+    base_only = rr.available_roles(None)
+    with_proj = rr.available_roles(str(proj))
+
+    # Base role visible in both; the project overlay role only with project_dir.
+    assert "developer" in base_only
+    assert "scilab-engineer" not in base_only
+    assert "scilab-engineer" in with_proj
+    assert "developer" in with_proj
+
+
+def test_project_overlay_role_passes_cli_validation(tmp_path):
+    """A project-overlay role must satisfy role_exists (the CLI dispatch gate)
+    for its project, while an unknown role is rejected — the helpful error then
+    lists it via available_roles."""
+    proj = tmp_path / "projA"
+    _write_role(proj, "my-custom-role", "body")
+
+    assert rr.role_exists("my-custom-role", str(proj)) is True   # survives CLI layer
+    assert rr.role_exists("my-custom-role", None) is False       # not a base role
+    assert rr.role_exists("nope", str(proj)) is False
+    assert "my-custom-role" in rr.available_roles(str(proj))     # shown in error list
