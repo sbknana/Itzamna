@@ -36,6 +36,7 @@ CREATE TABLE tasks (
     completed_at DATETIME,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     task_type TEXT DEFAULT 'feature',
+    role TEXT,
     FOREIGN KEY (project_id) REFERENCES projects(id)
 );
 
