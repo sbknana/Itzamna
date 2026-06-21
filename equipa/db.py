@@ -179,6 +179,8 @@ def ensure_schema() -> None:
     try:
         conn.executescript(schema_sql)
         conn.commit()
+        _ensure_additive_columns(conn)
+        conn.commit()
     except sqlite3.Error as e:
         logger.exception("[Schema] Failed to apply schema.sql: %s", e)
         raise SchemaNotInitialised(
@@ -188,6 +190,29 @@ def ensure_schema() -> None:
         conn.close()
 
     _SCHEMA_ENSURED = True
+
+
+def _ensure_additive_columns(conn) -> None:
+    """Add nullable columns that post-date a table's CREATE in existing DBs.
+
+    ``ensure_schema`` applies ``schema.sql`` with CREATE TABLE IF NOT EXISTS,
+    which is a no-op for tables that already exist — so a column added to a
+    table definition *after* that table was first created never reaches an
+    existing database. SQLite has no ``ALTER TABLE ... ADD COLUMN IF NOT
+    EXISTS``, so we check ``PRAGMA table_info`` and add only what is missing.
+    Idempotent, additive (nullable, no data change), and independent of the
+    ``db_migrate`` version counter — safe to run on every startup.
+    """
+    additive = {
+        # tasks.role lets a task carry its dispatch role so autonomous/scan
+        # modes (and --task without --role) fan out to specialist/project roles.
+        "tasks": [("role", "TEXT")],
+    }
+    for table, cols in additive.items():
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for name, decl in cols:
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
 
 # --- Record Functions ---
