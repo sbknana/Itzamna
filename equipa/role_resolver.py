@@ -156,3 +156,26 @@ def is_role_early_term_exempt(role: str, project_dir: str | None = None) -> bool
     if rc is not None and rc.early_term_exempt is not None:
         return rc.early_term_exempt
     return role in EARLY_TERM_EXEMPT_ROLES
+
+
+def available_roles(project_dir: str | None = None) -> list[str]:
+    """All dispatchable role names for ``project_dir``: base + project overlay.
+
+    Base roles come from ``prompts/`` (and the discovered ``ROLE_PROMPTS`` dict);
+    project roles come from ``<project_dir>/.equipa/roles/``. Used for helpful
+    "unknown role" error messages, since argparse cannot enumerate project-overlay
+    roles at parse time (the project dir is not known until a task is resolved).
+    """
+    names: set[str] = set()
+    if PROMPTS_DIR.is_dir():
+        for f in PROMPTS_DIR.glob("*.md"):
+            if not f.name.startswith("_"):
+                names.add(f.stem)
+    names.update(_equipa_constants.ROLE_PROMPTS.keys())
+    if project_dir:
+        overlay = Path(project_dir).joinpath(*PROJECT_ROLES_SUBDIR)
+        if overlay.is_dir():
+            for f in overlay.glob("*.md"):
+                if not f.name.startswith("_"):
+                    names.add(f.stem)
+    return sorted(names)

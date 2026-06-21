@@ -373,7 +373,7 @@ def build_system_prompt(
         def get_relevant_lessons(role=None, error_type=None, limit=5):
             return []
 
-    from equipa.role_resolver import resolve_role
+    from equipa.role_resolver import resolve_role, available_roles
 
     common_path = PROMPTS_DIR / "_common.md"
 
@@ -384,9 +384,9 @@ def build_system_prompt(
     # project_dir and holds no process-global state.
     role_cfg = resolve_role(role, project_dir)
     if role_cfg is None:
-        avail = ", ".join(sorted(ROLE_PROMPTS.keys()))
-        print(f"ERROR: Unknown role '{role}'. Available base roles: {avail}. "
-              f"Project-specific roles live in <project_dir>/.equipa/roles/.")
+        avail = ", ".join(available_roles(project_dir))
+        print(f"ERROR: Unknown role '{role}'. Available for this project "
+              f"(base + <project_dir>/.equipa/roles/): {avail}.")
         sys.exit(1)
     role_path = role_cfg.path
     role_text = role_cfg.body  # frontmatter (if any) already stripped
