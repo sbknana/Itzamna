@@ -11,6 +11,7 @@ Copyright 2026 Forgeborn.
 """
 
 import re
+import logging
 
 # --- Prompt-injection patterns to strip ---
 # These regex patterns match common prompt-injection techniques that an agent
@@ -63,25 +64,34 @@ _INJECTION_PATTERNS = [
     re.compile(r'\x1b\[[0-9;]*[a-zA-Z]'),
 ]
 
-# Maximum allowed length for a single lesson text
-MAX_LESSON_LENGTH = 500
+# --- Per-content-type length caps ---
+# Length policy is decoupled from sanitization: sanitize() does security only,
+# enforce_limit() applies a cap. A cap of None (or 0) disables truncation.
+#   - lessons are injected back into agent prompts, so they stay terse;
+#   - session notes / decision rationales are narrative records and must NOT be
+#     silently gutted. The old single 500-char cap truncated multi-thousand-char
+#     session summaries with no warning (Equipa task #100027).
+MAX_LESSON_LENGTH = 500            # lessons: terse, prompt-injected
+MAX_ERROR_SIGNATURE_LENGTH = 200   # short identifiers
+MAX_SESSION_NOTE_LENGTH = 50_000   # narrative session summaries (generous backstop)
+MAX_DECISION_LENGTH = 8_000        # decision rationales
 
-# Maximum allowed length for an error signature used in lessons
-MAX_ERROR_SIGNATURE_LENGTH = 200
+_log = logging.getLogger(__name__)
 
 
-def sanitize_lesson_content(text):
-    """Strip prompt-injection patterns from lesson text.
+def sanitize(text):
+    """Strip prompt-injection patterns from text. Security only — no length cap.
 
-    This is the primary sanitization function. It should be called on ALL
-    text that will be stored as a lesson or injected into an agent prompt.
+    This is the pure sanitization step: ANSI/injection-pattern stripping and
+    whitespace normalization, with NO truncation. Use enforce_limit() (or a
+    sanitize_* wrapper) to apply a length policy.
 
     Args:
-        text: Raw lesson text (from agent output, error summaries, etc.)
+        text: Raw text (agent output, error summaries, session notes, etc.)
 
     Returns:
-        Sanitized text with injection patterns removed and length capped.
-        Returns empty string if the input is None or empty.
+        Sanitized text with injection patterns removed. Empty string for
+        None/empty input.
     """
     if not text:
         return ""
@@ -98,20 +108,76 @@ def sanitize_lesson_content(text):
 
     # Collapse multiple whitespace left by removals
     text = re.sub(r'\s{3,}', '  ', text)
-    text = text.strip()
+    return text.strip()
 
-    # Cap length
-    if len(text) > MAX_LESSON_LENGTH:
-        text = text[:MAX_LESSON_LENGTH - 3] + "..."
 
+def enforce_limit(text, max_len, *, label="content"):
+    """Apply a length cap — loudly. Never truncates silently.
+
+    A falsy ``max_len`` (None or 0) disables the cap. When truncation does
+    occur it is logged at WARNING level so the caller/operator sees that
+    content was cut, rather than discovering it later as silent data loss
+    (the failure mode behind Equipa task #100027).
+
+    Args:
+        text: Already-sanitized text.
+        max_len: Maximum length, or None/0 to disable the cap.
+        label: Human-readable content kind, used in the warning message.
+
+    Returns:
+        The text, truncated with a trailing "..." only if it exceeded max_len.
+    """
+    if not text or not max_len:
+        return text or ""
+    if len(text) > max_len:
+        _log.warning(
+            "lesson_sanitizer: %s truncated from %d to %d chars (content not stored in full)",
+            label, len(text), max_len,
+        )
+        return text[:max_len - 3] + "..."
     return text
+
+
+def sanitize_lesson_content(text, max_len=MAX_LESSON_LENGTH, *, label="lesson"):
+    """Sanitize text and apply a length cap.
+
+    Backward-compatible: with the default ``max_len`` this behaves like before
+    (sanitize + cap at MAX_LESSON_LENGTH = 500), so the lessons pipeline is
+    unchanged. Differences from the old version:
+
+    * truncation is no longer silent (see enforce_limit);
+    * callers may pass a larger ``max_len`` — e.g. MAX_SESSION_NOTE_LENGTH — or
+      ``max_len=None`` to disable the cap for narrative content.
+
+    For session notes, prefer sanitize_session_note().
+
+    Args:
+        text: Raw text to sanitize.
+        max_len: Length cap (default = lesson cap); None/0 disables it.
+        label: Content kind, used in the truncation warning.
+
+    Returns:
+        Sanitized, length-capped text. Empty string for None/empty input.
+    """
+    return enforce_limit(sanitize(text), max_len, label=label)
+
+
+def sanitize_session_note(text):
+    """Sanitize a session-note field (summary / next_steps) without silent loss.
+
+    Uses MAX_SESSION_NOTE_LENGTH so multi-thousand-char summaries are preserved;
+    the 500-char lesson cap would gut them (Equipa task #100027).
+    """
+    return sanitize_lesson_content(text, max_len=MAX_SESSION_NOTE_LENGTH,
+                                   label="session note")
 
 
 def sanitize_error_signature(sig):
     """Sanitize an error signature before using it in lesson generation.
 
-    Error signatures come from agent error_summary fields which are
-    agent-controlled output. We sanitize before using as lesson content.
+    Error signatures come from agent error_summary fields (agent-controlled
+    output), so we sanitize before use. They should be short identifiers, so
+    they get the MAX_ERROR_SIGNATURE_LENGTH cap.
 
     Args:
         sig: Raw error signature string.
@@ -121,17 +187,8 @@ def sanitize_error_signature(sig):
     """
     if not sig:
         return ""
-
-    sig = str(sig)
-
-    # Apply the same injection stripping
-    sig = sanitize_lesson_content(sig)
-
-    # Additional constraint: error sigs should be short identifiers
-    if len(sig) > MAX_ERROR_SIGNATURE_LENGTH:
-        sig = sig[:MAX_ERROR_SIGNATURE_LENGTH - 3] + "..."
-
-    return sig
+    return enforce_limit(sanitize(sig), MAX_ERROR_SIGNATURE_LENGTH,
+                         label="error signature")
 
 
 # --- Structural validation allowlist ---
