@@ -200,7 +200,7 @@ class TestBuildSystemPromptCacheSplit:
     def test_returns_prompt_result(self, minimal_task, empty_context, mock_prompts_dir):
         """build_system_prompt returns a PromptResult, not a bare string."""
         with patch("equipa.prompts.PROMPTS_DIR", mock_prompts_dir), \
-             patch("equipa.prompts.ROLE_PROMPTS", {"developer": mock_prompts_dir / "developer.md"}):
+             patch("equipa.constants.ROLE_PROMPTS", {"developer": mock_prompts_dir / "developer.md"}):
             result = _call_build_system_prompt(minimal_task, empty_context, "/tmp/proj")
 
         assert isinstance(result, PromptResult)
@@ -210,7 +210,7 @@ class TestBuildSystemPromptCacheSplit:
     ):
         """Static prefix contains _common.md and role prompt content."""
         with patch("equipa.prompts.PROMPTS_DIR", mock_prompts_dir), \
-             patch("equipa.prompts.ROLE_PROMPTS", {"developer": mock_prompts_dir / "developer.md"}):
+             patch("equipa.constants.ROLE_PROMPTS", {"developer": mock_prompts_dir / "developer.md"}):
             result = _call_build_system_prompt(minimal_task, empty_context, "/tmp/proj")
 
         assert "EQUIPA Common Rules" in result.static_prefix
@@ -221,7 +221,7 @@ class TestBuildSystemPromptCacheSplit:
     ):
         """Dynamic suffix contains the task description."""
         with patch("equipa.prompts.PROMPTS_DIR", mock_prompts_dir), \
-             patch("equipa.prompts.ROLE_PROMPTS", {"developer": mock_prompts_dir / "developer.md"}):
+             patch("equipa.constants.ROLE_PROMPTS", {"developer": mock_prompts_dir / "developer.md"}):
             result = _call_build_system_prompt(minimal_task, empty_context, "/tmp/proj")
 
         assert "A test task description" in result.dynamic_suffix
@@ -237,7 +237,7 @@ class TestBuildSystemPromptCacheSplit:
         these from the '## Assigned Task' block in the dynamic suffix.
         """
         with patch("equipa.prompts.PROMPTS_DIR", mock_prompts_dir), \
-             patch("equipa.prompts.ROLE_PROMPTS", {"developer": mock_prompts_dir / "developer.md"}):
+             patch("equipa.constants.ROLE_PROMPTS", {"developer": mock_prompts_dir / "developer.md"}):
             result = _call_build_system_prompt(minimal_task, empty_context, "/tmp/proj")
 
         # Static still has the literal placeholder (template, not interpolated)
@@ -250,7 +250,7 @@ class TestBuildSystemPromptCacheSplit:
     ):
         """The full prompt can be split back on the boundary marker."""
         with patch("equipa.prompts.PROMPTS_DIR", mock_prompts_dir), \
-             patch("equipa.prompts.ROLE_PROMPTS", {"developer": mock_prompts_dir / "developer.md"}):
+             patch("equipa.constants.ROLE_PROMPTS", {"developer": mock_prompts_dir / "developer.md"}):
             result = _call_build_system_prompt(minimal_task, empty_context, "/tmp/proj")
 
         parts = result.full.split(SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
@@ -261,7 +261,7 @@ class TestBuildSystemPromptCacheSplit:
     ):
         """str(result) works as a backward-compatible string."""
         with patch("equipa.prompts.PROMPTS_DIR", mock_prompts_dir), \
-             patch("equipa.prompts.ROLE_PROMPTS", {"developer": mock_prompts_dir / "developer.md"}):
+             patch("equipa.constants.ROLE_PROMPTS", {"developer": mock_prompts_dir / "developer.md"}):
             result = _call_build_system_prompt(minimal_task, empty_context, "/tmp/proj")
 
         prompt_str = str(result)
@@ -274,7 +274,7 @@ class TestBuildSystemPromptCacheSplit:
     ):
         """max_turns budget info appears in dynamic suffix, not static."""
         with patch("equipa.prompts.PROMPTS_DIR", mock_prompts_dir), \
-             patch("equipa.prompts.ROLE_PROMPTS", {"developer": mock_prompts_dir / "developer.md"}):
+             patch("equipa.constants.ROLE_PROMPTS", {"developer": mock_prompts_dir / "developer.md"}):
             result = _call_build_system_prompt(
                 minimal_task, empty_context, "/tmp/proj", max_turns=45
             )
@@ -297,7 +297,7 @@ class TestBuildSystemPromptCacheSplit:
             "project_id": 42, "project_name": "OtherProj", "task_type": "bug",
         }
         with patch("equipa.prompts.PROMPTS_DIR", mock_prompts_dir), \
-             patch("equipa.prompts.ROLE_PROMPTS", {"developer": mock_prompts_dir / "developer.md"}):
+             patch("equipa.constants.ROLE_PROMPTS", {"developer": mock_prompts_dir / "developer.md"}):
             result_a = _call_build_system_prompt(task_a, empty_context, "/tmp/proj")
             result_b = _call_build_system_prompt(task_b, empty_context, "/tmp/proj")
 
@@ -317,7 +317,7 @@ class TestBuildSystemPromptCacheSplit:
             "project_id": 23, "project_name": "Proj", "task_type": "bug",
         }
         with patch("equipa.prompts.PROMPTS_DIR", mock_prompts_dir), \
-             patch("equipa.prompts.ROLE_PROMPTS", {"developer": mock_prompts_dir / "developer.md"}):
+             patch("equipa.constants.ROLE_PROMPTS", {"developer": mock_prompts_dir / "developer.md"}):
             result_a = _call_build_system_prompt(task_a, empty_context, "/tmp/proj")
             result_b = _call_build_system_prompt(task_b, empty_context, "/tmp/proj")
 
@@ -344,7 +344,7 @@ class TestPlannerEvaluatorCacheSplit:
     def test_planner_returns_prompt_result(self, mock_prompts_dir):
         from equipa.prompts import build_planner_prompt
         with patch("equipa.prompts.PROMPTS_DIR", mock_prompts_dir), \
-             patch("equipa.prompts.ROLE_PROMPTS", {
+             patch("equipa.constants.ROLE_PROMPTS", {
                  "planner": mock_prompts_dir / "planner.md",
              }):
             result = build_planner_prompt(
@@ -361,7 +361,7 @@ class TestPlannerEvaluatorCacheSplit:
         """Planner static prefix keeps {project_id} as literal placeholder."""
         from equipa.prompts import build_planner_prompt
         with patch("equipa.prompts.PROMPTS_DIR", mock_prompts_dir), \
-             patch("equipa.prompts.ROLE_PROMPTS", {
+             patch("equipa.constants.ROLE_PROMPTS", {
                  "planner": mock_prompts_dir / "planner.md",
              }):
             result = build_planner_prompt(
@@ -377,7 +377,7 @@ class TestPlannerEvaluatorCacheSplit:
         """Two planner dispatches with different project_ids have identical static."""
         from equipa.prompts import build_planner_prompt
         with patch("equipa.prompts.PROMPTS_DIR", mock_prompts_dir), \
-             patch("equipa.prompts.ROLE_PROMPTS", {
+             patch("equipa.constants.ROLE_PROMPTS", {
                  "planner": mock_prompts_dir / "planner.md",
              }):
             result_a = build_planner_prompt(
@@ -393,7 +393,7 @@ class TestPlannerEvaluatorCacheSplit:
     def test_evaluator_returns_prompt_result(self, mock_prompts_dir):
         from equipa.prompts import build_evaluator_prompt
         with patch("equipa.prompts.PROMPTS_DIR", mock_prompts_dir), \
-             patch("equipa.prompts.ROLE_PROMPTS", {
+             patch("equipa.constants.ROLE_PROMPTS", {
                  "evaluator": mock_prompts_dir / "evaluator.md",
              }):
             result = build_evaluator_prompt(

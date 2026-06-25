@@ -266,7 +266,7 @@ class TestNoHardcodedMasterInProduction:
         "equipa/git_ops.py": 4,
         "equipa/single_agent_guard.py": 1,
         "equipa/monitoring.py": 1,
-        "equipa/dispatch.py": 2,
+        "equipa/dispatch.py": 1,  # one legit "master" fallback remains (default-branch detection)
     }
 
     @staticmethod

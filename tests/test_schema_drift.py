@@ -60,14 +60,14 @@ REQUIRED_COLUMNS: dict[str, list[str]] = {
         "completed_at",
     ],
     # initiative_runner.fetch_initiative_tasks selects these explicitly.
-    # NOTE: ``role`` is intentionally NOT listed — it is absent from the
-    # canonical schema and every call site treats it as optional. The hard
-    # ``SELECT ... role`` previously here crashed on clean DBs (#2491); the
-    # query now selects it conditionally. See
-    # test_tasks_role_is_optional_not_canonical below.
+    # ``role`` is now part of the canonical schema (added to schema.sql with the
+    # tasks.role dispatch feature) AND back-filled onto legacy DBs by
+    # db._ensure_additive_columns. fetch_initiative_tasks still selects it
+    # CONDITIONALLY (NULL AS role when absent) so it stays safe on a pre-migration
+    # DB — that resilience is pinned by test_tasks_role_legacy_db_resilient below.
     "tasks": [
         "id", "project_id", "title", "status", "blocked_by",
-        "initiative_id",
+        "initiative_id", "role",
     ],
 }
 
@@ -148,31 +148,52 @@ def test_initiatives_phase2_columns_present(
         assert col in present, f"initiatives.{col} missing after migration"
 
 
-def test_tasks_role_is_optional_not_canonical(
+def test_tasks_role_is_canonical(
     canonical_conn: sqlite3.Connection,
 ) -> None:
-    """``tasks.role`` is absent from the canonical schema by design.
+    """``tasks.role`` is part of the canonical schema (tasks.role dispatch feature).
 
-    Regression for the #2491 drift bug: fetch_initiative_tasks hard-selected
-    ``role`` and crashed with 'no such column: role' on any DB built from the
-    canonical schema. Confirm the column really is absent here (so the
-    conditional-select fix is exercised), and that the resilient query runs.
+    It used to be intentionally absent (#2491); it was promoted to canonical when
+    dispatch-by-stored-role landed (schema.sql + db._ensure_additive_columns
+    back-fill for legacy DBs). fetch_initiative_tasks must still run cleanly on
+    the canonical schema.
     """
     from equipa.initiative_runner import fetch_initiative_tasks
 
-    present = _columns(canonical_conn, "tasks")
-    assert "role" not in present, (
-        "tasks.role now exists in the canonical schema — update "
-        "fetch_initiative_tasks to select it directly and add it to "
-        "REQUIRED_COLUMNS"
+    assert "role" in _columns(canonical_conn, "tasks"), (
+        "tasks.role missing from the canonical schema — the dispatch-by-role "
+        "feature requires it (schema.sql)."
     )
-    # Must not raise even though role is absent.
     canonical_conn.row_factory = sqlite3.Row
     try:
         result = fetch_initiative_tasks(canonical_conn, initiative_id=-1)
     finally:
         canonical_conn.row_factory = None
     assert result == []
+
+
+def test_tasks_role_legacy_db_resilient() -> None:
+    """fetch_initiative_tasks must not crash on a pre-migration DB lacking role.
+
+    Preserves the #2491 regression guard now that role is canonical: a legacy
+    ``tasks`` table without a ``role`` column must still be queryable — the
+    conditional ``NULL AS role`` branch in fetch_initiative_tasks handles it.
+    """
+    from equipa.initiative_runner import fetch_initiative_tasks
+
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute(
+            "CREATE TABLE tasks ("
+            "id INTEGER PRIMARY KEY, project_id INTEGER, title TEXT, "
+            "status TEXT, blocked_by TEXT, initiative_id INTEGER)"
+        )
+        conn.commit()
+        assert "role" not in _columns(conn, "tasks")
+        conn.row_factory = sqlite3.Row
+        assert fetch_initiative_tasks(conn, initiative_id=-1) == []
+    finally:
+        conn.close()
 
 
 def test_theforge_db_respects_env_var() -> None:
