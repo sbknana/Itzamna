@@ -43,7 +43,11 @@ def generate_skill_manifest() -> dict[str, str]:
         if not search_dir.is_dir():
             continue
         for md_file in sorted(search_dir.rglob("*.md")):
-            rel_path = str(md_file.relative_to(base_dir))
+            # Use POSIX separators so the manifest is portable across OSes —
+            # str() would emit backslashes on Windows, breaking both the
+            # startswith("prompts/") checks and verify_skill_integrity's
+            # cross-platform key matching.
+            rel_path = md_file.relative_to(base_dir).as_posix()
             file_hash = hashlib.sha256(md_file.read_bytes()).hexdigest()
             manifest[rel_path] = file_hash
 
