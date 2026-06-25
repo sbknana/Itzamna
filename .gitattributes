@@ -1,0 +1,29 @@
+# Normalize all text files to LF in the repo AND the working tree, regardless of
+# each contributor's local core.autocrlf (e.g. Git-for-Windows defaults it to
+# true). This keeps byte-level tooling stable cross-platform — notably the
+# skill-manifest hashing in equipa/security.py, which on a Windows autocrlf
+# checkout would otherwise read CRLF working-tree bytes and mismatch the
+# LF-content manifest on every file.
+* text=auto eol=lf
+
+# Shell / bats scripts must stay LF to run.
+*.sh   text eol=lf
+*.bats text eol=lf
+
+# Known binaries: never normalize. Most aren't tracked today, but this protects
+# them if added later (DB snapshots, audio, fonts, images).
+*.png    binary
+*.jpg    binary
+*.jpeg   binary
+*.gif    binary
+*.ico    binary
+*.wav    binary
+*.mp3    binary
+*.db     binary
+*.sqlite binary
+*.ttf    binary
+*.otf    binary
+*.woff   binary
+*.woff2  binary
+*.zip    binary
+*.pdf    binary
