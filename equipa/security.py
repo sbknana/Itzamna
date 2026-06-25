@@ -30,6 +30,22 @@ def wrap_untrusted(content: str, delimiter: str) -> str:
     return f"<<<{delimiter}>>>\n{content}\n<<<END_{delimiter}>>>"
 
 
+def _hash_md_bytes(data: bytes) -> str:
+    """SHA-256 of *data* with line endings normalized to LF.
+
+    The manifest pins LF-content hashes (the .md files are stored LF in git).
+    Hashing raw bytes makes verification line-ending-sensitive: on a checkout
+    with ``git autocrlf=true`` the working-tree files are CRLF, so raw-byte
+    hashes mismatch the LF manifest on *every* file — verify_skill_integrity
+    fails on Windows while passing on Linux/CI. Normalizing CRLF (and lone CR)
+    to LF before hashing makes verification identical on every platform and git
+    config, and leaves the existing LF manifest valid (LF content is unchanged
+    by normalization, so its hashes don't move).
+    """
+    normalized = data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    return hashlib.sha256(normalized).hexdigest()
+
+
 def generate_skill_manifest() -> dict[str, str]:
     """Scan all prompt and skill .md files and return a dict of {relative_path: sha256_hex}.
 
@@ -48,7 +64,7 @@ def generate_skill_manifest() -> dict[str, str]:
             # startswith("prompts/") checks and verify_skill_integrity's
             # cross-platform key matching.
             rel_path = md_file.relative_to(base_dir).as_posix()
-            file_hash = hashlib.sha256(md_file.read_bytes()).hexdigest()
+            file_hash = _hash_md_bytes(md_file.read_bytes())
             manifest[rel_path] = file_hash
 
     return manifest
@@ -101,7 +117,7 @@ def verify_skill_integrity() -> bool:
         if not file_path.exists():
             missing.append(rel_path)
             continue
-        actual_hash = hashlib.sha256(file_path.read_bytes()).hexdigest()
+        actual_hash = _hash_md_bytes(file_path.read_bytes())
         if actual_hash != expected_hash:
             mismatches.append(rel_path)
 
