@@ -75,14 +75,18 @@ VALUES (?, '{question}', '{context}', CURRENT_TIMESTAMP);
 
 Ask: "Brief summary of what was accomplished?"
 
-**CRITICAL: Sanitize summary and next_steps through lesson_sanitizer.py before DB write:**
+**CRITICAL: Sanitize summary and next_steps through lesson_sanitizer.py before DB write.**
+Use `sanitize_session_note()` — NOT `sanitize_lesson_content()`. Session notes are
+narrative records; the 500-char lesson cap would silently gut them (Equipa task #100027).
+`sanitize_session_note()` applies the generous `MAX_SESSION_NOTE_LENGTH` cap and logs
+loudly if it ever truncates.
 
 ```python
-from lesson_sanitizer import sanitize_lesson_content
+from lesson_sanitizer import sanitize_session_note
 
-# Sanitize user input
-sanitized_summary = sanitize_lesson_content(summary)
-sanitized_next_steps = sanitize_lesson_content(next_steps)
+# Sanitize user input (preserves multi-thousand-char summaries; no silent truncation)
+sanitized_summary = sanitize_session_note(summary)
+sanitized_next_steps = sanitize_session_note(next_steps)
 ```
 
 ```sql

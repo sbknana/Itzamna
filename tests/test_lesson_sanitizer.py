@@ -8,13 +8,17 @@ Copyright 2026 Forgeborn.
 """
 
 import sys
+import logging
 from pathlib import Path
 
 # Add project root to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from lesson_sanitizer import (
+    sanitize,
+    enforce_limit,
     sanitize_lesson_content,
+    sanitize_session_note,
     sanitize_error_signature,
     validate_lesson_structure,
     wrap_lessons_in_task_input,
@@ -334,6 +338,60 @@ def test_strips_code_blocks_with_dangerous_commands():
     print("PASS: Code block stripping works")
 
 
+def test_session_note_not_truncated():
+    """Session notes must use the generous cap, not the 500 lesson cap (task #100027)."""
+    print("\n--- Test: Session notes preserved (no silent truncation) ---")
+
+    note = "Narrative session summary that needs to be preserved in full. " * 100  # ~6000 chars
+    result = sanitize_session_note(note)
+    assert len(result) > 5000, f"Session note was gutted: {len(result)} chars"
+    # The lesson path must still cap at 500 (backward-compat unchanged)
+    assert len(sanitize_lesson_content(note)) <= 500, "Lesson cap regressed"
+
+    print(f"  OK: {len(note)} chars -> session_note {len(result)}, lesson {len(sanitize_lesson_content(note))}")
+    print("PASS: Session notes preserved while lessons still capped")
+
+
+def test_sanitize_has_no_length_cap():
+    """sanitize() does security only — it must NOT truncate."""
+    print("\n--- Test: sanitize() applies no length cap ---")
+
+    # Spaced words (not a continuous alphanumeric run, so the base64-payload
+    # filter does not strip it) — proves the length is preserved, not capped.
+    text = ("word " * 1800).strip()  # ~9000 chars
+    assert len(sanitize(text)) == len(text), "sanitize() unexpectedly altered length"
+    # but injection is still stripped without any cap
+    assert "<system>" not in sanitize("<system>x</system> " + text)
+
+    print(f"  OK: sanitize() preserves {len(text)} chars, still strips injection")
+    print("PASS: sanitize() has no length cap")
+
+
+def test_enforce_limit_is_loud_and_optional():
+    """enforce_limit must warn when truncating (never silent); None disables the cap."""
+    print("\n--- Test: enforce_limit loud truncation + None bypass ---")
+
+    import io
+    buf = io.StringIO()
+    handler = logging.StreamHandler(buf)
+    lg = logging.getLogger("lesson_sanitizer")
+    lg.addHandler(handler)
+    prev_level = lg.level
+    lg.setLevel(logging.WARNING)
+    try:
+        out = enforce_limit("x" * 600, 500, label="lesson")
+    finally:
+        lg.removeHandler(handler)
+        lg.setLevel(prev_level)
+
+    assert len(out) == 500 and out.endswith("..."), f"Cap not applied: {len(out)}"
+    assert "truncated from 600 to 500" in buf.getvalue(), "Truncation was silent (no warning)"
+    assert len(enforce_limit("y" * 9000, None)) == 9000, "max_len=None did not disable cap"
+
+    print("  OK: warned on truncation; None disables cap")
+    print("PASS: enforce_limit is loud and optional")
+
+
 def run_all_tests():
     """Execute all sanitization test cases."""
     print("=" * 70)
@@ -347,6 +405,9 @@ def run_all_tests():
         test_strips_base64_payloads()
         test_strips_ansi_escapes()
         test_caps_lesson_length()
+        test_session_note_not_truncated()
+        test_sanitize_has_no_length_cap()
+        test_enforce_limit_is_loud_and_optional()
         test_error_signature_sanitization()
         test_validate_lesson_structure_valid()
         test_validate_lesson_structure_invalid()
@@ -358,7 +419,7 @@ def run_all_tests():
         test_strips_code_blocks_with_dangerous_commands()
 
         print("\n" + "=" * 70)
-        print("ALL 15 TESTS PASSED")
+        print("ALL 18 TESTS PASSED")
         print("=" * 70)
         return 0
 
