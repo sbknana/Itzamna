@@ -44,6 +44,7 @@ result advisory (always exits 0 but still prints drifts).
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import subprocess
 import sys
@@ -145,7 +146,7 @@ def _looks_like_repo_path(candidate: str) -> bool:
         return False
     if candidate.startswith(("http://", "https://", "mailto:", "ftp://")):
         return False
-    if candidate.startswith("#"):
+    if candidate.startswith(("#", "~")):
         return False
     # Exclude things that obviously aren't paths.
     if " " in candidate:
@@ -199,10 +200,106 @@ def _extract_path_references(
     return refs
 
 
+_PRUNE_DIRS = {
+    ".git", "node_modules", ".venv", "venv", "__pycache__",
+    ".mypy_cache", ".pytest_cache", ".forge-worktrees",
+}
+
+
+def _load_prod_only(repo_root: Path) -> set[str]:
+    """Relative paths + basenames that legitimately exist only in production.
+
+    Read from ``.deploy-allowlist``. Docs reference these (dispatch_config.json,
+    forge_config.json, ...) even though they are intentionally absent from the
+    source tree, so they must not be reported as drift.
+    """
+
+    allow: set[str] = set()
+    f = repo_root / ".deploy-allowlist"
+    if not f.is_file():
+        return allow
+    try:
+        for line in f.read_text(encoding="utf-8").splitlines():
+            s = line.strip()
+            if s and not s.startswith("#"):
+                allow.add(s)
+                allow.add(Path(s).name)
+    except OSError:
+        pass
+    return allow
+
+
+def _build_repo_basenames(repo_root: Path) -> set[str]:
+    """Every file basename in the repo (VCS/heavy dirs pruned).
+
+    Lets a *bare* filename reference resolve — e.g. an ASCII architecture tree
+    entry ``cli.py`` that is implicitly ``equipa/cli.py``. A reference WITH a
+    slash is never matched this way, so a genuinely wrong path such as
+    ``src/missing_file.py`` still drifts.
+    """
+
+    names: set[str] = set()
+    for root, dirs, files in os.walk(repo_root):
+        dirs[:] = [d for d in dirs if d not in _PRUNE_DIRS]
+        names.update(files)
+    return names
+
+
+def _reference_exists(
+    repo_root: Path,
+    doc_file: Path,
+    raw: str,
+    repo_basenames: set[str],
+    prod_only: set[str],
+    top_level: set[str],
+) -> bool:
+    """True if ``raw`` resolves, or is not a checkable in-repo reference.
+
+    Resolves if it exists relative to the repo root (the usual case —
+    ``equipa/tasks.py`` in docs/*.md), relative to the doc's own dir, or — for a
+    bare filename — by basename anywhere in the repo.
+
+    References that are NOT plausibly repo-internal are treated as fine and never
+    reported: template placeholders (``<id>``), globs (``docs/*.md``), bare
+    extensions (``.md``), prod-only files (``.deploy-allowlist``), and external /
+    runtime references whose leading segment is not a real top-level repo dir and
+    which are not a bare ``*.py`` module (``.cursor/mcp.json``, ``.forge-state.json``,
+    ``CLAUDE.md``, ``package.json``). The checker exists to catch a doc naming a
+    repo source file that was renamed or deleted — not to police every filename a
+    doc mentions.
+    """
+
+    candidate = raw.strip().split("#", 1)[0].split("?", 1)[0]
+    if not candidate:
+        return True
+    if any(ch in candidate for ch in "<>*"):
+        return True
+    if re.fullmatch(r"\.[A-Za-z0-9]+", candidate):
+        return True
+    if candidate in prod_only or Path(candidate).name in prod_only:
+        return True
+    if _resolve(repo_root, doc_file, candidate).exists():
+        return True
+    if (repo_root / candidate.lstrip("/")).exists():
+        return True
+    if "/" not in candidate and candidate in repo_basenames:
+        return True
+    head = candidate.lstrip("/").split("/", 1)[0]
+    repo_internal = head in top_level or (
+        "/" not in candidate and candidate.endswith(".py")
+    )
+    return not repo_internal
+
+
 def check_paths(repo_root: Path, doc_files: list[Path]) -> list[Drift]:
     """Verify that every extracted path reference exists on disk."""
 
     drifts: list[Drift] = []
+    prod_only = _load_prod_only(repo_root)
+    repo_basenames = _build_repo_basenames(repo_root)
+    # Repo source dirs are non-hidden (equipa/, scripts/, tests/, ...); hidden
+    # dirs (.claude/, .github/) hold config/generated files, not source modules.
+    top_level = {p.name for p in repo_root.iterdir() if not p.name.startswith(".")}
     for doc_file in doc_files:
         try:
             text = doc_file.read_text(encoding="utf-8")
@@ -212,8 +309,9 @@ def check_paths(repo_root: Path, doc_files: list[Path]) -> list[Drift]:
 
         lines = _strip_ignored_regions(text)
         for line_no, raw in _extract_path_references(doc_file, lines):
-            resolved = _resolve(repo_root, doc_file, raw)
-            if not resolved.exists():
+            if not _reference_exists(
+                repo_root, doc_file, raw, repo_basenames, prod_only, top_level
+            ):
                 drifts.append(
                     Drift(
                         doc_file,

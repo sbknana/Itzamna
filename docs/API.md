@@ -515,7 +515,7 @@ if not result.safe:
 
 ### Hooks
 
-**Module:** `equipa/hooks.py`
+**Module:** `equipa/hooks/`
 
 Event system for extending EQUIPA without modifying core code.
 

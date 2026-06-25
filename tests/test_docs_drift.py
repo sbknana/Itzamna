@@ -197,3 +197,62 @@ def test_main_warn_only_mode_returns_zero(
     assert rc == 0
     assert "src/also_missing.py" in out
     assert "warn-only" in out
+
+
+# --- regression tests for cross-platform / false-positive hardening ---
+
+
+def test_repo_root_relative_ref_in_docs_resolves(clean_fixture: Path) -> None:
+    """Repo-root-relative ref in docs/*.md (equipa/a.py) must resolve."""
+    (clean_fixture / "docs" / "ref.md").write_text(
+        "See `equipa/a.py` for details.", encoding="utf-8"
+    )
+    drifts = drift.check_paths(clean_fixture, drift._discover_doc_files(clean_fixture))
+    assert not any("equipa/a.py" in d.message for d in drifts), [d.message for d in drifts]
+
+
+def test_bare_module_basename_resolves(clean_fixture: Path) -> None:
+    """A bare architecture-tree entry `a.py` resolves by basename."""
+    (clean_fixture / "docs" / "tree.md").write_text(
+        "```" + chr(10) + "equipa/" + chr(10) + "|-- a.py" + chr(10) + "+-- b.py" + chr(10) + "```" + chr(10),
+        encoding="utf-8",
+    )
+    drifts = drift.check_paths(clean_fixture, drift._discover_doc_files(clean_fixture))
+    assert drifts == [], [d.message for d in drifts]
+
+
+def test_external_and_runtime_refs_skipped(clean_fixture: Path) -> None:
+    """Home/external/runtime refs are not repo source and must never flag."""
+    (clean_fixture / "docs" / "ext.md").write_text(
+        "Configs: `~/.config/app.json`, `.cursor/mcp.json`, `.forge-state.json`, "
+        "`CLAUDE.md`, `package.json`.", encoding="utf-8",
+    )
+    drifts = drift.check_paths(clean_fixture, drift._discover_doc_files(clean_fixture))
+    assert drifts == [], [d.message for d in drifts]
+
+
+def test_placeholder_glob_and_lone_extension_skipped(clean_fixture: Path) -> None:
+    """Template placeholders, globs, and bare extensions are not file refs."""
+    (clean_fixture / "docs" / "ph.md").write_text(
+        "Paths: `<project_dir>/.equipa/roles/<role>.md`, `docs/*.md`, `.md`.",
+        encoding="utf-8",
+    )
+    drifts = drift.check_paths(clean_fixture, drift._discover_doc_files(clean_fixture))
+    assert drifts == [], [d.message for d in drifts]
+
+
+def test_prod_only_file_skipped(clean_fixture: Path) -> None:
+    """Files in .deploy-allowlist live only in prod; refs must not flag."""
+    (clean_fixture / ".deploy-allowlist").write_text("dispatch_config.json", encoding="utf-8")
+    (clean_fixture / "docs" / "cfg.md").write_text(
+        "Edit `dispatch_config.json` to configure.", encoding="utf-8"
+    )
+    drifts = drift.check_paths(clean_fixture, drift._discover_doc_files(clean_fixture))
+    assert not any("dispatch_config.json" in d.message for d in drifts), [d.message for d in drifts]
+
+
+def test_genuine_repo_internal_missing_is_flagged(clean_fixture: Path) -> None:
+    """A doc naming a non-existent repo source module still drifts (the point)."""
+    (clean_fixture / "docs" / "ghost.md").write_text("See `equipa/ghost.py`.", encoding="utf-8")
+    drifts = drift.check_paths(clean_fixture, drift._discover_doc_files(clean_fixture))
+    assert any("equipa/ghost.py" in d.message for d in drifts), [d.message for d in drifts]

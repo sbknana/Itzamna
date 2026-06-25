@@ -17,7 +17,9 @@ The pipeline is straightforward:
 
 1. **Forge Arena** generates training data by running agents on real tasks
 2. **`prepare_training_data.py`** converts arena results into training format
-3. **`train_qlora.py` / `train_qlora_peft.py`** trains a QLoRA adapter on a base model
+<!-- drift-ignore -->
+3. **`train_qlora.py` / `train_qlora_peft.py`** trains a QLoRA adapter on a base model (these scripts live in the separate training/benchmarks repo)
+<!-- /drift-ignore -->
 4. **Merge + convert** the adapter into a GGUF file for Ollama
 
 You end up with a quantized model that runs locally, costs nothing per token, and is specifically tuned for agent work.
