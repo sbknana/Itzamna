@@ -59,13 +59,18 @@ def test_generate_manifest_includes_prompts_and_skills():
 
 
 def test_generate_manifest_hash_matches_file_content():
-    """Spot-check: the hash for a known file should match its actual SHA-256."""
+    """Spot-check: the manifest hash for a known file matches its SHA-256 over
+    LF-normalized content. Hashing is line-ending independent (see
+    equipa.security._hash_md_bytes), so the expected value is computed over
+    CRLF/CR -> LF normalized bytes — otherwise this would fail on a checkout
+    with git autocrlf=true (CRLF working tree vs LF manifest)."""
     manifest = generate_skill_manifest()
     # Pick the first file and verify
     rel_path = next(iter(manifest))
     expected_hash = manifest[rel_path]
     file_path = REPO_ROOT / rel_path
-    actual_hash = hashlib.sha256(file_path.read_bytes()).hexdigest()
+    normalized = file_path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    actual_hash = hashlib.sha256(normalized).hexdigest()
     assert actual_hash == expected_hash, (
         f"Hash mismatch for {rel_path}: expected {expected_hash}, got {actual_hash}"
     )
