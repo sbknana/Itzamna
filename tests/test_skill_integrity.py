@@ -13,8 +13,10 @@ import json
 import os
 import sys
 import tempfile
+
+import pytest
+
 from pathlib import Path
-from unittest.mock import patch
 
 # Add parent directory for imports
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -26,6 +28,24 @@ from forge_orchestrator import (
     write_skill_manifest,
     SKILL_MANIFEST_FILE,
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolated_manifest(tmp_path, monkeypatch):
+    """Redirect the skill manifest to a throwaway path so tests never mutate the real
+    skill_manifest.json. write_skill_manifest() stamps a fresh generated_at on every
+    call, which would otherwise show the tracked file as modified after each test run
+    (and, pre-fix, churned the path separators on Windows). Patches all three namespaces
+    the path is referenced through — equipa.security (where the functions read it),
+    forge_orchestrator (the re-export), and this test module (the test bodies) — so
+    nothing touches the real file."""
+    import equipa.security as _security
+    import forge_orchestrator as _orch
+    tmp = tmp_path / "skill_manifest.json"
+    monkeypatch.setattr(_security, "SKILL_MANIFEST_FILE", tmp)
+    monkeypatch.setattr(_orch, "SKILL_MANIFEST_FILE", tmp, raising=False)
+    monkeypatch.setattr(sys.modules[__name__], "SKILL_MANIFEST_FILE", tmp)
+    return tmp
 
 
 # ---------------------------------------------------------------------------
@@ -101,10 +121,16 @@ def test_verify_passes_with_current_manifest():
     assert verify_skill_integrity() is True
 
 
-def test_verify_returns_true_when_manifest_missing():
-    """If manifest file doesn't exist, verification should pass (backward compat)."""
-    with patch("forge_orchestrator.SKILL_MANIFEST_FILE", Path("/nonexistent/skill_manifest.json")):
-        assert verify_skill_integrity() is True
+def test_verify_returns_false_when_manifest_missing():
+    """A missing manifest must FAIL verification — no manifest means no integrity
+    guarantee (matches verify_skill_integrity's documented behavior). The isolated
+    manifest path does not exist (nothing wrote it), so verification returns False.
+
+    NB: the prior version of this test asserted True ('backward compat') and only
+    passed because its patch was ineffective — verify_skill_integrity read the real,
+    existing manifest rather than the patched path. The manifest-isolation fixture
+    exposed the false positive; the code (and its docstring) say missing -> False."""
+    assert verify_skill_integrity() is False
 
 
 def test_verify_fails_on_tampered_file():
@@ -152,6 +178,7 @@ def test_verify_fails_on_empty_files_dict():
 
 def test_verify_fails_on_corrupt_json():
     """Corrupt JSON in the manifest should cause verification to fail."""
+    write_skill_manifest()  # ensure an (isolated) manifest exists to corrupt
     original = SKILL_MANIFEST_FILE.read_text(encoding="utf-8")
 
     SKILL_MANIFEST_FILE.write_text("{invalid json!!!", encoding="utf-8")
