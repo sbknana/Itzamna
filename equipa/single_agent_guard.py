@@ -35,6 +35,7 @@ Copyright 2026 Forgeborn
 from __future__ import annotations
 
 import logging
+import os
 import re
 import subprocess
 from dataclasses import dataclass, field
@@ -180,6 +181,103 @@ def _git_diff_files(repo_path: Path) -> list[str]:
         return []
 
 
+# Directories that never hold a real deliverable; pruned by the filesystem
+# scan so a huge dependency/VCS tree can't slow it down (or false-positive on
+# a vendored file whose mtime happens to fall after run start).
+_FS_SCAN_SKIP_DIRS: frozenset[str] = frozenset({
+    ".git",
+    ".hg",
+    ".svn",
+    "node_modules",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".forge-worktrees",
+})
+
+# Filesystem-mtime granularity (and small clock skew between the orchestrator
+# recording the run start and the agent process writing files) can leave a
+# genuinely-during-the-run file looking a hair "older" than run start. Allow a
+# small slack so we don't drop a real deliverable on rounding.
+_FS_MTIME_SLACK_SECONDS = 2.0
+
+
+def _as_timestamp(value: Any) -> float | None:
+    """Coerce a run-start marker (epoch float, datetime, or ISO string) to epoch."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    dt = _parse_iso_timestamp(value)
+    if dt is None:
+        return None
+    try:
+        return dt.timestamp()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _fs_files_since(repo_path: Path, run_started_at: Any) -> list[str]:
+    """Non-trivial files under ``repo_path`` created/modified at/after run start.
+
+    This is the git-independent evidence path: a deliverable written into a
+    **non-git** project dir (a CAD/docs/product folder) is invisible to
+    :func:`_git_diff_files`, but it still lands on disk with a fresh mtime.
+    Keying on ``run_started_at`` (rather than trusting the agent's self-report)
+    keeps the guard honest — a pre-existing file is not counted as new work.
+
+    Returns repo-relative paths. Empty when no marker is available or nothing
+    changed (so the guard still fails CLOSED on a genuinely empty run).
+    """
+    started = _as_timestamp(run_started_at)
+    if started is None:
+        return []
+    threshold = started - _FS_MTIME_SLACK_SECONDS
+
+    found: list[str] = []
+    try:
+        for root, dirs, files in os.walk(repo_path):
+            # Prune hidden + heavy dirs in place so os.walk skips them entirely.
+            dirs[:] = [
+                d for d in dirs
+                if d not in _FS_SCAN_SKIP_DIRS and not d.startswith(".")
+            ]
+            for name in files:
+                if name in _TRIVIAL_FILES or name.startswith("."):
+                    continue
+                p = Path(root) / name
+                try:
+                    if p.stat().st_mtime >= threshold:
+                        found.append(str(p.relative_to(repo_path)))
+                except (OSError, ValueError):
+                    continue
+    except OSError:
+        return found
+    return found
+
+
+def _is_report_role(role: str, project_dir: str | None) -> bool:
+    """True for a report-writing role (base OR project overlay).
+
+    A role whose frontmatter sets ``early_term_exempt: true`` delivers an
+    on-disk artifact rather than a git commit, so its output must be credited
+    via the filesystem scan, not git. Resolver-aware so project-overlay roles
+    (``<project_dir>/.equipa/roles/<role>.md``) are classified correctly
+    instead of falling into the strict "unrecognized role" branch.
+    """
+    try:
+        from equipa.role_resolver import is_role_early_term_exempt
+    except Exception:  # pragma: no cover — defensive, keeps guard importable
+        return False
+    try:
+        return is_role_early_term_exempt(role, project_dir)
+    except Exception:  # pragma: no cover — never let classification crash the guard
+        logger.exception("role classification failed for %r", role)
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Public API — single-agent outcome evaluation
 # ---------------------------------------------------------------------------
@@ -218,6 +316,8 @@ def evaluate_single_agent_outcome(
     task_id: int,
     run_result: dict[str, Any],
     repo_path: Path,
+    run_started_at: str | datetime | float | None = None,
+    project_dir: str | None = None,
 ) -> SingleAgentOutcome:
     """Decide whether a single-agent run produced real output.
 
@@ -228,6 +328,16 @@ def evaluate_single_agent_outcome(
             ``files_changed`` (preferred), ``raw_files_changed`` (fallback),
             ``stdout`` (used only as a last-resort signal for review roles).
         repo_path: The on-disk working directory the agent ran in.
+        run_started_at: When the orchestrator dispatched the agent (epoch
+            float, datetime, or ISO string). Enables the git-independent
+            filesystem fallback: a deliverable written into a **non-git**
+            project dir is detected by its post-run mtime. When omitted the
+            fallback is disabled and detection is git + self-report only
+            (legacy behaviour).
+        project_dir: The dispatching project's directory, used to resolve a
+            project-overlay role's ``early_term_exempt`` frontmatter so a
+            report-writing overlay role is classified correctly rather than
+            treated as an "unrecognized" strict role.
 
     Returns:
         :class:`SingleAgentOutcome`. ``is_blocked`` is True iff the run
@@ -242,12 +352,21 @@ def evaluate_single_agent_outcome(
     git_files = _git_diff_files(repo_path)
     union = list(dict.fromkeys(_real_files(files_changed) + _real_files(git_files)))
 
+    # Git-independent fallback. Only engaged when git found nothing — i.e. a
+    # non-git project dir, or a git repo with no committed/working-tree change
+    # (e.g. an untracked report). Keyed on run start so pre-existing files do
+    # not count. This is what stops "no git repo" being read as "no output".
+    fs_files: list[str] = []
+    if not git_files:
+        fs_files = _fs_files_since(repo_path, run_started_at)
+
     if role in _FILE_PRODUCING_ROLES:
-        if union:
+        evidence = list(dict.fromkeys(union + fs_files))
+        if evidence:
             return SingleAgentOutcome(
                 status="success",
-                reason=f"file-producing role {role!r} changed {len(union)} file(s)",
-                files_observed=tuple(union),
+                reason=f"file-producing role {role!r} changed {len(evidence)} file(s)",
+                files_observed=tuple(evidence),
             )
         return SingleAgentOutcome(
             status="no_output",
@@ -261,11 +380,15 @@ def evaluate_single_agent_outcome(
 
     if role in _REVIEW_ROLES:
         artifacts = _review_artifact_present(role, task_id, repo_path)
-        if artifacts:
+        # Generalized fallback: a review run that left its artifact under a
+        # non-conventional name (or in a non-git dir) is still credited on any
+        # non-trivial file touched since run start.
+        evidence = list(dict.fromkeys(artifacts + fs_files))
+        if evidence:
             return SingleAgentOutcome(
                 status="success",
-                reason=f"review role {role!r} produced artifact(s): {artifacts!r}",
-                files_observed=tuple(artifacts),
+                reason=f"review role {role!r} produced artifact(s): {evidence!r}",
+                files_observed=tuple(evidence),
             )
         return SingleAgentOutcome(
             status="no_output",
@@ -277,19 +400,25 @@ def evaluate_single_agent_outcome(
             files_observed=(),
         )
 
-    # Unknown / generic role: be conservative — accept any file change OR
-    # a non-empty stdout, but flag for visibility.
-    if union:
+    # Report-writing role (base or project overlay) or unknown/generic role.
+    # Both are credited on git/self-report evidence OR a filesystem deliverable
+    # produced since run start — the report-overlay case is the common one for
+    # non-git product folders.
+    report_role = _is_report_role(role, project_dir)
+    evidence = list(dict.fromkeys(union + fs_files))
+    if evidence:
+        kind = "report role" if report_role else "unrecognized role"
         return SingleAgentOutcome(
             status="success",
-            reason=f"unrecognized role {role!r}; accepted on {len(union)} file change(s)",
-            files_observed=tuple(union),
+            reason=f"{kind} {role!r}; accepted on {len(evidence)} file change(s)",
+            files_observed=tuple(evidence),
         )
+    kind = "report role" if report_role else "unrecognized role"
     return SingleAgentOutcome(
         status="no_output",
         reason=(
-            f"unrecognized role {role!r} produced no file changes; refusing to "
-            "mark success without on-disk evidence"
+            f"{kind} {role!r} produced no on-disk evidence since run start; "
+            "refusing to mark success without a deliverable on disk"
         ),
         files_observed=(),
     )

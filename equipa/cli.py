@@ -1684,6 +1684,11 @@ async def run_mode_task(args: argparse.Namespace) -> None:
             max_turns=role_turns_allocated,
         )
         print(f"Dynamic budget: {role_turns_allocated}/{role_turns_max} turns")
+        # Mark the wall-clock run start so the no-output guard's filesystem
+        # fallback can tell a fresh deliverable apart from pre-existing files
+        # (the only output signal in a non-git project dir).
+        from datetime import datetime as _dt
+        run_started_at = _dt.now()
         with build_cli_command(
             system_prompt, project_dir, role_turns_allocated, role_model, role=args.role,
             streaming=use_streaming,
@@ -1728,6 +1733,8 @@ async def run_mode_task(args: argparse.Namespace) -> None:
                 task_id=task["id"],
                 run_result=result,
                 repo_path=Path(project_dir),
+                run_started_at=run_started_at,
+                project_dir=project_dir,
             )
             if outcome_check.is_blocked:
                 print(
