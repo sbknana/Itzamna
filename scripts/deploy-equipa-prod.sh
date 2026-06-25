@@ -321,12 +321,16 @@ else
     # this step the "before" hash is whatever upstream happened to commit,
     # which is often stale relative to the runtime regenerator.
     if ( cd "${PROD_DIR}" && python3 forge_orchestrator.py --regenerate-manifest >/dev/null 2>&1 ); then
-        MANIFEST_BASELINE="$(sha256sum "${MANIFEST_PATH}" | awk '{print $1}')"
+        # Hash only the "files" map (sorted) — NOT the raw file. The manifest
+        # embeds a wall-clock "generated_at" stamp that changes every regen, so a
+        # raw-byte compare false-positives. Tamper detection only cares about the
+        # skill file hashes.
+        MANIFEST_BASELINE="$(python3 -c 'import json,hashlib,sys; d=json.load(open(sys.argv[1])); print(hashlib.sha256(json.dumps(d.get("files", d), sort_keys=True).encode()).hexdigest())' "${MANIFEST_PATH}")"
         # Second regeneration must produce an identical hash on the same host.
         if ! ( cd "${PROD_DIR}" && python3 forge_orchestrator.py --regenerate-manifest >/dev/null 2>&1 ); then
             fail "skill_manifest second regeneration failed (first succeeded). Investigate orchestrator state before continuing."
         fi
-        MANIFEST_VERIFY="$(sha256sum "${MANIFEST_PATH}" | awk '{print $1}')"
+        MANIFEST_VERIFY="$(python3 -c 'import json,hashlib,sys; d=json.load(open(sys.argv[1])); print(hashlib.sha256(json.dumps(d.get("files", d), sort_keys=True).encode()).hexdigest())' "${MANIFEST_PATH}")"
         if [ "${MANIFEST_BASELINE}" != "${MANIFEST_VERIFY}" ]; then
             fail "skill_manifest.json hashes drifted between two consecutive regenerations (baseline=${MANIFEST_BASELINE} verify=${MANIFEST_VERIFY}). Generation is non-deterministic or skill content changed mid-deploy."
         fi
