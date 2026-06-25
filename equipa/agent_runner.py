@@ -21,9 +21,27 @@ import subprocess
 import tempfile
 import time
 from collections.abc import Iterator
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, TypedDict
 
 logger = logging.getLogger(__name__)
+
+
+def _run_started_at_utc() -> str:
+    """Naive-UTC ISO timestamp marking when an agent run began.
+
+    Stamped onto every run result so consumers (notably the single-agent
+    guard's ``validate_tasks_created_claim``, which rejects a ``TASKS_CREATED``
+    line referencing task ids that predate the run) can tell a freshly-created
+    task from a pre-existing/hallucinated one.
+
+    MUST be naive UTC: ``tasks.created_at`` is ``DEFAULT CURRENT_TIMESTAMP``,
+    which SQLite stores as naive UTC. A tz-aware value would raise on the
+    ``created < run_started`` comparison (naive vs aware), and a local-time
+    value would false-flag tasks legitimately created *during* the run as
+    pre-existing (off by the UTC offset).
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
 
 if TYPE_CHECKING:
     from equipa.prompts import PromptResult
@@ -137,6 +155,11 @@ class AgentResult(_AgentResultRequired, total=False):
     # Caller-injected annotations (set by loops.py after dispatch)
     turns_allocated: int
     turns_max: int
+
+    # Run-start marker (naive UTC ISO), set by the top-level runners so the
+    # single-agent guard can date-check a TASKS_CREATED claim. See
+    # _run_started_at_utc.
+    started_at: str
 
 from equipa.abort_controller import AbortController, create_child_abort_controller
 from equipa.bash_security import check_bash_command
@@ -1457,12 +1480,16 @@ async def run_agent_with_retries(
 
     Returns (result, attempt_number) tuple.
     """
+    started_at = _run_started_at_utc()
     result: dict[str, Any] = {}
     for attempt in range(1, max_retries + 1):
         if attempt > 1:
             print(f"\n--- Retry {attempt}/{max_retries} ---")
 
         result = await run_agent(cmd)
+        # Stamp the run start so downstream date-checks (e.g. the single-agent
+        # guard's TASKS_CREATED validation) have a real value, not None.
+        result.setdefault("started_at", started_at)
 
         # Check if output is valid
         is_valid, reason = validate_output(result)
@@ -1648,11 +1675,17 @@ async def run_agent_streaming(
 
     Returns the same dict format as run_agent().
     """
-    return await run_agent_streaming_with_retry(
+    started_at = _run_started_at_utc()
+    result = await run_agent_streaming_with_retry(
         cmd, role=role, output=output, max_turns=max_turns,
         task_id=task_id, cycle_number=cycle_number, project_dir=project_dir,
         paralysis_retry_count=paralysis_retry_count,
     )
+    # Stamp the run start so downstream date-checks (e.g. the single-agent
+    # guard's TASKS_CREATED validation) have a real value, not None.
+    if isinstance(result, dict):
+        result.setdefault("started_at", started_at)
+    return result
 
 
 async def dispatch_agent(
