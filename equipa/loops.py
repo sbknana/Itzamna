@@ -1207,14 +1207,29 @@ _AUDIT_ROLES = frozenset({"security-reviewer", "code-reviewer"})
 _AUDIT_TASK_TYPES = frozenset({"audit", "review"})
 
 
-def _is_audit_type_task(task: dict[str, Any] | None, task_role: str) -> bool:
+def _is_audit_type_task(
+    task: dict[str, Any] | None,
+    task_role: str,
+    project_dir: str | None = None,
+) -> bool:
     """Return True if this task's deliverable is a markdown report, not code.
 
-    Triggers on either an audit-style ``task_type`` or one of the reviewer
-    roles. Matches the criteria spelled out in TheForge bug 2237.
+    Triggers on an audit-style ``task_type``, one of the reviewer roles, or a
+    report-writer role (frontmatter ``early_term_exempt`` — e.g. design /
+    ip / regulatory analysts and project-overlay analysis roles), which produce
+    markdown deliverables rather than code. Matches the criteria spelled out in
+    TheForge bug 2237. The caller still guards the short-circuit on an empty git
+    diff, so a role that does emit code keeps its tester cycle.
     """
     if task_role in _AUDIT_ROLES:
         return True
+    if project_dir:
+        try:
+            from equipa.role_resolver import is_role_early_term_exempt
+            if is_role_early_term_exempt(task_role, project_dir):
+                return True
+        except Exception:
+            pass
     if not isinstance(task, dict):
         return False
     return (task.get("task_type") or "") in _AUDIT_TASK_TYPES
@@ -2025,7 +2040,7 @@ async def run_dev_test_loop(
             # there is nothing for the tester to test. Running it anyway either
             # wastes turns in analysis paralysis or returns tester_blocked when
             # the diff is empty. See TheForge bug 2237.
-            if _is_audit_type_task(task, task_role):
+            if _is_audit_type_task(task, task_role, project_dir):
                 diff_empty = await _git_diff_is_empty(project_dir, base_ref=prev_cycle_sha)
                 if diff_empty:
                     md_files = [

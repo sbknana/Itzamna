@@ -61,3 +61,29 @@ For `early_term_exempt`, a role file's frontmatter value (when set) wins over th
 
 No base-code changes, no merge conflicts on Equipa updates. See
 [`examples/roles/`](../examples/roles/) for ready-to-copy starting points.
+
+## Dispatching by stored role (`tasks.role`)
+
+A task can carry its own dispatch role in the `tasks.role` column. When set, it
+drives dispatch wherever `--role` is not given explicitly:
+
+- **Single task:** `--task <ID>` (no `--role`) uses the task's role; an explicit
+  `--role X` still overrides it.
+- **Autonomous / scan modes:** `--auto-run` and `--project <ID>` dispatch each
+  task with its stored role, so a project can fan work out to specialist or
+  project-overlay roles instead of always running the dev/test loop.
+
+Role-selection precedence: explicit `--role` → `tasks.role` → `developer`.
+
+Report-writer roles (frontmatter `early_term_exempt: true`) skip the tester
+phase when they produce no code diff — the same treatment as the built-in
+reviewer roles.
+
+Set a task's role via the DB / MCP, e.g.:
+
+```sql
+UPDATE tasks SET role = 'scilab-engineer' WHERE id = 100028;
+```
+
+The `tasks.role` column is added automatically on startup (idempotent, additive)
+for existing databases, and is part of `schema.sql` for fresh installs.
