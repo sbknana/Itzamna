@@ -33,7 +33,6 @@ Copyright 2026 Forgeborn
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import logging
 import re
 import sqlite3
@@ -46,6 +45,52 @@ from equipa.initiative import BEGIN_MARKER, InitiativePlan, _sanitize_agent_text
 from equipa.security import _make_untrusted_delimiter, wrap_untrusted
 
 logger = logging.getLogger(__name__)
+
+
+# --- Cross-platform advisory file locking -------------------------------------
+# The initiative concurrency guard takes an exclusive, non-blocking lock and is
+# deliberately fail-CLOSED: if the lock is already held it raises OSError, which
+# the caller converts to InitiativeLockError and refuses to dispatch. POSIX uses
+# fcntl.flock; Windows (no fcntl) uses msvcrt.locking. Both raise OSError on
+# contention, preserving the fail-closed semantics on every platform.
+try:
+    import fcntl as _fcntl
+
+    def _lock_exclusive_nonblocking(fh) -> None:
+        _fcntl.flock(fh.fileno(), _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+
+    def _unlock(fh) -> None:
+        _fcntl.flock(fh.fileno(), _fcntl.LOCK_UN)
+except ImportError:  # Windows
+    import msvcrt as _msvcrt
+
+    def _lock_exclusive_nonblocking(fh) -> None:
+        fh.seek(0)
+        # Lock 1 byte at offset 0 (region may extend past EOF on Windows).
+        # LK_NBLCK = exclusive, non-blocking; raises OSError if already held.
+        _msvcrt.locking(fh.fileno(), _msvcrt.LK_NBLCK, 1)
+
+    def _unlock(fh) -> None:
+        fh.seek(0)
+        _msvcrt.locking(fh.fileno(), _msvcrt.LK_UNLCK, 1)
+
+
+def _user_token() -> str:
+    """Stable per-user token for namespacing the last-resort tmp lock dir (N3).
+
+    POSIX uses the numeric uid (``os.getuid``). Windows has no ``getuid``, so we
+    fall back to the sanitized login name. Either way the tmp lock dir stays
+    per-user, so another local user cannot pre-create or hijack it.
+    """
+    import os
+
+    getuid = getattr(os, "getuid", None)
+    if getuid is not None:
+        return str(getuid())
+    import getpass
+
+    name = getpass.getuser() or "unknown"
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", name)
 
 
 # Task statuses the runner treats as "still needs work" when selecting the
@@ -555,7 +600,7 @@ def _initiative_lock_dir(repo_path: str | Path) -> Path:
         candidates.append(Path(xdg) / "equipa")
     candidates.append(Path(repo_path) / ".git" / "equipa-locks")
     candidates.append(
-        Path(tempfile.gettempdir()) / f"equipa-locks-{os.getuid()}"
+        Path(tempfile.gettempdir()) / f"equipa-locks-{_user_token()}"
     )
 
     for candidate in candidates:
@@ -627,7 +672,7 @@ def _initiative_lock(
         ) from exc
     try:
         try:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _lock_exclusive_nonblocking(fh)
         except OSError as exc:
             raise InitiativeLockError(
                 f"Initiative #{initiative_id} already has a live run "
@@ -636,7 +681,7 @@ def _initiative_lock(
         try:
             yield
         finally:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            _unlock(fh)
     finally:
         fh.close()
 
@@ -962,7 +1007,7 @@ def _active_pause_marker(
         path = InitiativePlan.plan_path(Path(repo_path), initiative_id)
         if not path.exists():
             return None
-        markers = parse_pause_markers(path.read_text())
+        markers = parse_pause_markers(path.read_text(encoding="utf-8"))
     except OSError:
         logger.exception(
             "Failed to read plan file for pause markers (initiative=%s)",
