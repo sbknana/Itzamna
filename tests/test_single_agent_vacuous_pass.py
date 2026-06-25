@@ -15,7 +15,9 @@ dispatch path so the regression cannot return silently.
 
 from __future__ import annotations
 
+import os
 import subprocess
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -192,6 +194,119 @@ def test_single_agent_evaluator_no_artifact_is_blocked(fake_repo: Path) -> None:
     )
     assert outcome.status == "no_output"
     assert outcome.is_blocked is True
+
+
+# ---------------------------------------------------------------------------
+# Bug 5: non-git project dirs + project-overlay report roles
+#
+# The guard proved "real work" via git only for non-review roles. In a non-git
+# project dir (a CAD/docs/product folder) git detection returns nothing, so a
+# report-writer overlay role's real on-disk deliverable was falsely BLOCKED.
+# These pin the mtime-based filesystem fallback + resolver-aware classification.
+# ---------------------------------------------------------------------------
+
+def _run_start_marker() -> datetime:
+    """A run-start timestamp safely in the past relative to files we create."""
+    return datetime.now() - timedelta(seconds=30)
+
+
+def test_nongit_overlay_role_with_deliverable_passes(tmp_path: Path) -> None:
+    """Non-git dir + unrecognized role: a deliverable written after run start
+    is seen by the filesystem fallback -> success (the Bug 5 repro)."""
+    assert not (tmp_path / ".git").exists()  # genuinely not a git repo
+    run_started_at = _run_start_marker()
+
+    deliverable = tmp_path / "docs" / "ip"
+    deliverable.mkdir(parents=True)
+    report = deliverable / "FTO-fact-canfd.md"
+    report.write_text("# FTO\nReal cited patents.\n", encoding="utf-8")
+
+    run_result = _make_run_result(stdout="RESULT: success\n", files_changed=[])
+
+    outcome = dispatch.evaluate_single_agent_outcome(
+        role="ip-analyst",
+        task_id=100036,
+        run_result=run_result,
+        repo_path=tmp_path,
+        run_started_at=run_started_at,
+    )
+
+    assert outcome.status == "success"
+    assert outcome.is_blocked is False
+    assert any("FTO-fact-canfd.md" in f for f in outcome.files_observed)
+
+
+def test_nongit_empty_run_still_blocked(tmp_path: Path) -> None:
+    """Non-git dir, nothing written after run start -> still no_output.
+
+    The fix must stop treating "no git repo" as "no output" WITHOUT going soft
+    on a genuinely empty run."""
+    # A pre-existing file whose mtime predates the run must NOT count.
+    stale = tmp_path / "README.md"
+    stale.write_text("pre-existing\n", encoding="utf-8")
+    old = (datetime.now() - timedelta(hours=1)).timestamp()
+    os.utime(stale, (old, old))
+
+    run_started_at = _run_start_marker()
+    run_result = _make_run_result(stdout="RESULT: success\n", files_changed=[])
+
+    outcome = dispatch.evaluate_single_agent_outcome(
+        role="ip-analyst",
+        task_id=100036,
+        run_result=run_result,
+        repo_path=tmp_path,
+        run_started_at=run_started_at,
+    )
+
+    assert outcome.status == "no_output"
+    assert outcome.is_blocked is True
+
+
+def test_nongit_project_overlay_report_role_classified(tmp_path: Path) -> None:
+    """A project-overlay role marked ``early_term_exempt: true`` is classified
+    as a report role (resolver-aware) and credited on its filesystem artifact."""
+    roles_dir = tmp_path / ".equipa" / "roles"
+    roles_dir.mkdir(parents=True)
+    (roles_dir / "ip-analyst.md").write_text(
+        "---\nearly_term_exempt: true\n---\nYou are an FTO analyst.\n",
+        encoding="utf-8",
+    )
+
+    run_started_at = _run_start_marker()
+    report = tmp_path / "FTO-fact-canfd.md"
+    report.write_text("# FTO\n", encoding="utf-8")
+
+    run_result = _make_run_result(stdout="RESULT: success\n", files_changed=[])
+
+    outcome = dispatch.evaluate_single_agent_outcome(
+        role="ip-analyst",
+        task_id=100036,
+        run_result=run_result,
+        repo_path=tmp_path,
+        run_started_at=run_started_at,
+        project_dir=str(tmp_path),
+    )
+
+    assert outcome.status == "success"
+    assert "report role" in outcome.reason
+
+
+def test_nongit_no_run_marker_keeps_legacy_behaviour(tmp_path: Path) -> None:
+    """Without a run_started_at marker the filesystem fallback is disabled, so
+    behaviour is unchanged (git + self-report only) -> no_output here."""
+    (tmp_path / "out.md").write_text("# out\n", encoding="utf-8")
+
+    run_result = _make_run_result(stdout="RESULT: success\n", files_changed=[])
+
+    outcome = dispatch.evaluate_single_agent_outcome(
+        role="ip-analyst",
+        task_id=100036,
+        run_result=run_result,
+        repo_path=tmp_path,
+        # run_started_at omitted on purpose
+    )
+
+    assert outcome.status == "no_output"
 
 
 # ---------------------------------------------------------------------------
