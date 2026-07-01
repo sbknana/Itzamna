@@ -589,7 +589,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         help=f"Max manager rounds (default: {MAX_MANAGER_ROUNDS})")
     parser.add_argument("--max-concurrent", type=int, default=None,
                         help="Override max concurrent goals (default: from goals file or 4)")
-    parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Model to use (default: {DEFAULT_MODEL})")
+    parser.add_argument("--model", default=None, help=f"Model to use (default: {DEFAULT_MODEL})")
     parser.add_argument("--max-turns", type=int, default=DEFAULT_MAX_TURNS, help=f"Max agent turns (default: {DEFAULT_MAX_TURNS})")
     # Dynamically discover available roles from prompts directory
     prompts_dir = Path(__file__).parent.parent / "prompts"

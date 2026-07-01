@@ -362,9 +362,9 @@ class TestS1FailClosedPropagation:
     def _mock_args(self):
         from unittest.mock import Mock
 
-        from equipa.constants import DEFAULT_MODEL
-
-        return Mock(model=DEFAULT_MODEL, dispatch_config=None)
+        # model=None is the correct sentinel after task-2610 fix: argparse default
+        # is None (not DEFAULT_MODEL), so unset --model is represented as None.
+        return Mock(model=None, dispatch_config=None)
 
     def _trip_all_circuits(self):
         for tier in TIER_ORDER:

@@ -1,146 +1,174 @@
 """
 Tests for task-2610: honor explicit --model even when it equals DEFAULT_MODEL,
-and let explicit config win over auto_model_routing.
+and let explicit per-complexity config win over auto_model_routing.
 """
 import pytest
-from unittest.mock import patch, MagicMock
-import sys
-import os
-
-# Ensure equipa package is importable from worktree
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from equipa.roles import resolve_model_for_role
-from equipa.constants import DEFAULT_MODEL
+from unittest.mock import Mock, patch
 
 
 class FakeArgs:
     """Simulates CLI args namespace."""
-    def __init__(self, model=None, role=None, complexity=None):
+    def __init__(self, model=None, dispatch_config=None):
         self.model = model
-        self.role = role
-        self.complexity = complexity
+        self.dispatch_config = dispatch_config
 
 
 class TestExplicitModelSentinel:
     """--model passed explicitly must be honored even when it equals DEFAULT_MODEL."""
 
     def test_explicit_model_equals_default_is_honored(self):
-        """Regression: --model DEFAULT_MODEL must NOT be silently ignored."""
-        args = FakeArgs(model=DEFAULT_MODEL)
-        features = {"auto_model_routing": False}
-        dispatch_config = {}
-        result = resolve_model_for_role(
-            role="developer",
-            complexity="epic",
-            args=args,
-            features=features,
-            dispatch_config=dispatch_config,
-        )
+        """Regression for task-2610 bug 1: --model DEFAULT_MODEL must NOT be a no-op.
+
+        Before the fix, get_role_model used DEFAULT_MODEL as the argparse sentinel.
+        Passing --model DEFAULT_MODEL compared equal and was silently dropped,
+        falling through to auto-routing or DEFAULT_ROLE_MODELS.
+        """
+        from equipa.roles import get_role_model
+        from equipa.constants import DEFAULT_MODEL
+
+        args = FakeArgs(model=DEFAULT_MODEL)  # user explicitly passed --model DEFAULT_MODEL
+        config = {"features": {"auto_model_routing": False}}
+        task = {"id": 1, "description": "fix a small bug", "title": "Fix bug", "complexity": "medium"}
+
+        result = get_role_model("developer", args, config=config, task=task)
+
         assert result == DEFAULT_MODEL, (
-            f"Expected explicit --model={DEFAULT_MODEL!r} to be honored, got {result!r}. "
-            "Equality with DEFAULT_MODEL must not cause a silent no-op."
+            f"Expected explicit --model={DEFAULT_MODEL!r} to be honored even though it "
+            f"equals DEFAULT_MODEL. Got: {result!r}"
+        )
+
+    def test_explicit_model_equals_default_beats_auto_routing(self):
+        """Explicit --model DEFAULT_MODEL must win over auto_model_routing.
+
+        If --model opus is passed but opus == DEFAULT_MODEL, the old sentinel
+        equality check silently dropped the override and auto-routing ran instead,
+        potentially returning a cheaper model (e.g. haiku for a trivial task).
+        """
+        from equipa.roles import get_role_model
+        from equipa.constants import DEFAULT_MODEL
+
+        args = FakeArgs(model=DEFAULT_MODEL)
+        # trivial task — without the fix, auto-routing would pick haiku/sonnet
+        config = {"features": {"auto_model_routing": True}}
+        task = {"id": 2, "description": "fix typo", "title": "typo", "complexity": "medium"}
+
+        result = get_role_model("developer", args, config=config, task=task)
+
+        assert result == DEFAULT_MODEL, (
+            f"Explicit --model={DEFAULT_MODEL!r} must win over auto_model_routing even "
+            f"when its value equals DEFAULT_MODEL. Got: {result!r}"
         )
 
     def test_explicit_model_non_default_honored(self):
-        """--model with a value different from DEFAULT_MODEL must still be honored."""
-        args = FakeArgs(model="claude-sonnet-4-6")
-        features = {"auto_model_routing": False}
-        dispatch_config = {}
-        result = resolve_model_for_role(
-            role="developer",
-            complexity="epic",
-            args=args,
-            features=features,
-            dispatch_config=dispatch_config,
-        )
-        assert result == "claude-sonnet-4-6"
+        """--model with a value different from DEFAULT_MODEL must be honored."""
+        from equipa.roles import get_role_model
+        from equipa.constants import DEFAULT_MODEL
 
-    def test_no_explicit_model_uses_config_or_default(self):
-        """When --model is not passed (None sentinel), fall through to config/default."""
-        args = FakeArgs(model=None)
-        features = {"auto_model_routing": False}
-        dispatch_config = {}
-        result = resolve_model_for_role(
-            role="developer",
-            complexity="epic",
-            args=args,
-            features=features,
-            dispatch_config=dispatch_config,
-        )
-        # Should not raise; result is determined by config/defaults
-        assert result is not None
+        other_model = "claude-sonnet-4-6" if DEFAULT_MODEL != "claude-sonnet-4-6" else "claude-opus-4-8"
+        args = FakeArgs(model=other_model)
+        config = {"features": {"auto_model_routing": False}}
+        task = {"id": 3, "description": "implement complex system", "title": "Complex", "complexity": "epic"}
 
-    def test_no_explicit_model_with_auto_routing_off_uses_role_config(self):
-        """When --model is None and auto_model_routing is off, per-role config wins."""
-        args = FakeArgs(model=None)
-        features = {"auto_model_routing": False}
-        dispatch_config = {
-            "model_epic": "claude-opus-4-8",
-        }
-        result = resolve_model_for_role(
-            role="developer",
-            complexity="epic",
-            args=args,
-            features=features,
-            dispatch_config=dispatch_config,
-        )
-        assert result == "claude-opus-4-8", (
-            f"Per-complexity config 'model_epic=claude-opus-4-8' must win when "
-            f"auto_model_routing is off and no explicit --model given. Got: {result!r}"
-        )
+        result = get_role_model("developer", args, config=config, task=task)
+        assert result == other_model
+
+    def test_no_explicit_model_falls_through(self):
+        """When --model is not passed (None sentinel), fall through to config/defaults."""
+        from equipa.roles import get_role_model
+
+        args = FakeArgs(model=None)  # None = not passed by user
+        config = {"features": {"auto_model_routing": False}}
+        task = {"id": 4, "description": "fix typo", "title": "typo", "complexity": "medium"}
+
+        result = get_role_model("developer", args, config=config, task=task)
+        assert result is not None  # should get DEFAULT_ROLE_MODELS or config value
 
 
 class TestAutoRoutingPrecedence:
-    """auto_model_routing must NOT override explicit --model or per-complexity config."""
+    """Explicit config must win over auto_model_routing."""
 
-    def test_explicit_model_beats_auto_routing(self):
-        """--model must win over auto_model_routing complexity scoring."""
-        args = FakeArgs(model="claude-opus-4-8")
-        features = {"auto_model_routing": True}
-        dispatch_config = {}
-        # auto_model_routing is on, but explicit --model was given
-        result = resolve_model_for_role(
-            role="developer",
-            complexity="simple",
-            args=args,
-            features=features,
-            dispatch_config=dispatch_config,
-        )
+    def test_per_complexity_config_beats_auto_routing(self):
+        """When auto_model_routing is ON, explicit model_<complexity> config wins.
+
+        This is the task-2610 bug 2 scenario: operator set model_epic=opus but
+        auto_model_routing was routing epic tasks to sonnet/haiku via circuit-
+        breaker fallback. Per-complexity config is checked BEFORE auto-routing.
+        """
+        from equipa.roles import get_role_model
+
+        args = FakeArgs(model=None)
+        config = {
+            "features": {"auto_model_routing": True},
+            "model_epic": "claude-opus-4-8",
+        }
+        task = {"id": 5, "description": "implement a large epic feature", "title": "Epic", "complexity": "epic"}
+
+        result = get_role_model("developer", args, config=config, task=task)
+
         assert result == "claude-opus-4-8", (
-            "Explicit --model must win over auto_model_routing complexity scoring. "
+            "Per-complexity config model_epic must win over auto_model_routing. "
             f"Got: {result!r}"
         )
 
-    def test_per_complexity_config_beats_auto_routing_when_disabled(self):
-        """When auto_model_routing is off, per-complexity config must be used."""
+    def test_per_complexity_config_honored_when_auto_routing_off(self):
+        """When auto_model_routing is OFF, per-complexity config is used directly.
+
+        This directly tests the requirement: 'config-model honored when auto_model_routing off'.
+        """
+        from equipa.roles import get_role_model
+
         args = FakeArgs(model=None)
-        features = {"auto_model_routing": False}
-        dispatch_config = {
+        config = {
+            "features": {"auto_model_routing": False},
             "model_epic": "claude-opus-4-8",
         }
-        result = resolve_model_for_role(
-            role="developer",
-            complexity="epic",
-            args=args,
-            features=features,
-            dispatch_config=dispatch_config,
+        task = {"id": 6, "description": "implement an epic system", "title": "Epic", "complexity": "epic"}
+
+        result = get_role_model("developer", args, config=config, task=task)
+
+        assert result == "claude-opus-4-8", (
+            "Per-complexity config model_epic must be used when auto_model_routing is off. "
+            f"Got: {result!r}"
         )
-        assert result == "claude-opus-4-8"
 
-    def test_auto_routing_used_when_no_explicit_override(self):
-        """When auto_model_routing is on and no explicit --model or config, routing runs."""
+    def test_per_role_config_honored_when_auto_routing_off(self):
+        """Per-role config (model_developer) is used when auto_routing is off."""
+        from equipa.roles import get_role_model
+
         args = FakeArgs(model=None)
-        features = {"auto_model_routing": True}
-        dispatch_config = {}
-        mock_model = "claude-sonnet-4-6"
+        config = {
+            "features": {"auto_model_routing": False},
+            "model_developer": "claude-opus-4-8",
+        }
+        task = {"id": 7, "description": "fix a small bug", "title": "Fix", "complexity": "medium"}
 
-        with patch("equipa.roles.auto_select_model", return_value=mock_model):
-            result = resolve_model_for_role(
-                role="developer",
-                complexity="simple",
-                args=args,
-                features=features,
-                dispatch_config=dispatch_config,
-            )
-        assert result == mock_model
+        result = get_role_model("developer", args, config=config, task=task)
+
+        assert result == "claude-opus-4-8", (
+            "Per-role config model_developer must be used when auto_model_routing is off. "
+            f"Got: {result!r}"
+        )
+
+    def test_per_complexity_config_has_higher_priority_than_cli(self):
+        """Per-complexity config (priority 1) outranks CLI --model (priority 3).
+
+        Documents the existing priority order: dispatch_config model_<complexity>
+        wins over CLI --model. This is intentional — the operator-configured
+        dispatch profile takes precedence over ad-hoc CLI overrides.
+        """
+        from equipa.roles import get_role_model
+
+        args = FakeArgs(model="claude-sonnet-4-6")
+        config = {
+            "features": {"auto_model_routing": False},
+            "model_epic": "claude-opus-4-8",
+        }
+        task = {"id": 8, "description": "implement epic feature", "title": "Epic", "complexity": "epic"}
+
+        result = get_role_model("developer", args, config=config, task=task)
+
+        # model_epic wins: per-complexity config is priority 1, CLI --model is priority 3.
+        assert result == "claude-opus-4-8", (
+            "Per-complexity config (priority 1) must outrank CLI --model (priority 3). "
+            f"Got: {result!r}"
+        )

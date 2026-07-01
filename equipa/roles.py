@@ -9,8 +9,11 @@ Copyright 2026 Forgeborn
 
 from __future__ import annotations
 
+import logging
 import equipa.constants as _equipa_constants
 from equipa.config import is_feature_enabled
+
+logger = logging.getLogger(__name__)
 from equipa.constants import (
     COMPLEXITY_MULTIPLIERS,
     COST_ESTIMATE_PER_TURN,
@@ -124,23 +127,32 @@ def get_role_model(
         complexity = get_task_complexity(task)
         complexity_key = f"model_{complexity}"
         if complexity_key in effective_config:
-            return effective_config[complexity_key]
+            model = effective_config[complexity_key]
+            logger.info("model: %s (source=dispatch_config[%s], role=%s)", model, complexity_key, role)
+            return model
 
     if effective_config:
         # Check role-based model override
         role_key = role.replace("-", "_")
         role_model_key = f"model_{role_key}"
         if role_model_key in effective_config:
-            return effective_config[role_model_key]
+            model = effective_config[role_model_key]
+            logger.info("model: %s (source=dispatch_config[%s])", model, role_model_key)
+            return model
 
-    # CLI override
-    cli_model = getattr(args, "model", DEFAULT_MODEL)
-    if cli_model != DEFAULT_MODEL:
+    # CLI override — use None sentinel so --model DEFAULT_MODEL is honored,
+    # not silently dropped by an equality check. argparse default is None (not
+    # DEFAULT_MODEL) so only an explicitly-passed --model sets a non-None value.
+    cli_model = getattr(args, "model", None)
+    if cli_model is not None:
+        logger.info("model: %s (source=--model CLI flag, role=%s)", cli_model, role)
         return cli_model
 
     # Config global model
     if effective_config and "model" in effective_config:
-        return effective_config["model"]
+        model = effective_config["model"]
+        logger.info("model: %s (source=dispatch_config[model], role=%s)", model, role)
+        return model
 
     # Priority 6: Auto-routing (late import, gated by feature flag)
     #
@@ -161,6 +173,7 @@ def get_role_model(
         from equipa.routing import CircuitOpenError, auto_select_model
         routed_model = auto_select_model(task, effective_config)
         if routed_model:
+            logger.info("model: %s (source=auto_model_routing, role=%s)", routed_model, role)
             return routed_model
         raise CircuitOpenError(role=role, tier_attempted="haiku")
 
@@ -169,8 +182,11 @@ def get_role_model(
     # without a base constants.py edit.
     rc = _resolve_role_cfg(role, task)
     if rc and rc.model:
+        logger.info("model: %s (source=role_frontmatter, role=%s)", rc.model, role)
         return rc.model
-    return DEFAULT_ROLE_MODELS.get(role, DEFAULT_MODEL)
+    model = DEFAULT_ROLE_MODELS.get(role, DEFAULT_MODEL)
+    logger.info("model: %s (source=DEFAULT_ROLE_MODELS, role=%s)", model, role)
+    return model
 
 
 def _discover_roles() -> None:
