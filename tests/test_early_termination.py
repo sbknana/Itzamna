@@ -1388,8 +1388,15 @@ def test_paralysis_retry_2_first_read_not_killed():
         "retry 2 first Read should arm must_write_next_turn so the NEXT call must write"
 
 
-def test_paralysis_retry_1_first_read_allowed_arms_must_write():
-    """Retry == 1 + turn 1 + Read keeps the existing ONE-read allowance."""
+def test_paralysis_retry_1_first_read_is_no_op():
+    """Retry == 1 + turn 1 + Read is a NO-OP — gate only applies on retry >= 2.
+
+    First paralysis retry must not arm must_write_next_turn on the first read.
+    Hard design/wiring tasks legitimately need 3-4 reads before writing — task
+    #2611 evidence: CryptoTrader DataContext task, turns=2/400 on every retry.
+    Normal warn→final_warn→kill escalation (via effective_kill_turns) still
+    applies; only the instant 1-read clamp is disabled for retry == 1.
+    """
     from equipa.agent_runner import _evaluate_paralysis_retry_read_gate
 
     early_term, must_write = _evaluate_paralysis_retry_read_gate(
@@ -1400,7 +1407,31 @@ def test_paralysis_retry_1_first_read_allowed_arms_must_write():
         must_write_next_turn=False,
     )
     assert early_term is None
-    assert must_write is True
+    assert must_write is False  # gate bypassed on first retry — agent can read more
+
+
+def test_paralysis_retry_1_multiple_reads_not_killed():
+    """Hard task that reads 4 files on retry==1 must NOT be gated out on any read.
+
+    Task #2611: before fix, turns 1-Read armed must_write (1 read allowed),
+    turn 2-Read killed. A novel-wiring task dies at turn 2 of a 400-turn budget.
+    After fix: retry==1 gate is a no-op; agent can read up to effective_kill_turns.
+    """
+    from equipa.agent_runner import _evaluate_paralysis_retry_read_gate
+
+    must_write = False
+    for turn in range(1, 5):
+        early_term, must_write = _evaluate_paralysis_retry_read_gate(
+            paralysis_retry_count=1,
+            turn_count=turn,
+            tool_name="Read",
+            has_any_file_change=False,
+            must_write_next_turn=must_write,
+        )
+        assert early_term is None, \
+            f"retry==1 read on turn {turn} must not kill (gate is no-op)"
+        assert must_write is False, \
+            f"retry==1 read on turn {turn} must not arm must_write_next_turn"
 
 
 def test_paralysis_retry_0_no_op():
@@ -1553,7 +1584,8 @@ def main():
         test_git_diff_non_git_directory,
         # Paralysis retry read gate tests
         test_paralysis_retry_2_first_read_not_killed,
-        test_paralysis_retry_1_first_read_allowed_arms_must_write,
+        test_paralysis_retry_1_first_read_is_no_op,
+        test_paralysis_retry_1_multiple_reads_not_killed,
         test_paralysis_retry_0_no_op,
         test_paralysis_retry_write_tool_no_op,
         test_paralysis_retry_after_file_change_no_op,

@@ -491,7 +491,12 @@ def test_paralysis_cap_skipped_when_files_accumulated():
 # ---------------------------------------------------------------------------
 
 def test_evaluate_paralysis_retry_read_gate_turn1_allowed():
-    """On paralysis retry, turn-1 read is still allowed (arms must_write_next_turn)."""
+    """On first paralysis retry (retry_count==1), turn-1 read is a no-op (task #2611).
+
+    The gate (1-read-then-die) only fires on the SECOND paralysis retry and
+    beyond. First retry allows multiple reads via normal warn→kill escalation so
+    hard design tasks can read 3-4 files before their first write.
+    """
     term_reason, new_must_write = _evaluate_paralysis_retry_read_gate(
         paralysis_retry_count=1,
         turn_count=1,
@@ -499,8 +504,10 @@ def test_evaluate_paralysis_retry_read_gate_turn1_allowed():
         has_any_file_change=False,
         must_write_next_turn=False,
     )
-    assert term_reason is None, "Should not kill on turn-1 read on paralysis retry"
-    assert new_must_write is True, "Should arm must_write_next_turn after turn-1 read"
+    assert term_reason is None, "Should not kill on turn-1 read on first paralysis retry"
+    # Task #2611: gate is a no-op on retry==1 so hard tasks can read 3-4 files.
+    # Gate only fires on retry >= 2 (arms must_write_next_turn = True on second retry).
+    assert new_must_write is False, "retry==1 should NOT arm must_write_next_turn (gate bypass)"
 
 
 # ---------------------------------------------------------------------------

@@ -410,18 +410,27 @@ def _evaluate_paralysis_retry_read_gate(
     Behavior:
         * Not on a paralysis retry, agent already wrote, or tool is not read-only
           → no-op (None, must_write_next_turn unchanged).
-        * On paralysis retry >= 1 with a read-only tool on turn 1 (and we have
-          not already armed must_write_next_turn) → allow ONE read and arm
-          must_write_next_turn so the NEXT call must be Edit/Write or the agent
-          dies on the regular paralysis path.
+        * On the FIRST paralysis retry (retry_count == 1) → no-op. The agent
+          still has a reduced ``effective_kill_turns`` budget and normal
+          warn/final-warn/kill escalation, but it can read 3-4 files before
+          writing. Legitimately hard design tasks (novel wiring seams, DataContext
+          injection, etc.) need multiple reads before they can produce a correct
+          first edit — clamping to 1 read on the first retry killed them before
+          they could start (task #2611 evidence: turns=2/400, PID 343414).
+        * On the SECOND paralysis retry and beyond (retry_count >= 2) with a
+          read-only tool on turn 1 (and we have not already armed
+          must_write_next_turn) → allow ONE read and arm must_write_next_turn
+          so the NEXT call must be Edit/Write or the agent dies on the regular
+          paralysis path.
 
     The pre-2026-05-03 behavior killed instantly on retry >= 2 even on turn 1.
     That made refactor tasks unsatisfiable: after a paralysis kill the agent
     has zero forward-context (soft_checkpoint only stores the file list at
     kill time, not file contents) and must read at least one file to know what
     to edit. Forbidding all reads guaranteed a kill loop. The single-read
-    allowance is preserved by the regular FAST_ESCALATION + must_write logic
-    that fires on the very next call.
+    allowance on retry >= 2 is preserved by the regular FAST_ESCALATION +
+    must_write logic. The 30-min wall-clock cap and PARALYSIS_CYCLE_HARD_CAP
+    remain as the true-wedge backstop for agents that never write (task #2604).
 
     Args:
         paralysis_retry_count: 0 on the first attempt, 1+ after each paralysis
@@ -435,7 +444,11 @@ def _evaluate_paralysis_retry_read_gate(
         Tuple of (early_term_reason, must_write_next_turn). early_term_reason
         is always None now — the prior kill branch was unsatisfiable.
     """
-    if paralysis_retry_count <= 0 or has_any_file_change:
+    # Gate is inactive on the first attempt (retry_count == 0) and the first
+    # paralysis retry (retry_count == 1). First retry gets reduced kill
+    # threshold via effective_kill_turns but no instant 1-read clamp — hard
+    # tasks need multiple reads before they can write (task #2611).
+    if paralysis_retry_count <= 1 or has_any_file_change:
         return None, must_write_next_turn
     if tool_name not in ("Read", "Grep", "Glob", "Agent"):
         return None, must_write_next_turn
