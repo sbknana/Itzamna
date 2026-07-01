@@ -130,6 +130,16 @@ TESTER_COMPACTION_THRESHOLD = 6  # turns before compacting tester
 NO_PROGRESS_LIMIT = 2            # consecutive no-change runs before blocking
 MAX_CONTINUATIONS = 3            # auto-retries when developer runs out of turns/timeout
 
+# Task #2604 wedge fix: hard caps for the FINAL-WARNING → kill → retry loop.
+# Without these, an agent can spin for MAX_DEV_TEST_CYCLES × agent_duration
+# (observed: 50 min, PID 343414, task #2602) with zero commits.
+# PARALYSIS_CYCLE_HARD_CAP: max consecutive paralysis-killed cycles before
+# the loop bails out as "no_progress" instead of spawning yet another agent.
+# WEDGE_WALL_CLOCK_CAP_SECS: absolute wall-clock ceiling for the dev-test
+# loop when no file changes have been produced across ALL cycles.
+PARALYSIS_CYCLE_HARD_CAP: int = 3      # bail after 3 back-to-back paralysis cycles
+WEDGE_WALL_CLOCK_CAP_SECS: int = 1800  # 30-min wall-clock cap (no-progress only)
+
 # --- Early Termination ---
 
 # Detect stuck agents mid-run and kill before wasting turns
