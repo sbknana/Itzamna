@@ -777,6 +777,11 @@ async def _run_agent_streaming_impl(
     consecutive_text_only_turns = 0
     monologue_warning_injected = False
     all_text_chunks: list[str] = []
+    # Count read-only calls after the final warning (task #2604 wedge fix).
+    # One read is permitted — the agent may need to see current file contents
+    # before editing. Killing on the very first post-warning read created an
+    # unrecoverable FINAL_WARNING → kill → retry → FINAL_WARNING loop.
+    post_final_warning_reads = 0
     # Task #2242 Phase A3: accumulate framework stdout printed by bash/test
     # tool_result events so the downstream Phase-B grep can see what the
     # actual test runner reported (e.g. pytest's "= 3 skipped =" footer).
@@ -981,6 +986,7 @@ async def _run_agent_streaming_impl(
                         turns_without_file_change = 0
                         consecutive_readonly_tools = 0
                         must_write_next_turn = False  # Agent wrote — crisis averted
+                        post_final_warning_reads = 0  # Reset post-warning read counter
                     else:
                         turns_without_file_change += 1
                         # On paralysis retries (retry_count > 0), the prompt
@@ -1072,15 +1078,35 @@ async def _run_agent_streaming_impl(
                             write_tools = {"Edit", "Write", "NotebookEdit"}
                             if (must_write_next_turn
                                     and tool_name not in write_tools):
-                                early_term_reason = (
-                                    f"Agent terminated: received FINAL WARNING "
-                                    f"but next tool call was {tool_name} (read-only) "
-                                    f"instead of Edit/Write. "
-                                    f"{turns_without_file_change} turns without "
-                                    f"file changes — analysis paralysis"
-                                )
-                                log(f"  [EarlyTerm] KILLED (post-warning): "
-                                    f"{early_term_reason}", output)
+                                post_final_warning_reads += 1
+                                if post_final_warning_reads == 1:
+                                    # Allow ONE read-only call after the FINAL WARNING.
+                                    # The agent may need to see the current file before
+                                    # it can edit. Killing immediately here caused the
+                                    # task #2604 wedge: FINAL_WARNING → kill → retry →
+                                    # FINAL_WARNING loop (50 min, zero commits, PID 343414).
+                                    log(
+                                        f"  [EarlyTerm] POST-FINAL-WARNING read "
+                                        f"#{post_final_warning_reads}: {tool_name} "
+                                        f"after FINAL WARNING. ONE read permitted — "
+                                        f"next call MUST be Edit/Write or you die.",
+                                        output,
+                                    )
+                                else:
+                                    early_term_reason = (
+                                        f"Agent terminated: received FINAL WARNING "
+                                        f"but made {post_final_warning_reads} "
+                                        f"consecutive read-only calls (last: {tool_name}) "
+                                        f"instead of Edit/Write. "
+                                        f"{turns_without_file_change} turns without "
+                                        f"file changes — analysis paralysis"
+                                    )
+                                    log(
+                                        f"  [EarlyTerm] KILLED (post-warning, "
+                                        f"{post_final_warning_reads}x read): "
+                                        f"{early_term_reason}",
+                                        output,
+                                    )
 
                             if (turns_without_file_change >= effective_warn_turns
                                     and not warning_injected):
@@ -1565,6 +1591,20 @@ async def run_agent_streaming_with_retry(
         stderr_text = " ".join(result.get("errors", []))
         stdout_text = result.get("result_text", "")
         last_error = stderr_text[:200] if stderr_text else stdout_text[:200]
+
+        # Non-retryable: analysis paralysis kills must fail fast, not retry.
+        # Retrying after a paralysis kill restarts the exact same pattern
+        # (agent reads → FINAL WARNING → reads again → kill → retry → ...)
+        # and burns API cost for 10 attempts before giving up (task #2604 wedge).
+        if result.get("early_terminated"):
+            term_reason = result.get("early_term_reason", "")
+            if (
+                "analysis paralysis" in term_reason
+                or "without file changes" in term_reason
+                or "read-only" in term_reason
+                or "reading ratio" in term_reason
+            ):
+                return result
 
         # Check for 529/overloaded errors
         if is_overloaded_error(stderr_text, stdout_text):

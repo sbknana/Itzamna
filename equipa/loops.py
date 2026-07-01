@@ -42,8 +42,10 @@ from equipa.constants import (
     MAX_CONTINUATIONS,
     MAX_DEV_TEST_CYCLES,
     NO_PROGRESS_LIMIT,
+    PARALYSIS_CYCLE_HARD_CAP,
     SECURITY_SEVERITY_PATTERNS,
     TESTER_GIT_DIFF_MAX_CHARS,
+    WEDGE_WALL_CLOCK_CAP_SECS,
 )
 from equipa.db import (
     _get_latest_agent_run_id,
@@ -1654,6 +1656,10 @@ class DevTestState:
     last_error_type: str | None = None
     dev_run_config: dict[str, Any] = field(default_factory=dict)
     loop_detector: LoopDetector = field(default_factory=LoopDetector)
+    # Task #2604: track consecutive analysis-paralysis-killed cycles so the
+    # PARALYSIS_CYCLE_HARD_CAP can bail out fast instead of spinning for
+    # MAX_DEV_TEST_CYCLES iterations (observed: 50 min, PID 343414).
+    consecutive_paralysis_cycles: int = 0
 
     def record_progress(self, files_changed: list[str], dev_turns_used: int) -> bool:
         """Apply the loop's progress rule and update accumulated_files.
@@ -1813,6 +1819,10 @@ async def run_dev_test_loop(
     tester_result: dict[str, Any] = {}
     dev_result: dict[str, Any] = {}
 
+    # Task #2604: record the loop start time so the wall-clock wedge cap can
+    # bail out when the loop has been running too long with zero file changes.
+    loop_start_time = time.time()
+
     # Track the HEAD SHA at the end of each cycle so the next cycle's tester
     # diff only includes that cycle's developer changes. Without this, every
     # cycle pays the prompt-bloat tax of all prior cycles' diffs (TheForge
@@ -1935,7 +1945,55 @@ async def run_dev_test_loop(
                 if _handle_paralysis_retry(
                     reason, cycle, state.compaction_history, state.dev_run_config, output
                 ):
+                    state.consecutive_paralysis_cycles += 1
+
+                    # Task #2604 HARD CAP #1: too many consecutive paralysis cycles.
+                    # Without this cap, the loop spins MAX_DEV_TEST_CYCLES times
+                    # (observed: 5 cycles × ~10 min = 50 min, PID 343414, zero commits).
+                    if state.consecutive_paralysis_cycles >= PARALYSIS_CYCLE_HARD_CAP:
+                        log(
+                            f"  [WedgeCap] HARD STOP (cycle {cycle}): "
+                            f"{state.consecutive_paralysis_cycles} consecutive "
+                            f"analysis-paralysis cycles with no file changes. "
+                            f"Failing fast to prevent further cost burn (task #2604).",
+                            output,
+                        )
+                        dev_result["early_terminated"] = True
+                        dev_result["early_term_reason"] = (
+                            f"analysis_paralysis_exhausted: "
+                            f"{state.consecutive_paralysis_cycles} consecutive "
+                            f"paralysis cycles with no commits"
+                        )
+                        return dev_result, cycle, "no_progress"
+
+                    # Task #2604 HARD CAP #2: wall-clock ceiling for the no-progress case.
+                    # Even within the paralysis-cycle cap, an extremely slow agent
+                    # (e.g. hitting 600s readline timeout per cycle) can still burn
+                    # PARALYSIS_CYCLE_HARD_CAP × timeout seconds before this fires.
+                    elapsed_loop = time.time() - loop_start_time
+                    if (
+                        elapsed_loop > WEDGE_WALL_CLOCK_CAP_SECS
+                        and not state.accumulated_files
+                    ):
+                        log(
+                            f"  [WedgeCap] HARD STOP (wall-clock): "
+                            f"{elapsed_loop / 60:.1f} min elapsed with zero file changes. "
+                            f"Cap is {WEDGE_WALL_CLOCK_CAP_SECS / 60:.0f} min. "
+                            f"Marking no_progress (task #2604).",
+                            output,
+                        )
+                        dev_result["early_terminated"] = True
+                        dev_result["early_term_reason"] = (
+                            f"wedge_wall_clock_cap: "
+                            f"{elapsed_loop / 60:.1f} min elapsed, "
+                            f"no file changes across {cycle} cycle(s)"
+                        )
+                        return dev_result, cycle, "no_progress"
+
                     continue
+
+                # Non-paralysis early termination: reset paralysis cycle counter.
+                state.consecutive_paralysis_cycles = 0
 
                 return dev_result, cycle, "early_terminated"
 
