@@ -1368,6 +1368,102 @@ class TestDeveloperLoosens:
         result = check_bash_command('bash -c "real_cmd\n# malicious"')
         assert not result.safe
 
+    # --- Bug 2603: path-qualified python (venv/bin) false-positives ---
+    # Exact commands that hard-killed CryptoTrader dispatches on 2026-06-30/07-01
+    # (tasks #2596 x2, #2601, #2602).
+
+    def test_venv_bin_python_c_with_inline_hash_comment_dot_slash(
+        self,
+    ) -> None:
+        """Bug 2603: ``timeout N ./venv/bin/python -c`` with a ``# comment``
+        inside the Python body must NOT be blocked. The ``./`` prefix caused
+        check 23 to miss the safe-interpreter allowlist. (task #2596 exact
+        reproduction.)"""
+        cmd = (
+            'timeout 30 ./venv/bin/python -c "\n'
+            "import asyncio, httpx\n"
+            "\n"
+            "async def probe():\n"
+            "    # 1. Probe REST endpoint\n"
+            '    async with httpx.AsyncClient() as c:\n'
+            '        r = await c.get("http://localhost:8000/health")\n'
+            "        print(r.status_code)\n"
+            "\n"
+            "asyncio.run(probe())\n"
+            '"'
+        )
+        result = check_bash_command(cmd)
+        assert result.safe, (
+            f"./venv/bin/python -c with # comment should pass check 23; "
+            f"got check_id={result.check_id} msg={result.message}"
+        )
+
+    def test_venv_bin_python_c_with_inline_hash_comment_no_dot_slash(
+        self,
+    ) -> None:
+        """Bug 2603: ``timeout N venv/bin/python -c`` (no leading ``./``) must
+        also pass. (tasks #2595-SR and #2602 exact reproduction.)"""
+        cmd = (
+            'timeout 20 venv/bin/python -c "\n'
+            "import sys\n"
+            "# verify version\n"
+            "print(sys.version)\n"
+            '"'
+        )
+        result = check_bash_command(cmd)
+        assert result.safe, (
+            f"venv/bin/python -c with # comment should pass check 23; "
+            f"got check_id={result.check_id} msg={result.message}"
+        )
+
+    def test_venv_bin_python3_c_with_inline_hash_comment(self) -> None:
+        """Bug 2603: ``timeout N venv/bin/python3 -c`` must pass. (task #2601
+        exact reproduction.)"""
+        cmd = (
+            'timeout 30 venv/bin/python3 -c "\n'
+            "import os\n"
+            "# check environment\n"
+            'print(os.environ.get("DATABASE_URL", "not set"))\n'
+            '"'
+        )
+        result = check_bash_command(cmd)
+        assert result.safe, (
+            f"venv/bin/python3 -c with # comment should pass check 23; "
+            f"got check_id={result.check_id} msg={result.message}"
+        )
+
+    def test_absolute_path_python_c_with_hash_comment(self) -> None:
+        """Absolute-path virtualenv ``/srv/app/venv/bin/python -c`` must also
+        pass — same reasoning as the relative-path forms."""
+        cmd = (
+            'timeout 60 /srv/app/venv/bin/python3 -c "\n'
+            "import json\n"
+            "# load config\n"
+            'data = json.load(open("config.json"))\n'
+            "print(data)\n"
+            '"'
+        )
+        result = check_bash_command(cmd)
+        assert result.safe, (
+            f"/path/to/python -c with # comment should pass check 23; "
+            f"got check_id={result.check_id} msg={result.message}"
+        )
+
+    def test_bash_c_path_qualified_still_blocked(self) -> None:
+        """Regression: path-qualified SHELL interpreters (``/bin/bash -c``)
+        must still be blocked — the check-23 allowlist intentionally excludes
+        shell interpreters where ``#`` IS the comment-smuggling primitive."""
+        result = check_bash_command('/bin/bash -c "real\n# evil"')
+        assert not result.safe
+        assert result.check_id == CheckID.QUOTED_NEWLINE
+
+    def test_venv_bin_sh_still_blocked(self) -> None:
+        """``venv/bin/sh -c`` (a shell, not a script language) must still be
+        blocked — the safe-interpreter allowlist excludes shells."""
+        result = check_bash_command('venv/bin/sh -c "real\n# evil"')
+        assert not result.safe
+        assert result.check_id == CheckID.QUOTED_NEWLINE
+
     # ---- Confirm loosens did not weaken bash_security's prompt-injection checks ---- #
 
     @pytest.mark.parametrize("cmd", [

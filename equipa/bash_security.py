@@ -1336,8 +1336,16 @@ def _check_control_characters(command: str) -> BashSecurityResult:
 # comment character (Python/Perl/Ruby/JS), not a shell-comment smuggling
 # primitive. Note: bash/sh/zsh are intentionally EXCLUDED — for those, the
 # quoted body IS shell input and '# evil' really can hide arguments.
+#
+# The optional path prefix ``(?:[^\s]*/)?`` allows virtualenv / path-qualified
+# forms like ``./venv/bin/python``, ``venv/bin/python3``, ``/usr/bin/python3``
+# that agents commonly use when activating a project virtualenv. The ``#``
+# inside such a ``-c`` body is the Python comment character — not a shell
+# comment smuggling primitive — so the check-23 block is a false positive
+# (bug 2603, tasks #2596 x2 / #2601 / #2602).
 _SAFE_SCRIPT_INTERPRETER_BEFORE_QUOTE_RE = re.compile(
     r"(?:^|[\s;&|`(])"
+    r"(?:[^\s]*/)?"
     r"(?:python|python2|python3|py|perl|ruby|node|nodejs)"
     r"\s+-(?:c|e)\s*$"
 )
@@ -1353,9 +1361,13 @@ _SAFE_SCRIPT_INTERPRETER_BEFORE_QUOTE_RE = re.compile(
 # The ``\n#`` smuggling primitive is still caught for shells by check 23
 # via ``_is_inside_safe_interpreter_arg`` (which intentionally excludes
 # the shells), so this looser list does not weaken that defense.
+#
+# The optional path prefix ``(?:[^\s]*/)?`` mirrors the same fix applied
+# to ``_SAFE_SCRIPT_INTERPRETER_BEFORE_QUOTE_RE`` — virtualenv forms like
+# ``./venv/bin/python3 -c`` must also pass the newline check (bug 2603).
 _QUOTED_ARG_INTERPRETER_BEFORE_QUOTE_RE = re.compile(
     r"(?:^|[\s;&|`(])"
-    r"(?:python|python2|python3|py|perl|ruby|node|nodejs|"
+    r"(?:[^\s]*/)?(?:python|python2|python3|py|perl|ruby|node|nodejs|"
     r"bash|sh|zsh|ksh|dash|fish|"
     r"psql|mysql|mariadb|sqlite|sqlite3|"
     r"awk|gawk|sed|"
