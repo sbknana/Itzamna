@@ -34,6 +34,14 @@ DEFAULT_FEATURE_FLAGS: dict[str, bool] = {
     "forgesmith_episodes": True,
     "gepa_ab_testing": False,
     "security_review": True,
+    # When True, agent_runner injects a Claude Code PreToolUse hook into the
+    # spawned CLI subprocess (via a generated --settings file) so that
+    # equipa.bash_security.check_bash_command runs BEFORE the Bash tool
+    # executes — genuine pre-execution blocking, not the reactive
+    # detect-and-terminate that the stream observer provides. DEFAULT FALSE:
+    # the reactive stream check (agent_runner.py, defense-in-depth) is always
+    # on; this flag only adds the true pre-execution gate on top. See task 2703.
+    "bash_security_pretooluse": False,
     # When True (default), a missing SECURITY-REVIEW-NNNN.md artifact after
     # the security-review agent runs is treated as a gate-blocking failure
     # (fail-closed). Set to False only if your workflow accepts the
