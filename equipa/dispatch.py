@@ -1827,6 +1827,14 @@ def _security_review_blocks_merge(
     same shape as the original 2321 vulnerability, narrower scope.
     Operators who need the legacy fail-open behaviour can disable the
     ``security_review_block_on_missing_artifact`` feature flag.
+
+    CAVEAT (task #2706): disabling that flag relaxes ONLY this policy layer.
+    For a non-doc (code) diff the unified gate derives ``expect_artifact=True``,
+    so the defensive invariant in :func:`_merge_task_branch` still re-reads the
+    artifact and fails closed on a missing one — the flag is effectively inert
+    for code diffs and only takes effect on doc-only / review-disabled paths
+    (where no artifact is expected). See ``decide_merge_gate`` for the full
+    layering note.
     """
     # Task 2476: read from .equipa-artifacts/ first, then fall back to
     # the legacy repo-root path so in-flight artifacts still parse.

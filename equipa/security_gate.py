@@ -119,6 +119,22 @@ def decide_merge_gate(
       * ``block_on_missing`` — the ``security_review_block_on_missing_
         artifact`` fail-open escape hatch (defaults fail-closed).
 
+    LAYERING NOTE (task #2706, resolves the cycle-1 tester's open question):
+    ``block_on_missing=False`` relaxes ONLY this policy layer — for a code diff
+    with a missing artifact it makes this function return
+    ``blocks_merge=False``. It does NOT relax the independent defensive
+    invariant in ``dispatch._merge_task_branch``: because a code diff yields
+    ``expect_artifact=True``, that invariant re-reads the artifact, finds it
+    missing, and raises ``SecurityGateBypassError`` regardless of the flag. So
+    for a code diff the fail-open flag is effectively INERT (the unified gate
+    stays strictly fail-closed on a missing artifact, satisfying the #2706
+    "never looser than today" constraint); the flag is only observable on the
+    ``expect_artifact=False`` paths (doc-only / review-disabled), where no
+    artifact is expected in the first place. This is intentional — documented,
+    not a code change — so an operator never mistakes it for a way to merge an
+    unreviewed code diff. See
+    ``test_block_on_missing_false_is_still_caught_by_defensive_invariant``.
+
     ``security_review_blocks_merge`` is injected (rather than imported) so
     this leaf module stays free of a circular import on ``dispatch`` while
     the decision logic remains unit-testable in isolation. It must have the
