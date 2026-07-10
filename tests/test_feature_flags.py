@@ -83,6 +83,7 @@ class TestDefaultFeatureFlags(unittest.TestCase):
         "forgesmith_episodes": True,
         "gepa_ab_testing": False,
         "security_review": True,
+        "bash_security_pretooluse": False,
         "security_review_block_on_missing_artifact": True,
         "quality_scoring": True,
         "anti_compaction_state": True,
