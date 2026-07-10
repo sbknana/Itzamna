@@ -1,4 +1,8 @@
 name: Tests
+
+# Least-privilege token: the pytest step runs arbitrary repo code (SR-2699 S1).
+permissions:
+  contents: read
 on:
   push:
     branches: [main]
