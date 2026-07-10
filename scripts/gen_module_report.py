@@ -384,8 +384,10 @@ def generate_report(repo_root: Path) -> str:
         top_n = len(m.top_deps)
         late_n = len(m.late_deps)
         lines.append(f"| `{m.display}` | {top_n} | {late_n} | **{top_n + late_n}** |")
-    lines.append("")
 
+    # Exactly one trailing newline -> stable byte-for-byte diffing.
+    while lines and lines[-1] == "":
+        lines.pop()
     return "\n".join(lines) + "\n"
 
 

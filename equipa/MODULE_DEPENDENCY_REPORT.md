@@ -177,4 +177,3 @@ How many other `equipa` modules each module imports.
 | `tasks.py` | 2 | 0 | **2** |
 | `templates.py` | 1 | 2 | **3** |
 | `tool_result_storage.py` | 0 | 0 | **0** |
-
