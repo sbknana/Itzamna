@@ -1978,6 +1978,106 @@ def _check_comment_quote_desync(command: str) -> BashSecurityResult:
 
 
 # ---------------------------------------------------------------------------
+# Benign git-commit heredoc detection (task 2468)
+# ---------------------------------------------------------------------------
+
+# Heredoc opener with a QUOTED or backslash-escaped delimiter. Only these
+# forms suppress parameter/command expansion inside the body, making the
+# heredoc content inert literal text fed to the command's stdin. An unquoted
+# ``<<EOF`` is intentionally NOT matched here — expansions happen there, so it
+# must continue through the normal (blocking) checks.
+_GIT_HEREDOC_QUOTED_OPENER_RE = re.compile(
+    r"<<-?[ \t]*(?:'(?P<sq>[A-Za-z_][A-Za-z0-9_]*)'"
+    r'|"(?P<dq>[A-Za-z_][A-Za-z0-9_]*)"'
+    r"|\\(?P<bs>[A-Za-z_][A-Za-z0-9_]*))"
+)
+
+
+def _benign_git_heredoc_sanitized(command: str) -> str | None:
+    r"""Detect a canonical ``git commit`` fed by a quoted-delimiter heredoc and
+    return an equivalent command with the inert heredoc region removed.
+
+    Recognizes the shape::
+
+        [git <args> &&]* git commit <args> <<'DELIM'
+        ...literal message body...
+        DELIM
+
+    A single-quoted, double-quoted, or backslash-escaped heredoc delimiter
+    suppresses ALL shell expansion in the body, so the body is literal text
+    piped to ``git``'s stdin — it cannot separate shell commands, redirect
+    files, or smuggle comments. Checks 7/9/10/21/23 therefore false-positive
+    on ordinary prose in the body (``count < limit``, ``\;``, ``# Notes``),
+    which repeatedly burned dev-agent turns (task 2468, observed during the
+    2464 dispatch).
+
+    When the shape matches, the heredoc opener + body + closing delimiter are
+    stripped and the remaining pure-``git`` command line is returned so the
+    caller can re-validate it through the normal pipeline (catching any
+    injection in the git arguments themselves, e.g.
+    ``git commit -F - > ~/.bashrc``). Returns ``None`` when the command is not
+    this exact benign shape, in which case the normal checks apply unchanged.
+
+    Safety constraints (all required):
+      * The heredoc delimiter must be quoted or backslash-escaped (inert body).
+      * The command part before the heredoc must contain NO command
+        substitution (``$(`` / ``${`` / backtick / ``<(``) — this also cleanly
+        excludes the ``git commit -m "$(cat <<'EOF' ... )"`` substitution form,
+        which is already handled by checks 12/19.
+      * No shell-level ``;`` or ``|`` in the git command line (only ``&&``
+        chaining of git commands is allowed).
+      * Every ``&&``-separated segment before the heredoc must be a ``git``
+        command, and the final one must be ``git commit``.
+      * Nothing but whitespace may follow the closing delimiter line.
+    """
+    if "<<" not in command:
+        return None
+
+    opener = _GIT_HEREDOC_QUOTED_OPENER_RE.search(command)
+    if opener is None:
+        return None
+
+    prefix = command[: opener.start()]
+
+    # No command substitution in the git command line itself. This also
+    # excludes the `git commit -m "$(cat <<'EOF' ...)"` substitution form.
+    if re.search(r"\$\(|\$\{|`|<\(", prefix):
+        return None
+
+    # Only `&&`-chaining of git commands is permitted. Higher-risk `;`/`|`
+    # separators at the shell level bail to the normal pipeline.
+    if _has_shell_level_char(prefix, ";|"):
+        return None
+
+    segments = _split_command_segments(prefix)
+    if not segments:
+        return None
+    for seg in segments:
+        if _get_base_command(seg) != "git":
+            return None
+    if not re.match(r"^git\s+commit\b", segments[-1]):
+        return None
+
+    delim = opener.group("sq") or opener.group("dq") or opener.group("bs")
+    # The closing delimiter must appear on its own line (optionally
+    # tab/space-indented for the `<<-` form).
+    tail = command[opener.end():]
+    close = re.search(
+        r"\n[ \t]*" + re.escape(delim) + r"[ \t]*(?:\n|$)", tail,
+    )
+    if close is None:
+        return None
+
+    suffix = tail[close.end():]
+    if suffix.strip():
+        return None
+
+    # Rebuild with the inert heredoc removed; the remaining single-line git
+    # command is returned for normal re-validation by the caller.
+    return prefix.rstrip()
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -1992,6 +2092,14 @@ def check_bash_command(command: str) -> BashSecurityResult:
     """
     if not command or not command.strip():
         return _SAFE
+
+    # Canonical `git commit` fed by a quoted-delimiter heredoc: the body is
+    # inert literal text piped to git's stdin, so strip it and validate only
+    # the real git command line. Prevents checks 7/9/10/21/23 from
+    # false-positiving on ordinary prose in the commit body (task 2468).
+    sanitized = _benign_git_heredoc_sanitized(command)
+    if sanitized is not None:
+        command = sanitized
 
     base_cmd = _get_base_command(command)
     unquoted = _extract_unquoted(command)
