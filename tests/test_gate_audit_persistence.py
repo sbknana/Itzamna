@@ -20,6 +20,8 @@ Copyright 2026 Forgeborn
 from __future__ import annotations
 
 import sqlite3
+import subprocess
+import sys
 
 import pytest
 
@@ -197,3 +199,122 @@ class TestStderrUnchanged:
 
 def captured_err_has_prefix(capsys) -> bool:
     return capsys.readouterr().err.startswith("[GATE-AUDIT] ")
+
+
+class TestLogGateAuditHelper:
+    """Direct tests of ``db.log_gate_audit`` — the new persistence boundary and
+    the primary file of task #2702 — exercised WITHOUT routing through
+    ``_gate_audit_log`` so column-mapping and fail-open behaviour are pinned at
+    the helper itself (the dispatch/cli circuit-breaker sites call it directly).
+    """
+
+    def test_helper_writes_full_column_mapping(self, tmp_forge_db):
+        message = "task=2702 event=merge-succeeded branch=forge-task-2702"
+        equipa_db.log_gate_audit(message, 2702, event="merge-succeeded")
+
+        rows = _rows(tmp_forge_db)
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["task_id"] == 2702
+        assert row["tool_name"] == "gate-audit"
+        assert row["role"] == "security-gate"
+        assert row["tool_input_preview"] == message
+        assert row["error_summary"] == "merge-succeeded"
+        assert row["cycle_number"] == 0
+        assert row["turn_number"] == 0
+        assert row["success"] == 1
+        # Columns that a gate event has no value for stay NULL, not defaulted.
+        assert row["run_id"] is None
+        assert row["error_type"] is None
+        assert row["duration_ms"] is None
+
+    def test_event_none_persists_null_error_summary(self, tmp_forge_db):
+        # event is optional; the None branch must store NULL, not the string.
+        equipa_db.log_gate_audit("task=2702 event=x", 2702, event=None)
+        rows = _rows(tmp_forge_db)
+        assert len(rows) == 1
+        assert rows[0]["error_summary"] is None
+
+    def test_long_event_tag_truncated_to_200_chars(self, tmp_forge_db):
+        # The helper slices event[:200] so an oversized tag never relies on
+        # silent DB truncation. SQLite would store the full string otherwise.
+        equipa_db.log_gate_audit("task=2702", 2702, event="e" * 500)
+        rows = _rows(tmp_forge_db)
+        assert len(rows) == 1
+        assert len(rows[0]["error_summary"]) == 200
+
+    def test_counts_kwarg_accepted_without_error(self, tmp_forge_db):
+        # counts is informational-only but must be accepted so callers can pass
+        # structured data; the row is still written.
+        equipa_db.log_gate_audit(
+            "task=2702 event=merge-skipped C=0 H=1", 2702,
+            event="merge-skipped", counts={"HIGH": 1},
+        )
+        assert len(_rows(tmp_forge_db)) == 1
+
+    def test_none_task_id_returns_none_and_writes_nothing(self, tmp_forge_db):
+        # task_id NOT NULL in agent_actions → an unattributable event is skipped
+        # rather than forced in with a bogus id.
+        assert equipa_db.log_gate_audit("no id token", None) is None
+        assert _rows(tmp_forge_db) == []
+
+
+class TestStructuredTaskIdPrecedence:
+    """The docstring promises the structured ``task_id`` param always wins over
+    a ``task=<n>`` token parsed from the message. Lock that ordering."""
+
+    def test_structured_task_id_overrides_message_token(self, tmp_forge_db):
+        # message embeds a DIFFERENT task token than the structured param.
+        security_gate._gate_audit_log(
+            "task=999 event=merge-succeeded", task_id=2702,
+            event="merge-succeeded",
+        )
+        rows = _rows(tmp_forge_db)
+        assert len(rows) == 1
+        assert rows[0]["task_id"] == 2702
+
+    def test_counts_flows_through_gate_audit_log(self, tmp_forge_db):
+        # The security-review-blocked call site (dispatch._gated_merge_task)
+        # passes counts through _gate_audit_log; verify the row still lands.
+        security_gate._gate_audit_log(
+            "task=2702 event=merge-skipped reason=security-review-blocked "
+            "C=0 H=2 M=0 L=0 I=0",
+            task_id=2702, event="merge-skipped", counts={"HIGH": 2},
+        )
+        rows = _rows(tmp_forge_db)
+        assert len(rows) == 1
+        assert rows[0]["error_summary"] == "merge-skipped"
+
+
+class TestLeafModuleImportGraph:
+    """Task #2702 requirement: ``security_gate`` is a leaf module, and importing
+    ``equipa.db`` (done lazily inside ``_gate_audit_log``) must NOT create a
+    circular import.
+
+    Run in a FRESH subprocess: an in-process test cannot catch an import cycle
+    once both modules are already cached in ``sys.modules``. Importing the leaf
+    module first is the order most likely to expose a cycle.
+    """
+
+    def test_security_gate_first_then_db_no_cycle(self):
+        from pathlib import Path
+
+        repo_root = Path(equipa_db.__file__).resolve().parent.parent
+        code = (
+            "import equipa.security_gate as sg\n"
+            "from equipa.db import log_gate_audit\n"
+            "assert callable(log_gate_audit)\n"
+            "assert callable(sg._gate_audit_log)\n"
+            "print('import-graph-ok')\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 0, (
+            f"import cycle / import failure:\n{result.stderr}"
+        )
+        assert "import-graph-ok" in result.stdout
