@@ -1,135 +1,180 @@
 # EQUIPA Module Dependency Report
 
-**Generated:** 2026-03-24
-**Task:** #1601
-**Modules analyzed:** 21 (equipa/ package)
+> **Auto-generated — do not edit by hand.**
+> Regenerate with `python scripts/gen_module_report.py`. The `docs-drift-check`
+> CI job fails if this file is stale (see `scripts/check_docs_drift.py`).
+
+**Modules analyzed:** 52 (equipa/ package, recursive)
 
 ## Summary
 
-The `equipa/` package contains 21 Python modules totaling **7,849 lines of code**. The dependency graph is 10 layers deep (L0–L9), with `constants.py` as the sole leaf module and `__init__.py` as the re-export hub at the top. Late (deferred) imports are used in 12 modules to break circular dependencies — no top-level circular imports exist.
+The `equipa/` package contains **52 Python modules** totaling **30,784 lines** of code across **11 dependency layers** (L0–L10). 27 module(s) use late (deferred) imports to break circular dependencies; there are no top-level circular imports.
 
 ## Module Dependency Table
 
-| Module | Lines | Layer | Imports From (equipa) | Public Exports |
-|---|---:|:---:|---|---|
-| `constants.py` | 209 | L0 | *(none)* | 49 constants |
-| `parsing.py` | 572 | L1 | constants | `CHARS_PER_TOKEN`, `SYSTEM_PROMPT_TOKEN_TARGET`, `SYSTEM_PROMPT_TOKEN_HARD_LIMIT`, `EPISODE_REDUCTION_THRESHOLD`, `estimate_tokens`, `compute_keyword_overlap`, `deduplicate_lessons`, `compact_agent_output`, `parse_reflection`, `parse_approach_summary`, `classify_agent_failure`, `parse_error_patterns`, `compute_initial_q_value`, `parse_tester_output`, `parse_developer_output`, `build_compaction_summary`, `build_test_failure_context`, `validate_output` (18) |
-| `security.py` | 121 | L1 | constants | `wrap_untrusted`, `generate_skill_manifest`, `write_skill_manifest`, `verify_skill_integrity` (4) |
-| `checkpoints.py` | 83 | L1 | constants | `save_checkpoint`, `load_checkpoint`, `clear_checkpoints` (3) |
-| `git_ops.py` | 368 | L1 | constants, tasks^late | `detect_project_language`, `check_gh_installed`, `setup_single_repo`, `setup_all_repos` (4) |
-| `db.py` | 415 | L1 | constants, output^late, tasks^late, prompts^late | `get_db_connection`, `ensure_schema`, `record_agent_run`, `classify_error`, `log_agent_action`, `bulk_log_agent_actions`, `update_task_status` (7) |
-| `tasks.py` | 273 | L2 | constants, db | `fetch_task`, `fetch_next_todo`, `fetch_project_context`, `fetch_project_info`, `fetch_tasks_by_ids`, `get_task_complexity`, `verify_task_updated`, `resolve_project_dir` (8) |
-| `monitoring.py` | 690 | L2 | constants, parsing^late | `LOOP_WARNING_THRESHOLD`, `LOOP_TERMINATE_THRESHOLD`, `LoopDetector`, `calculate_dynamic_budget`, `adjust_dynamic_budget` (5) |
-| `output.py` | 292 | L2 | constants, monitoring^late | `log`, `print_manager_summary`, `print_summary`, `print_dev_test_summary`, `print_parallel_summary`, `print_dispatch_summary`, `print_dispatch_plan` (7) |
-| `roles.py` | 165 | L2 | constants, tasks^late, output^late | `get_role_turns`, `get_role_model` (2) |
-| `messages.py` | 130 | L2 | db, security^late | `post_agent_message`, `read_agent_messages`, `mark_messages_read`, `format_messages_for_prompt` (4) |
-| `lessons.py` | 462 | L2 | constants, db, parsing, security^late, output^late | `format_lessons_for_injection`, `update_lesson_injection_count`, `get_relevant_episodes`, `format_episodes_for_injection`, `record_agent_episode`, `update_episode_injection_count`, `update_episode_q_values`, `update_injected_episode_q_values_for_task` (8) |
-| `prompts.py` | 494 | L3 | constants, lessons, parsing, security, git_ops^late, dispatch^late | `build_task_prompt`, `build_system_prompt`, `build_checkpoint_context`, `build_planner_prompt`, `build_evaluator_prompt` (5) |
-| `reflexion.py` | 144 | L3 | db, lessons, output, parsing, agent_runner^late | `REFLEXION_PROMPT`, `INITIAL_Q_VALUE`, `run_reflexion_agent`, `maybe_run_reflexion` (4) |
-| `agent_runner.py` | 662 | L4 | constants, db, monitoring, output, parsing, security, tasks, cli^late | `build_cli_command`, `run_agent`, `run_agent_streaming`, `run_agent_with_retries`, `dispatch_agent` (5) |
-| `preflight.py` | 307 | L4 | constants, output, agent_runner^late, prompts^late, roles^late | `auto_install_dependencies`, `preflight_build_check` (2) |
-| `loops.py` | 751 | L5 | agent_runner, checkpoints, constants, db, messages, monitoring, output, parsing, preflight, prompts, roles, tasks, dispatch^late | `run_quality_scoring`, `run_security_review`, `run_dev_test_loop` (3) |
-| `manager.py` | 310 | L6 | agent_runner, constants, db, loops, output, prompts, roles, tasks | `parse_planner_output`, `parse_evaluator_output`, `run_planner_agent`, `run_evaluator_agent`, `run_manager_loop` (5) |
-| `dispatch.py` | 981 | L7 | constants, db, git_ops, lessons, loops, manager, output, prompts, reflexion, roles, tasks | `DEFAULT_FEATURE_FLAGS`, `DEFAULT_DISPATCH_CONFIG`, `is_feature_enabled`, `load_dispatch_config`, `scan_pending_work`, `score_project`, `apply_dispatch_filters`, `run_project_tasks`, `run_project_dispatch`, `run_auto_dispatch`, `load_goals_file`, `validate_goals`, `run_single_goal`, `run_parallel_goals`, `parse_task_ids`, `run_parallel_tasks` (16) |
-| `cli.py` | 756 | L8 | constants, agent_runner, checkpoints, db, dispatch, git_ops, lessons, loops, manager, monitoring, output, parsing, prompts, reflexion, roles, security, tasks | `get_provider`, `get_ollama_model`, `get_ollama_base_url`, `load_config`, `async_main`, `main` (6) |
-| `__init__.py` | 527 | L9 | *(all 20 modules)* | 226 re-exported symbols |
+| Module | Lines | Layer | Imports (equipa) | Late Imports | Exports |
+|---|---:|:---:|---|---|---:|
+| `abort_controller.py` | 218 | L0 | — | — | 3 |
+| `bash_security.py` | 2209 | L0 | — | — | 4 |
+| `classifier.py` | 167 | L0 | — | — | 3 |
+| `constants.py` | 332 | L0 | — | — | 67 |
+| `env_loader.py` | 98 | L0 | — | — | 1 |
+| `heartbeat.py` | 855 | L0 | — | `config.py`, `config_versions.py`, `db.py`, `sessions.py` | 18 |
+| `hooks/classifier_retry.py` | 105 | L0 | — | — | 3 |
+| `hooks/dispatcher.py` | 151 | L0 | — | — | 5 |
+| `hooks/security_review_gate.py` | 94 | L0 | — | — | 4 |
+| `hooks/vacuous_pass.py` | 308 | L0 | — | `monitoring.py` | 3 |
+| `initiative.py` | 763 | L0 | — | `security.py` | 19 |
+| `integration_test.py` | 194 | L0 | — | `git_ops.py` | 5 |
+| `mcp_health.py` | 112 | L0 | — | — | 5 |
+| `plugins.py` | 69 | L0 | — | — | 3 |
+| `scaffold.py` | 633 | L0 | — | `db.py` | 8 |
+| `single_agent_guard.py` | 576 | L0 | — | `role_resolver.py` | 5 |
+| `tool_result_storage.py` | 247 | L0 | — | — | 15 |
+| `checkpoints.py` | 308 | L1 | `constants.py` | — | 8 |
+| `config.py` | 170 | L1 | `constants.py` | — | 5 |
+| `db.py` | 709 | L1 | `constants.py` | `output.py`, `prompts.py`, `tasks.py` | 12 |
+| `git_ops.py` | 870 | L1 | `constants.py` | `tasks.py` | 15 |
+| `hooks/__init__.py` | 427 | L1 | `hooks/dispatcher.py` | — | 17 |
+| `output.py` | 292 | L1 | `constants.py` | `monitoring.py` | 7 |
+| `parsing.py` | 908 | L1 | `constants.py` | `tool_result_storage.py` | 20 |
+| `role_resolver.py` | 181 | L1 | `constants.py` | — | 7 |
+| `routing.py` | 538 | L1 | `constants.py` | — | 27 |
+| `security.py` | 137 | L1 | `constants.py` | — | 4 |
+| `config_versions.py` | 480 | L2 | `constants.py`, `db.py` | — | 8 |
+| `embeddings.py` | 233 | L2 | `config.py`, `constants.py` | `db.py`, `graph.py` | 6 |
+| `flows.py` | 762 | L2 | `config.py`, `db.py` | `sessions.py` | 25 |
+| `graph.py` | 321 | L2 | `db.py` | — | 7 |
+| `initiative_runner.py` | 1367 | L2 | `initiative.py`, `security.py` | `db.py`, `dispatch.py`, `git_ops.py` | 29 |
+| `lessons.py` | 635 | L2 | `config.py`, `constants.py`, `db.py`, `parsing.py` | `embeddings.py`, `graph.py`, `output.py`, `security.py` | 10 |
+| `messages.py` | 124 | L2 | `db.py` | `security.py` | 4 |
+| `monitoring.py` | 922 | L2 | `constants.py`, `hooks/__init__.py` | `parsing.py` | 12 |
+| `rlm_decompose.py` | 687 | L2 | `output.py`, `parsing.py` | — | 20 |
+| `roles.py` | 252 | L2 | `config.py`, `constants.py` | `output.py`, `role_resolver.py`, `routing.py`, `tasks.py` | 3 |
+| `security_gate.py` | 375 | L2 | `git_ops.py` | `db.py` | 7 |
+| `sessions.py` | 335 | L2 | `checkpoints.py`, `db.py` | `agent_runner.py` | 7 |
+| `tasks.py` | 335 | L2 | `constants.py`, `db.py` | — | 8 |
+| `templates.py` | 943 | L2 | `db.py` | `constants.py`, `embeddings.py` | 8 |
+| `mcp_server.py` | 888 | L3 | `constants.py`, `tasks.py` | — | 12 |
+| `prompts.py` | 799 | L3 | `config.py`, `constants.py`, `lessons.py`, `parsing.py`, `security.py` | `db.py`, `git_ops.py`, `graph.py`, `initiative.py`, `role_resolver.py` | 8 |
+| `reflexion.py` | 143 | L3 | `db.py`, `lessons.py`, `output.py`, `parsing.py` | `agent_runner.py` | 4 |
+| `agent_runner.py` | 1952 | L4 | `abort_controller.py`, `bash_security.py`, `checkpoints.py`, `config.py`, `constants.py`, `db.py`, `monitoring.py`, `output.py`, `parsing.py`, `prompts.py`, `security.py`, `tasks.py` | `cli.py`, `git_ops.py`, `rlm_decompose.py`, `role_resolver.py` | 21 |
+| `preflight.py` | 311 | L5 | `agent_runner.py`, `constants.py`, `output.py` | `prompts.py`, `roles.py` | 2 |
+| `loops.py` | 2269 | L6 | `agent_runner.py`, `checkpoints.py`, `classifier.py`, `config.py`, `constants.py`, `db.py`, `git_ops.py`, `hooks/__init__.py`, `messages.py`, `monitoring.py`, `output.py`, `parsing.py`, `preflight.py`, `prompts.py`, `roles.py`, `sessions.py`, `tasks.py` | `role_resolver.py` | 11 |
+| `manager.py` | 312 | L7 | `agent_runner.py`, `constants.py`, `db.py`, `loops.py`, `output.py`, `prompts.py`, `roles.py`, `tasks.py` | — | 5 |
+| `dispatch.py` | 2520 | L8 | `config.py`, `constants.py`, `db.py`, `git_ops.py`, `hooks/__init__.py`, `lessons.py`, `loops.py`, `manager.py`, `output.py`, `parsing.py`, `prompts.py`, `reflexion.py`, `roles.py`, `routing.py`, `security_gate.py`, `single_agent_guard.py`, `tasks.py` | `flows.py`, `initiative.py`, `scaffold.py` | 15 |
+| `cli.py` | 2074 | L9 | `agent_runner.py`, `checkpoints.py`, `config.py`, `constants.py`, `db.py`, `dispatch.py`, `git_ops.py`, `hooks/__init__.py`, `lessons.py`, `loops.py`, `manager.py`, `mcp_server.py`, `monitoring.py`, `output.py`, `parsing.py`, `plugins.py`, `prompts.py`, `reflexion.py`, `roles.py`, `routing.py`, `security.py`, `security_gate.py`, `tasks.py`, `templates.py` | `config_versions.py`, `initiative_runner.py`, `role_resolver.py`, `scaffold.py`, `single_agent_guard.py` | 21 |
+| `__init__.py` | 58 | L10 | `cli.py`, `dispatch.py`, `loops.py`, `manager.py`, `mcp_server.py`, `monitoring.py`, `prompts.py` | — | 14 |
+| `__main__.py` | 16 | L10 | `cli.py` | — | 0 |
 
-**Total:** 7,849 lines | 170 public exports
+**Total:** 30,784 lines | 560 public exports
 
-## Dependency Layer Diagram
+## Modules by Layer
 
-```
-L9  __init__.py ──────────────────────── re-export hub (527 LOC)
-     │
-L8  cli.py ───────────────────────────── entry point (756 LOC)
-     │
-L7  dispatch.py ──────────────────────── orchestration dispatch (981 LOC)
-     │
-L6  manager.py ───────────────────────── planner/evaluator loop (310 LOC)
-     │
-L5  loops.py ─────────────────────────── dev-test / quality / security loops (751 LOC)
-     │
-L4  agent_runner.py, preflight.py ────── agent execution (662 + 307 = 969 LOC)
-     │
-L3  prompts.py, reflexion.py ─────────── prompt construction + RL (494 + 144 = 638 LOC)
-     │
-L2  tasks.py, monitoring.py, output.py,  data access + monitoring (2,012 LOC)
-     roles.py, messages.py, lessons.py
-     │
-L1  parsing.py, security.py,            leaf utilities (1,559 LOC)
-     checkpoints.py, git_ops.py, db.py
-     │
-L0  constants.py ─────────────────────── configuration (209 LOC)
-```
+Layer *N* is the longest chain of top-level (non-deferred) imports from a leaf module. Late imports are excluded so the graph stays acyclic.
 
-## Circular Import Analysis
-
-**No top-level circular imports exist.** The codebase uses late (deferred) imports inside functions to break 6 potential cycles:
-
-| Cycle | Broken By |
-|---|---|
-| `db.py` → `output.py` → `monitoring.py` → `parsing.py` | `db` uses late import of `output`, `tasks`, `prompts` |
-| `output.py` ↔ `monitoring.py` | `output` uses late import of `monitoring` |
-| `prompts.py` ↔ `dispatch.py` | `prompts` uses late import of `dispatch` |
-| `agent_runner.py` ↔ `cli.py` | `agent_runner` uses late import of `cli` |
-| `loops.py` ↔ `dispatch.py` | `loops` uses late import of `dispatch` |
-| `git_ops.py` → `tasks.py` → `db.py` | `git_ops` uses late import of `tasks` |
+- **L0**: `abort_controller.py`, `bash_security.py`, `classifier.py`, `constants.py`, `env_loader.py`, `heartbeat.py`, `hooks/classifier_retry.py`, `hooks/dispatcher.py`, `hooks/security_review_gate.py`, `hooks/vacuous_pass.py`, `initiative.py`, `integration_test.py`, `mcp_health.py`, `plugins.py`, `scaffold.py`, `single_agent_guard.py`, `tool_result_storage.py`
+- **L1**: `checkpoints.py`, `config.py`, `db.py`, `git_ops.py`, `hooks/__init__.py`, `output.py`, `parsing.py`, `role_resolver.py`, `routing.py`, `security.py`
+- **L2**: `config_versions.py`, `embeddings.py`, `flows.py`, `graph.py`, `initiative_runner.py`, `lessons.py`, `messages.py`, `monitoring.py`, `rlm_decompose.py`, `roles.py`, `security_gate.py`, `sessions.py`, `tasks.py`, `templates.py`
+- **L3**: `mcp_server.py`, `prompts.py`, `reflexion.py`
+- **L4**: `agent_runner.py`
+- **L5**: `preflight.py`
+- **L6**: `loops.py`
+- **L7**: `manager.py`
+- **L8**: `dispatch.py`
+- **L9**: `cli.py`
+- **L10**: `__init__.py`, `__main__.py`
 
 ## Late Import Inventory
 
-12 of 21 modules use late/deferred imports to avoid circular dependencies:
+27 module(s) defer intra-package imports inside function bodies to avoid import cycles:
 
 | Module | Late Imports |
 |---|---|
-| `db.py` | output, tasks, prompts |
-| `git_ops.py` | tasks |
-| `lessons.py` | security, output |
-| `monitoring.py` | parsing |
-| `output.py` | monitoring |
-| `roles.py` | tasks, output |
-| `messages.py` | security |
-| `prompts.py` | git_ops, dispatch |
-| `reflexion.py` | agent_runner |
-| `agent_runner.py` | cli |
-| `preflight.py` | agent_runner, prompts, roles |
-| `loops.py` | dispatch (×2) |
+| `agent_runner.py` | `cli.py`, `git_ops.py`, `rlm_decompose.py`, `role_resolver.py` |
+| `cli.py` | `config_versions.py`, `initiative_runner.py`, `role_resolver.py`, `scaffold.py`, `single_agent_guard.py` |
+| `db.py` | `output.py`, `prompts.py`, `tasks.py` |
+| `dispatch.py` | `flows.py`, `initiative.py`, `scaffold.py` |
+| `embeddings.py` | `db.py`, `graph.py` |
+| `flows.py` | `sessions.py` |
+| `git_ops.py` | `tasks.py` |
+| `heartbeat.py` | `config.py`, `config_versions.py`, `db.py`, `sessions.py` |
+| `hooks/vacuous_pass.py` | `monitoring.py` |
+| `initiative.py` | `security.py` |
+| `initiative_runner.py` | `db.py`, `dispatch.py`, `git_ops.py` |
+| `integration_test.py` | `git_ops.py` |
+| `lessons.py` | `embeddings.py`, `graph.py`, `output.py`, `security.py` |
+| `loops.py` | `role_resolver.py` |
+| `messages.py` | `security.py` |
+| `monitoring.py` | `parsing.py` |
+| `output.py` | `monitoring.py` |
+| `parsing.py` | `tool_result_storage.py` |
+| `preflight.py` | `prompts.py`, `roles.py` |
+| `prompts.py` | `db.py`, `git_ops.py`, `graph.py`, `initiative.py`, `role_resolver.py` |
+| `reflexion.py` | `agent_runner.py` |
+| `roles.py` | `output.py`, `role_resolver.py`, `routing.py`, `tasks.py` |
+| `scaffold.py` | `db.py` |
+| `security_gate.py` | `db.py` |
+| `sessions.py` | `agent_runner.py` |
+| `single_agent_guard.py` | `role_resolver.py` |
+| `templates.py` | `constants.py`, `embeddings.py` |
 
-## Import Count per Module (how many other equipa modules each imports)
+## Import Count per Module
+
+How many other `equipa` modules each module imports.
 
 | Module | Top-level | Late | Total |
 |---|---:|---:|---:|
-| `constants.py` | 0 | 0 | **0** |
-| `parsing.py` | 1 | 0 | **1** |
-| `security.py` | 1 | 0 | **1** |
+| `__init__.py` | 7 | 0 | **7** |
+| `__main__.py` | 1 | 0 | **1** |
+| `abort_controller.py` | 0 | 0 | **0** |
+| `agent_runner.py` | 12 | 4 | **16** |
+| `bash_security.py` | 0 | 0 | **0** |
 | `checkpoints.py` | 1 | 0 | **1** |
-| `git_ops.py` | 1 | 1 | **2** |
+| `classifier.py` | 0 | 0 | **0** |
+| `cli.py` | 24 | 5 | **29** |
+| `config.py` | 1 | 0 | **1** |
+| `config_versions.py` | 2 | 0 | **2** |
+| `constants.py` | 0 | 0 | **0** |
 | `db.py` | 1 | 3 | **4** |
-| `tasks.py` | 2 | 0 | **2** |
-| `monitoring.py` | 1 | 1 | **2** |
-| `output.py` | 1 | 1 | **2** |
-| `roles.py` | 1 | 2 | **3** |
-| `messages.py` | 1 | 1 | **2** |
-| `lessons.py` | 3 | 2 | **5** |
-| `prompts.py` | 4 | 2 | **6** |
-| `reflexion.py` | 4 | 1 | **5** |
-| `agent_runner.py` | 7 | 1 | **8** |
-| `preflight.py` | 2 | 3 | **5** |
-| `loops.py` | 12 | 1 | **13** |
+| `dispatch.py` | 17 | 3 | **20** |
+| `embeddings.py` | 2 | 2 | **4** |
+| `env_loader.py` | 0 | 0 | **0** |
+| `flows.py` | 2 | 1 | **3** |
+| `git_ops.py` | 1 | 1 | **2** |
+| `graph.py` | 1 | 0 | **1** |
+| `heartbeat.py` | 0 | 4 | **4** |
+| `hooks/__init__.py` | 1 | 0 | **1** |
+| `hooks/classifier_retry.py` | 0 | 0 | **0** |
+| `hooks/dispatcher.py` | 0 | 0 | **0** |
+| `hooks/security_review_gate.py` | 0 | 0 | **0** |
+| `hooks/vacuous_pass.py` | 0 | 1 | **1** |
+| `initiative.py` | 0 | 1 | **1** |
+| `initiative_runner.py` | 2 | 3 | **5** |
+| `integration_test.py` | 0 | 1 | **1** |
+| `lessons.py` | 4 | 4 | **8** |
+| `loops.py` | 17 | 1 | **18** |
 | `manager.py` | 8 | 0 | **8** |
-| `dispatch.py` | 11 | 0 | **11** |
-| `cli.py` | 17 | 0 | **17** |
-| `__init__.py` | 20 | 0 | **20** |
+| `mcp_health.py` | 0 | 0 | **0** |
+| `mcp_server.py` | 2 | 0 | **2** |
+| `messages.py` | 1 | 1 | **2** |
+| `monitoring.py` | 2 | 1 | **3** |
+| `output.py` | 1 | 1 | **2** |
+| `parsing.py` | 1 | 1 | **2** |
+| `plugins.py` | 0 | 0 | **0** |
+| `preflight.py` | 3 | 2 | **5** |
+| `prompts.py` | 5 | 5 | **10** |
+| `reflexion.py` | 4 | 1 | **5** |
+| `rlm_decompose.py` | 2 | 0 | **2** |
+| `role_resolver.py` | 1 | 0 | **1** |
+| `roles.py` | 2 | 4 | **6** |
+| `routing.py` | 1 | 0 | **1** |
+| `scaffold.py` | 0 | 1 | **1** |
+| `security.py` | 1 | 0 | **1** |
+| `security_gate.py` | 1 | 1 | **2** |
+| `sessions.py` | 2 | 1 | **3** |
+| `single_agent_guard.py` | 0 | 1 | **1** |
+| `tasks.py` | 2 | 0 | **2** |
+| `templates.py` | 1 | 2 | **3** |
+| `tool_result_storage.py` | 0 | 0 | **0** |
 
-## Observations
-
-1. **`loops.py` is the most coupled module** (13 imports from other equipa modules), acting as the integration point for dev-test, quality scoring, and security review workflows.
-
-2. **`cli.py` imports 17 modules** — expected for a CLI entry point, but refactoring opportunities exist (e.g., lazy-loading subcommand dependencies).
-
-3. **`dispatch.py` is the second-most complex** (11 imports, 981 LOC) — it orchestrates project-level task routing and goal management.
-
-4. **6 late-import cycles** suggest the dependency graph could benefit from further decoupling (e.g., extracting shared interfaces or using dependency injection).
-
-5. **`constants.py` is the only true leaf** — all other L1 modules import from it. This makes `constants.py` a change amplifier: any constant rename requires updating all 20 downstream modules.
-
-6. **`__init__.py` re-exports 226 symbols** — this "flat namespace" pattern simplifies external usage (`from equipa import X`) but means importing `equipa` triggers loading all 20 submodules.
