@@ -33,9 +33,8 @@ from forge_orchestrator import (
 @pytest.fixture(autouse=True)
 def _isolated_manifest(tmp_path, monkeypatch):
     """Redirect the skill manifest to a throwaway path so tests never mutate the real
-    skill_manifest.json. write_skill_manifest() stamps a fresh generated_at on every
-    call, which would otherwise show the tracked file as modified after each test run
-    (and, pre-fix, churned the path separators on Windows). Patches all three namespaces
+    skill_manifest.json, so test runs never show the tracked file as modified
+    (pre-fix, write_skill_manifest churned the path separators on Windows). Patches all three namespaces
     the path is referenced through — equipa.security (where the functions read it),
     forge_orchestrator (the re-export), and this test module (the test bodies) — so
     nothing touches the real file."""
@@ -106,7 +105,8 @@ def test_write_skill_manifest_creates_valid_json():
     result = write_skill_manifest()
     assert "version" in result
     assert result["version"] == 1
-    assert "generated_at" in result
+    # Deterministic manifest: no wall-clock field (open Q #460)
+    assert "generated_at" not in result
     assert "files" in result
     assert len(result["files"]) > 0
 

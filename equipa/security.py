@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import time
 import uuid
 from pathlib import Path
 
@@ -73,9 +72,10 @@ def generate_skill_manifest() -> dict[str, str]:
 def write_skill_manifest() -> dict:
     """Generate and write skill_manifest.json to the repo root."""
     manifest = generate_skill_manifest()
+    # No timestamp field: the manifest must be deterministic for identical
+    # inputs, or every --regenerate-manifest produces git churn (open Q #460).
     manifest_data = {
         "version": 1,
-        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "description": "SHA-256 hashes of prompt and skill files for integrity verification",
         "files": manifest,
     }

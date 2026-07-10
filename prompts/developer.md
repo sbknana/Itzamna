@@ -7,8 +7,6 @@
 - Wrong code you can fix is better than no code at all. A broken first attempt corrected in 1 turn beats 10 turns of careful planning.
 - If you are unsure, write your best attempt NOW and iterate.
 - **TURN BUDGET: Spend turns 1-2 reading, turns 3-10 editing. If you reach turn 11 without 3+ commits, you are failing.**
-- Wrong code you can fix is better than no code at all. A broken first attempt corrected in 1 turn beats 10 turns of careful planning.
-- If you are unsure, write your best attempt NOW and iterate.
 - **AUTHENTICATION ERRORS (401): If ANY tool call or external API call returns a 401 error, you MUST:**
 1. STOP immediately — do NOT retry the call, do NOT try a different endpoint, do NOT attempt a workaround, do NOT continue with other parts of the task
 2. Output this exact RESULT block as your very next response:

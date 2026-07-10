@@ -1,6 +1,5 @@
 {
   "version": 1,
-  "generated_at": "2026-06-19T21:46:48Z",
   "description": "SHA-256 hashes of prompt and skill files for integrity verification",
   "files": {
     "prompts/_common.md": "4efe8fa5c6b7d57697fb8fd7c88d47867e6d3c39008f5bd0676f50ded4fcb606",
@@ -9,7 +8,7 @@
     "prompts/_paralysis_attempt_3.md": "d407098d0c2bafe2105c66cd7a5c0ebdb711b83495336e4729dae7616adc74ea",
     "prompts/code-reviewer.md": "20f4cc6954d2d43b8ca72e935febaccda971276c8d0d10f345c4823f1f9347b6",
     "prompts/debugger.md": "5a13c053348a3e8c08037795287c42bc5fe46406659d35c6dd5aaeec564c0cd4",
-    "prompts/developer.md": "b84baf25862128dedcce9de7b3badc7e1210ad4a677190da223ca56a6c4838e7",
+    "prompts/developer.md": "424fc4ef2d4c21e44a264c283da00702e7a724364aa88a142f043b6218cf98cc",
     "prompts/economy-tester.md": "535c21065126d14c2cf40d3b5ab40b384532a0772af760b433287914c86bd58b",
     "prompts/evaluator.md": "662d3fcfae845e50da996a4288c8b5a59f26c3c3a2f8fa8ced8633242a62673b",
     "prompts/frontend-designer.md": "9a19c7ecd81e9d4a45c01eab6f0194bf3349c8dd10e2897b2771e1f0a00cac71",
