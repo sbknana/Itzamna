@@ -343,6 +343,112 @@ def _is_escaped_at(content: str, pos: int) -> bool:
     return count % 2 == 1
 
 
+def _has_shell_level_char(command: str, chars: str) -> bool:
+    """Return True if any character in *chars* appears at the shell level.
+
+    "Shell level" means outside every single/double-quoted string literal and
+    not backslash-escaped — i.e. a position where the character would act as a
+    real shell operator rather than literal data. This is the shared
+    quote-aware pre-pass used to stop operators embedded inside quoted string
+    literals (``grep -rn "SATS->ECHO"``, ``echo "a|b"``) from tripping the
+    pattern-scanning checks (task 2652).
+    """
+    in_single = False
+    in_double = False
+    escaped = False
+    for ch in command:
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\" and not in_single:
+            escaped = True
+            continue
+        if in_single:
+            if ch == "'":
+                in_single = False
+            continue
+        if in_double:
+            if ch == '"':
+                in_double = False
+            continue
+        if ch == "'":
+            in_single = True
+            continue
+        if ch == '"':
+            in_double = True
+            continue
+        if ch in chars:
+            return True
+    return False
+
+
+def _scan_shell_level_dollar_quotes(command: str) -> set[str]:
+    r"""Detect genuine ANSI-C (``$'...'``) and locale (``$"..."``) quoting.
+
+    Returns a set that may contain ``"ansi-c"`` and/or ``"locale"``.
+
+    A ``$'`` or ``$"`` sequence is a real bash quoting construct ONLY when the
+    ``$`` sits at the shell level — outside any existing quoted string and not
+    backslash-escaped. The same two-character sequence appearing *inside* a
+    double- or single-quoted literal (e.g. a ``$`` immediately before a
+    closing ``'`` in a ``python -c "print('cost: $', x)"`` body) is ordinary
+    literal text, not a quoting construct, and must not be reported.
+
+    This replaces the previous raw ``re.search(r"\$'[^']*'", command)`` /
+    ``re.search(r'\$"[^"]*"', command)`` scans, which matched such sequences
+    regardless of the surrounding quote context and produced check-4 false
+    positives (task 2652). ``\$'...'`` (an escaped dollar) is correctly NOT
+    reported, matching bash semantics where ``\$`` is a literal ``$``.
+    """
+    kinds: set[str] = set()
+    in_single = False
+    in_double = False
+    escaped = False
+    n = len(command)
+    i = 0
+    while i < n:
+        ch = command[i]
+        if escaped:
+            escaped = False
+            i += 1
+            continue
+        if ch == "\\" and not in_single:
+            escaped = True
+            i += 1
+            continue
+        if in_single:
+            if ch == "'":
+                in_single = False
+            i += 1
+            continue
+        if in_double:
+            if ch == '"':
+                in_double = False
+            i += 1
+            continue
+        # Unquoted, unescaped shell-level context.
+        if ch == "$" and i + 1 < n:
+            nxt = command[i + 1]
+            if nxt == "'":
+                kinds.add("ansi-c")
+                # Enter the ANSI-C single-quoted region so its body (which may
+                # contain " or $) does not perturb detection of later tokens.
+                in_single = True
+                i += 2
+                continue
+            if nxt == '"':
+                kinds.add("locale")
+                in_double = True
+                i += 2
+                continue
+        if ch == "'":
+            in_single = True
+        elif ch == '"':
+            in_double = True
+        i += 1
+    return kinds
+
+
 # ---------------------------------------------------------------------------
 # Unicode whitespace pattern (matches bashSecurity.ts UNICODE_WS_RE)
 # ---------------------------------------------------------------------------
@@ -768,8 +874,15 @@ def _check_obfuscated_flags(command: str, base_cmd: str) -> BashSecurityResult:
     # for this exact pattern; ANSI-C / locale-quoting checks still apply.
     skip_empty_quote_checks = _is_git_commit_multi_paragraph(command)
 
-    # ANSI-C quoting: $'...'
-    if re.search(r"\$'[^']*'", command):
+    # Quote-aware detection of ANSI-C ($'...') and locale ($"...") quoting.
+    # Only genuine shell-level constructs are reported — a $' or $" sequence
+    # buried inside a quoted string literal is literal text, not a quoting
+    # construct, and must not fire (task 2652: raw regex scanning tripped
+    # check-4 on a `$` before a closing `'` inside a python -c body).
+    dollar_quote_kinds = _scan_shell_level_dollar_quotes(command)
+
+    # ANSI-C quoting: $'...' — always blocked (no legitimate allowlist).
+    if "ansi-c" in dollar_quote_kinds:
         return BashSecurityResult(
             safe=False, check_id=CheckID.OBFUSCATED_FLAGS,
             message="Command contains ANSI-C quoting ($'...') which can hide characters",
@@ -788,14 +901,14 @@ def _check_obfuscated_flags(command: str, base_cmd: str) -> BashSecurityResult:
     # and evaluate the allowlist against EACH chained segment's own first
     # word. Without this, a safe head (`git status; python -c $"x"`) would
     # whitewash an exec primitive in a later segment.
-    if re.search(r'\$"[^"]*"', command):
+    if "locale" in dollar_quote_kinds:
         segments = _split_command_segments(command)
         # Fall back to whole-command behavior when the splitter produced no
         # segments (defensive — empty/whitespace-only input).
         if not segments:
             segments = [command]
         for segment in segments:
-            if not re.search(r'\$"[^"]*"', segment):
+            if "locale" not in _scan_shell_level_dollar_quotes(segment):
                 continue
             seg_base = _get_base_command(segment)
             if seg_base not in _LOCALE_QUOTING_SAFE_BASES:
@@ -935,7 +1048,7 @@ def _check_command_substitution(unquoted: str) -> BashSecurityResult:
     return _SAFE
 
 
-def _check_redirections(unquoted: str) -> BashSecurityResult:
+def _check_redirections(command: str, unquoted: str) -> BashSecurityResult:
     """Checks 9-10: Input and output redirection in unquoted content.
 
     Threat model: ``cmd > /etc/passwd`` overwrites system files; ``cmd >
@@ -961,7 +1074,19 @@ def _check_redirections(unquoted: str) -> BashSecurityResult:
     patterns (``cat <<EOF`` / ``cat <<<"$VAR"``). Strip the ``<<`` and ``<<<``
     operators *before* the literal-char check so only a true bare ``<``
     (file redirection) trips the block.
+
+    Shared quote-aware pre-pass (task 2652): a genuine redirection operator
+    must appear at the shell level — outside every quoted string literal. If
+    the ORIGINAL command has no shell-level ``<`` or ``>`` at all, then any
+    ``<``/``>`` surfaced by ``_extract_unquoted`` is an artifact of a quoted
+    literal (``grep -rn "SATS->ECHO"``) or a quote-tracking desync, never a
+    real redirect — so the check short-circuits to safe. This makes check-9/10
+    provably immune to operators embedded inside quoted strings while leaving
+    every genuine redirect (which is always unquoted) fully validated.
     """
+    if not _has_shell_level_char(command, "<>"):
+        return _SAFE
+
     # Hard denylist applied to the ORIGINAL unquoted string before any
     # stripping — these targets are never safe even if they textually match
     # the allowlist patterns later.
@@ -1883,7 +2008,7 @@ def check_bash_command(command: str) -> BashSecurityResult:
         _check_quoted_newline_comment(command),
         _check_newlines(command, unquoted),
         _check_command_substitution(unquoted),
-        _check_redirections(unquoted),
+        _check_redirections(command, unquoted),
         _check_dangerous_variables(unquoted),
         _check_shell_metacharacters(command, unquoted),
         _check_obfuscated_flags(command, base_cmd),
