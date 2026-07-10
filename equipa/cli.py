@@ -313,28 +313,25 @@ async def _gated_post_merge(
     repo: str | os.PathLike,
     branch: str,
     outcome: str,
-    review_blocks_merge: bool,
     task_id: int | None = None,
-    review_skipped_doc_only: bool = False,
+    block_on_missing: bool = True,
 ) -> str:
     """Unified post-loop gated merge for single-task ``--dev-test`` mode.
 
-    Task #2451 Phase B: this is now a thin adapter that delegates to
+    Task #2451 Phase B: this is a thin adapter that delegates to
     :func:`equipa.dispatch._gated_merge_task` — both single-task and parallel
     modes share one merge path so the gate semantics cannot diverge again.
 
-    The caller-flag transform: pass ``review_blocks_merge=True`` when the
-    caller explicitly blocked (we trust positive blocks). Pass ``None`` when
-    the caller did NOT block — this forces ``_gated_merge_task`` to re-read
-    the artifact and re-apply the fail-closed rule, instead of silently
-    trusting an unreliable "do not block" assertion.
-
-    Phase H (F-01) — when ``review_skipped_doc_only=True`` the doc-only
-    short-circuit fired, so no SECURITY-REVIEW-{task_id}.md was written.
-    The defensive invariant in ``_merge_task_branch`` must NOT then
-    demand one. The hint is forwarded as ``expect_artifact=False`` so
-    the invariant is skipped (the diff is provably doc-only, nothing
-    code-level to gate).
+    Task #2706: the previous ``review_blocks_merge`` / ``review_skipped_doc_
+    only`` caller-flag transform is REMOVED. Those were exactly the
+    caller-supplied trust signals that re-opened the merge-gate hole (a
+    caller mis-setting ``review_skipped_doc_only`` would forward
+    ``expect_artifact=False`` and disable the fail-closed invariant). The
+    unified gate now computes a single ``GateDecision`` from ground truth
+    (the real branch diff + the on-disk artifact) INSIDE
+    ``_gated_merge_task``, so this adapter forwards ONLY the merge target,
+    the test ``outcome``, and the operator ``block_on_missing`` policy flag.
+    There is no longer any flag a caller can set to bypass the gate.
     """
     if task_id is None:
         try:
@@ -345,20 +342,12 @@ async def _gated_post_merge(
                 f"{branch!r}; pass task_id= explicitly"
             ) from e
 
-    if outcome == "security_review_blocked":
-        # Outcome already demoted by the caller — preserve the explicit
-        # block signal through to the unified gate.
-        caller_flag: bool | None = True
-    else:
-        caller_flag = True if review_blocks_merge else None
-
     return await _gated_merge_task(
         repo=repo,
         branch=branch,
         outcome=outcome,
         task_id=task_id,
-        review_blocks_merge=caller_flag,
-        expect_artifact=not review_skipped_doc_only,
+        block_on_missing=block_on_missing,
     )
 
 
@@ -1646,13 +1635,20 @@ async def _run_security_review_and_gate(
     # outcome=security_review_blocked but commits on master, branch gone).
     if args.dev_test:
         merge_branch = f"forge-task-{task['id']}"
+        # Task #2706: no per-task trust signal is forwarded — the unified
+        # gate re-derives doc-only-ness from the real diff and re-reads the
+        # artifact itself. ``review_blocks_merge`` / ``review_skipped_doc_
+        # only`` above still drive the DB-status outcome demotion and the
+        # operator log lines, but they NO LONGER steer the merge decision.
         merge_result = await _gated_post_merge(
             repo=project_dir,
             branch=merge_branch,
             outcome=outcome,
-            review_blocks_merge=review_blocks_merge,
             task_id=task["id"],
-            review_skipped_doc_only=review_skipped_doc_only,
+            block_on_missing=is_feature_enabled(
+                getattr(args, "dispatch_config", None) or {},
+                "security_review_block_on_missing_artifact",
+            ),
         )
         if merge_result == "merged":
             print(
