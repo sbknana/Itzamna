@@ -31,7 +31,7 @@ from equipa.constants import (
 )
 from equipa.agent_runner import build_cli_command, run_agent_streaming, run_agent_with_retries
 from equipa.checkpoints import load_checkpoint
-from equipa.db import record_agent_run, update_task_status
+from equipa.db import log_gate_audit, record_agent_run, update_task_status
 from equipa.config import is_security_review_enabled
 from equipa.dispatch import (
     _build_dispatch_attempt_reflection,
@@ -1469,6 +1469,16 @@ async def run_mode_task(args: argparse.Namespace) -> None:
                 print(
                     f"  [GATE-AUDIT] task={task['id']} event=circuit-blocked "
                     f"role={exc.role} tier_attempted={exc.tier_attempted}"
+                )
+                # Task #2702: durably persist the gate event. This site emits
+                # via print() (stdout), not _gate_audit_log() (stderr), so we
+                # call the DB helper directly to avoid a duplicate stderr line.
+                # Best-effort fail-open — log_gate_audit swallows all DB errors.
+                log_gate_audit(
+                    f"task={task['id']} event=circuit-blocked "
+                    f"role={exc.role} tier_attempted={exc.tier_attempted}",
+                    task["id"],
+                    event="circuit-blocked",
                 )
                 print(
                     f"  [Routing] Task #{task['id']} blocked by circuit "

@@ -46,6 +46,7 @@ from equipa.constants import (
 from equipa.db import (
     db_conn,
     get_db_connection,
+    log_gate_audit,
     record_agent_run,
     update_task_status,
 )
@@ -536,6 +537,16 @@ async def run_dev_test_loop_with_autoresearch(
                 f"  [GATE-AUDIT] task={task_id} event=circuit-blocked "
                 f"role={exc.role} tier_attempted={exc.tier_attempted}",
                 output,
+            )
+            # Task #2702: durably persist the gate event too. This site emits
+            # via log() (operator stdout), not _gate_audit_log() (stderr), so
+            # we call the DB helper directly to avoid a duplicate stderr line.
+            # Best-effort fail-open — log_gate_audit swallows all DB errors.
+            log_gate_audit(
+                f"task={task_id} event=circuit-blocked "
+                f"role={exc.role} tier_attempted={exc.tier_attempted}",
+                task_id,
+                event="circuit-blocked",
             )
             log(
                 f"  [Routing] Task #{task_id} blocked by circuit breaker "
@@ -1868,7 +1879,9 @@ async def _gated_merge_task(
     # operator-facing logs and for the audit trail.
     if review_blocks_merge is True:
         _gate_audit_log(
-            f"task={task_id} event=merge-skipped reason=caller-gate-blocked"
+            f"task={task_id} event=merge-skipped reason=caller-gate-blocked",
+            task_id=task_id,
+            event="merge-skipped",
         )
         return "blocked"
 
@@ -1896,7 +1909,10 @@ async def _gated_merge_task(
             if blocks:
                 _gate_audit_log(
                     f"task={task_id} event=merge-skipped "
-                    f"reason=security-review-blocked {format_counts(counts)}"
+                    f"reason=security-review-blocked {format_counts(counts)}",
+                    task_id=task_id,
+                    event="merge-skipped",
+                    counts=counts,
                 )
                 return "blocked"
 
@@ -1911,13 +1927,23 @@ async def _gated_merge_task(
         )
     except SecurityGateBypassError as exc:
         _gate_audit_log(
-            f"task={task_id} event=defensive-invariant-blocked detail={exc}"
+            f"task={task_id} event=defensive-invariant-blocked detail={exc}",
+            task_id=task_id,
+            event="defensive-invariant-blocked",
         )
         return "blocked"
     if merged:
-        _gate_audit_log(f"task={task_id} event=merge-succeeded branch={branch}")
+        _gate_audit_log(
+            f"task={task_id} event=merge-succeeded branch={branch}",
+            task_id=task_id,
+            event="merge-succeeded",
+        )
         return "merged"
-    _gate_audit_log(f"task={task_id} event=merge-failed branch={branch}")
+    _gate_audit_log(
+        f"task={task_id} event=merge-failed branch={branch}",
+        task_id=task_id,
+        event="merge-failed",
+    )
     return "merge_failed"
 
 
