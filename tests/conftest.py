@@ -27,64 +27,54 @@ if _SCRIPTS_DIR.is_dir():
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
 
-def _ensure_full_schema():
-    """Apply schema.sql to the test database, creating any missing tables.
+def _make_idempotent(schema_sql: str) -> str:
+    """Rewrite CREATE statements to be idempotent (IF NOT EXISTS).
 
-    Converts CREATE TABLE to CREATE TABLE IF NOT EXISTS and
-    CREATE VIEW to CREATE VIEW IF NOT EXISTS so this is idempotent.
-    CREATE INDEX already uses IF NOT EXISTS in the schema file.
+    Covers TABLE / VIEW / TRIGGER / INDEX / UNIQUE INDEX so applying a schema
+    file more than once (or over an already-populated DB) is a safe no-op.
     """
-    from equipa.constants import THEFORGE_DB
-
-    schema_path = REPO_ROOT / "schema.sql"
-    if not schema_path.exists():
-        print(f"  [conftest] WARNING: schema.sql not found at {schema_path}")
-        return
-
-    schema_sql = schema_path.read_text()
-
-    # Make CREATE TABLE idempotent
-    schema_sql = re.sub(
-        r"CREATE TABLE(?!\s+IF\s+NOT\s+EXISTS)",
-        "CREATE TABLE IF NOT EXISTS",
-        schema_sql,
-        flags=re.IGNORECASE,
-    )
-    # Make CREATE VIEW idempotent
-    schema_sql = re.sub(
-        r"CREATE VIEW(?!\s+IF\s+NOT\s+EXISTS)",
-        "CREATE VIEW IF NOT EXISTS",
-        schema_sql,
-        flags=re.IGNORECASE,
-    )
-    # Make CREATE TRIGGER idempotent
-    schema_sql = re.sub(
-        r"CREATE TRIGGER(?!\s+IF\s+NOT\s+EXISTS)",
-        "CREATE TRIGGER IF NOT EXISTS",
-        schema_sql,
-        flags=re.IGNORECASE,
-    )
-    # Make CREATE INDEX idempotent (most already are)
-    schema_sql = re.sub(
-        r"CREATE INDEX(?!\s+IF\s+NOT\s+EXISTS)",
-        "CREATE INDEX IF NOT EXISTS",
-        schema_sql,
-        flags=re.IGNORECASE,
-    )
-    # Make CREATE UNIQUE INDEX idempotent
+    for keyword in ("TABLE", "VIEW", "TRIGGER", "INDEX"):
+        schema_sql = re.sub(
+            rf"CREATE {keyword}(?!\s+IF\s+NOT\s+EXISTS)",
+            f"CREATE {keyword} IF NOT EXISTS",
+            schema_sql,
+            flags=re.IGNORECASE,
+        )
     schema_sql = re.sub(
         r"CREATE UNIQUE INDEX(?!\s+IF\s+NOT\s+EXISTS)",
         "CREATE UNIQUE INDEX IF NOT EXISTS",
         schema_sql,
         flags=re.IGNORECASE,
     )
+    return schema_sql
+
+
+def _apply_schema_file(conn, schema_path):
+    """Idempotently apply one schema .sql file to an open connection."""
+    if not schema_path.exists():
+        print(f"  [conftest] WARNING: schema not found at {schema_path}")
+        return
+    try:
+        conn.executescript(_make_idempotent(schema_path.read_text()))
+        conn.commit()
+    except Exception as e:
+        print(f"  [conftest] WARNING: {schema_path.name} partial apply: {e}")
+
+
+def _ensure_full_schema():
+    """Apply BOTH schema files to the test database, creating missing tables.
+
+    The test suite needs every table — including the owner-only personal-PM
+    tables split into schema_personal.sql (task 2707) — so both files are
+    applied here regardless of the personal_pm_tables feature flag. Both are
+    rewritten to CREATE ... IF NOT EXISTS, so re-applying is a safe no-op.
+    """
+    from equipa.constants import THEFORGE_DB
 
     conn = sqlite3.connect(THEFORGE_DB)
     try:
-        conn.executescript(schema_sql)
-        conn.commit()
-    except Exception as e:
-        print(f"  [conftest] WARNING: schema.sql partial apply: {e}")
+        _apply_schema_file(conn, REPO_ROOT / "schema.sql")
+        _apply_schema_file(conn, REPO_ROOT / "schema_personal.sql")
     finally:
         conn.close()
 

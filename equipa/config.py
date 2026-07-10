@@ -58,6 +58,13 @@ DEFAULT_FEATURE_FLAGS: dict[str, bool] = {
     "config_versioning": False,
     "session_persistence": False,
     "project_templates": False,
+    # When True (default), ensure_schema also applies schema_personal.sql — the
+    # owner-only personal-PM data model (competitors, content_tickler, reminders,
+    # voice_messages, etc.). The owner's prod install keeps this on so pulling the
+    # split touches nothing. Public/fresh installs set it False in dispatch_config
+    # to ship the orchestrator product WITHOUT the personal-PM tables. Purely
+    # additive either way — schema_personal.sql is CREATE ... IF NOT EXISTS only.
+    "personal_pm_tables": True,
 }
 
 DEFAULT_DISPATCH_CONFIG: dict = {

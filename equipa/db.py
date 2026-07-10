@@ -136,6 +136,12 @@ _SCHEMA_ENSURED = False
 # <repo>/equipa/db.py, so the schema file is one directory up.
 SCHEMA_SQL_PATH = Path(__file__).resolve().parent.parent / "schema.sql"
 
+# Owner-only personal-PM data model, split out of schema.sql (task 2707). Applied
+# ONLY when the file exists AND the personal_pm_tables feature flag is on (default
+# TRUE, so the owner's prod install keeps these tables). Public/fresh installs
+# that set the flag false ship the product WITHOUT the personal tables.
+SCHEMA_PERSONAL_SQL_PATH = Path(__file__).resolve().parent.parent / "schema_personal.sql"
+
 
 class SchemaNotInitialised(RuntimeError):
     """Raised when TheForge DB schema cannot be applied or located.
@@ -169,7 +175,24 @@ def _make_schema_idempotent(schema_sql: str) -> str:
     return schema_sql
 
 
-def ensure_schema() -> None:
+def _should_apply_personal_schema() -> bool:
+    """Return True iff the owner-only ``schema_personal.sql`` should be applied.
+
+    Reads the ``features.personal_pm_tables`` flag through the same
+    ``load_dispatch_config`` / ``is_feature_enabled`` path every other feature
+    flag uses. Default is TRUE (see ``DEFAULT_FEATURE_FLAGS``), so an owner prod
+    install with no explicit override keeps the personal-PM tables; a public
+    install opts out by setting the flag false in ``dispatch_config.json``.
+
+    Imported lazily so this connection-layer module keeps a clean import graph
+    (``equipa.config`` depends only on ``equipa.constants``, never on ``db``).
+    """
+    from equipa.config import is_feature_enabled, load_dispatch_config
+
+    return is_feature_enabled(load_dispatch_config(None), "personal_pm_tables")
+
+
+def ensure_schema(apply_personal: bool | None = None) -> None:
     """Apply the canonical ``schema.sql`` to TheForge DB if needed.
 
     Safety net: the primary schema management path is ``db_migrate.py``
@@ -178,10 +201,26 @@ def ensure_schema() -> None:
     those entry points have not run — but unlike the previous inline
     ``CREATE TABLE`` block it does not duplicate table definitions.
 
+    Core ``schema.sql`` is ALWAYS applied. The owner-only
+    ``schema_personal.sql`` (task 2707) is applied only when the file exists
+    AND personal-PM tables are opted in — controlled by ``apply_personal``:
+
+      * ``None`` (default) → resolve the ``features.personal_pm_tables`` flag
+        via :func:`_should_apply_personal_schema` (flag default TRUE).
+      * ``True`` / ``False`` → explicit override, mainly for tests.
+
+    Both schema files are ``CREATE ... IF NOT EXISTS`` only (schema.sql is
+    rewritten to be idempotent by :func:`_make_schema_idempotent`), so applying
+    either against an existing DB is a no-op — additive, never a data rewrite.
+
+    Args:
+        apply_personal: force-apply (True) / skip (False) the personal schema,
+            or resolve from the feature flag when None.
+
     Raises:
-        SchemaNotInitialised: if ``schema.sql`` is missing or applying it
-            fails.  Callers must NOT swallow this — a missing schema means
-            downstream telemetry and lesson lookups will silently lose data.
+        SchemaNotInitialised: if ``schema.sql`` is missing or applying either
+            schema file fails.  Callers must NOT swallow this — a missing schema
+            means downstream telemetry and lesson lookups will silently lose data.
     """
     global _SCHEMA_ENSURED
     if _SCHEMA_ENSURED:
@@ -200,6 +239,23 @@ def ensure_schema() -> None:
             f"Could not read schema file at {SCHEMA_SQL_PATH}: {e}"
         ) from e
 
+    if apply_personal is None:
+        apply_personal = _should_apply_personal_schema()
+
+    personal_sql: str | None = None
+    if apply_personal and SCHEMA_PERSONAL_SQL_PATH.exists():
+        try:
+            # schema_personal.sql already uses CREATE ... IF NOT EXISTS, but run
+            # it through the same idempotency rewrite defensively so a future
+            # edit that forgets the guard cannot corrupt an existing DB.
+            personal_sql = _make_schema_idempotent(
+                SCHEMA_PERSONAL_SQL_PATH.read_text()
+            )
+        except OSError as e:
+            raise SchemaNotInitialised(
+                f"Could not read schema file at {SCHEMA_PERSONAL_SQL_PATH}: {e}"
+            ) from e
+
     # get_db_connection raises FileNotFoundError if the DB file does not
     # exist.  In production db_migrate.py / equipa_setup.py creates the
     # file first; in test worktrees the DB may start absent, so fall back
@@ -213,10 +269,13 @@ def ensure_schema() -> None:
     try:
         conn.executescript(schema_sql)
         conn.commit()
+        if personal_sql is not None:
+            conn.executescript(personal_sql)
+            conn.commit()
         _ensure_additive_columns(conn)
         conn.commit()
     except sqlite3.Error as e:
-        logger.exception("[Schema] Failed to apply schema.sql: %s", e)
+        logger.exception("[Schema] Failed to apply schema files: %s", e)
         raise SchemaNotInitialised(
             f"Failed to apply {SCHEMA_SQL_PATH.name}: {e}"
         ) from e
