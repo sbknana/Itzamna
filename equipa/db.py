@@ -47,6 +47,17 @@ def get_db_connection(write: bool = False) -> sqlite3.Connection:
         conn = sqlite3.connect(uri, uri=True)
     conn.row_factory = sqlite3.Row
 
+    # Enforce the 29 FOREIGN KEY relationships declared in schema.sql. SQLite
+    # defaults foreign_keys OFF per-connection, so without this every db.py-routed
+    # write could insert a dangling reference (e.g. an agent_runs row whose
+    # task_id/project_id points at no row) and schema.sql's FK constraints would
+    # be silently unenforced. heartbeat.py:_connect already sets this; db.py
+    # diverged (SR-2700 S1). It is connection-level, so it is applied to read-only
+    # handles too — harmless there (no writes occur) and it keeps the two code
+    # paths identical. Must be set outside any transaction, which is the case on a
+    # freshly-opened connection.
+    conn.execute("PRAGMA foreign_keys = ON")
+
     # Wait up to 5s for a competing lock to clear before raising
     # sqlite3.OperationalError, matching heartbeat.py:_connect. EQUIPA runs N
     # parallel agents writing telemetry to one shared SQLite file, so brief lock
