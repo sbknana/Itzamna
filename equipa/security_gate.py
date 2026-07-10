@@ -65,27 +65,19 @@ class GateDecision:
         ``SECURITY-REVIEW-<task>.md`` artifact, fail-closed on missing.
 
     The dataclass is frozen so a decision cannot be mutated after it is
-    computed. ``expect_artifact`` is derived (``not doc_only``) so the
-    defensive invariant in ``_merge_task_branch`` receives an internally
-    computed value, not a caller assertion.
+    computed. ``expect_artifact`` is an explicit field the gate DERIVES (it
+    is False for a provably doc-only diff and when the operator has disabled
+    security review outright, True otherwise) so the defensive invariant in
+    ``_merge_task_branch`` receives an internally computed value, never a
+    caller assertion.
     """
 
     blocks_merge: bool
     doc_only: bool
+    expect_artifact: bool
     counts: dict | None
     reason: str
     changed_files: list[str] = field(default_factory=list)
-
-    @property
-    def expect_artifact(self) -> bool:
-        """Whether the defensive invariant must demand a review artifact.
-
-        A provably doc-only diff cannot introduce a code-level finding, so
-        no ``SECURITY-REVIEW-<task>.md`` is expected. Every other diff
-        (including an empty/failed one, which :func:`is_doc_only_diff`
-        classifies as NOT doc-only) demands the artifact — fail closed.
-        """
-        return not self.doc_only
 
 
 def decide_merge_gate(
@@ -94,6 +86,7 @@ def decide_merge_gate(
     security_review_blocks_merge,
     project_dir: str,
     task_id: int,
+    security_review_enabled: bool = True,
     block_on_missing: bool = True,
 ) -> GateDecision:
     """Compute the single :class:`GateDecision` from ground truth.
@@ -103,14 +96,28 @@ def decide_merge_gate(
     :func:`get_changed_files_for_branch`) plus a callable that reads the
     on-disk security-review artifact, and returns an immutable decision.
 
-    NO caller-supplied booleans participate:
+    NO per-task caller-supplied security-state booleans participate — those
+    (the old tri-state ``review_blocks_merge`` / ``expect_artifact`` /
+    ``doc_only`` signals) were the caller-trust hole task #2706 closes:
 
       * doc-only-ness is re-derived here via :func:`is_doc_only_diff` on the
         real file list — a caller can no longer assert ``doc_only`` to
-        disable the gate (task #2706).
+        disable the gate.
       * when the diff is NOT doc-only, the artifact is (re-)read through the
         injected ``security_review_blocks_merge`` callable, which fails
         closed on a missing/unparseable artifact when ``block_on_missing``.
+
+    The two GLOBAL operator-policy flags below are NOT per-task trust signals
+    (they are the operator's feature-flag configuration, the same trust
+    boundary as today) and are threaded through so unification does not
+    silently change behaviour:
+
+      * ``security_review_enabled`` — when the operator has disabled security
+        review entirely, no artifact is ever produced, so none is expected
+        (``expect_artifact=False``) and the gate does not block. This is the
+        operator's explicit opt-out, not a gate weakness.
+      * ``block_on_missing`` — the ``security_review_block_on_missing_
+        artifact`` fail-open escape hatch (defaults fail-closed).
 
     ``security_review_blocks_merge`` is injected (rather than imported) so
     this leaf module stays free of a circular import on ``dispatch`` while
@@ -118,11 +125,21 @@ def decide_merge_gate(
     signature ``(project_dir, task_id, *, block_on_missing) ->
     tuple[bool, dict | None]`` — i.e. ``dispatch._security_review_blocks_merge``.
     """
+    if not security_review_enabled:
+        return GateDecision(
+            blocks_merge=False,
+            doc_only=False,
+            expect_artifact=False,
+            counts=None,
+            reason="security-review-disabled",
+            changed_files=list(changed_files),
+        )
     doc_only = is_doc_only_diff(changed_files)
     if doc_only:
         return GateDecision(
             blocks_merge=False,
             doc_only=True,
+            expect_artifact=False,
             counts=None,
             reason="doc-only-diff",
             changed_files=list(changed_files),
@@ -134,6 +151,7 @@ def decide_merge_gate(
     return GateDecision(
         blocks_merge=blocks,
         doc_only=False,
+        expect_artifact=True,
         counts=counts,
         reason=reason,
         changed_files=list(changed_files),

@@ -239,14 +239,17 @@ def test_fallback_marker_fails_closed(gated_repo, monkeypatch):
     assert _git(repo, "rev-parse", "HEAD") == master_head
 
 
-def test_caller_false_does_not_short_circuit_artifact_recheck(
+def test_single_task_path_rereads_artifact_and_blocks_high(
     gated_repo, monkeypatch,
 ):
-    """GATE-02: review_blocks_merge=False must NOT skip on-disk re-check.
+    """GATE-02 (task #2706): the single-task path has NO caller flag left.
 
-    Proves Phase B+C unification — single-task delegate translates the
-    caller's False into None, the unified gate then re-reads the artifact,
-    finds HIGH, and blocks. Previously this combination short-circuited.
+    Pre-#2706 this test passed ``review_blocks_merge=False`` to prove the
+    caller could not short-circuit the on-disk re-check. That flag is now
+    removed entirely: ``_gated_post_merge`` forwards only repo/branch/
+    outcome/task_id, and the unified gate computes its own GateDecision from
+    the real diff (feature.py -> not doc-only) + the on-disk HIGH artifact,
+    and blocks. There is no argument a caller could set to bypass it.
     """
     from equipa import cli
 
@@ -259,7 +262,6 @@ def test_caller_false_does_not_short_circuit_artifact_recheck(
         repo=str(repo),
         branch="forge-task-9999",
         outcome="tests_passed",
-        review_blocks_merge=False,
         task_id=9999,
     ))
 
@@ -298,12 +300,15 @@ def test_loosened_parser_detects_non_canonical_header(gated_repo, monkeypatch):
 
 
 def test_doc_only_diff_merges_without_artifact(tmp_path, monkeypatch):
-    """Phase H (F-01): doc-only diff merges with expect_artifact=False.
+    """Task #2706: doc-only detection is DRIVEN BY THE REAL DIFF, not a flag.
 
     The reviewer is skipped on doc-only diffs (task #2358), so no
-    SECURITY-REVIEW-NNNN.md is written. The defensive invariant must NOT
-    then demand one. Without this hint, the Phase-A fail-closed rule
-    blocks every pure .md/.rst/.txt change — the F-01 regression.
+    SECURITY-REVIEW-NNNN.md is written. Pre-#2706 the caller had to pass
+    ``expect_artifact=False`` to tell the invariant not to demand one — a
+    caller-trust hole. That parameter is now removed: the gate diffs the
+    real forge-task-9999 branch (docs.md only), calls the EXISTING
+    ``is_doc_only_diff`` itself, derives doc_only=True, and merges without an
+    artifact. No caller flag is involved.
     """
     from equipa import dispatch
 
@@ -334,11 +339,73 @@ def test_doc_only_diff_merges_without_artifact(tmp_path, monkeypatch):
         outcome="tests_passed",
         task_id=9999,
         project_context={"id": 23},
-        expect_artifact=False,
     ))
 
     assert result == "merged"
     assert _git(repo, "rev-parse", "HEAD") != master_head
+
+
+def test_code_diff_missing_artifact_blocks_via_ground_truth(
+    gated_repo, monkeypatch,
+):
+    """Task #2706 (inverse of doc-only): a code diff with NO artifact and NO
+    caller flag MUST block.
+
+    This is the ground-truth path through ``_gated_merge_task`` (not a
+    direct ``_merge_task_branch`` call). The forge-task-9999 branch contains
+    feature.py, so the gate re-derives doc_only=False from the real diff,
+    the artifact is missing, and the fail-closed policy blocks. Proves the
+    gate never ASSUMES doc-only when the reviewer produced nothing — the old
+    ``expect_artifact=False`` caller escape hatch is gone.
+    """
+    from equipa import dispatch
+
+    repo = gated_repo["repo"]
+    master_head = gated_repo["master_head"]
+    assert not (repo / "SECURITY-REVIEW-9999.md").exists()
+    monkeypatch.setenv("EQUIPA_GATE_AUDIT_LOG", "1")
+
+    result = asyncio.run(dispatch._gated_merge_task(
+        repo=str(repo),
+        branch="forge-task-9999",
+        outcome="tests_passed",
+        task_id=9999,
+        project_context={"id": 23},
+    ))
+
+    assert result == "blocked"
+    assert _git(repo, "rev-parse", "HEAD") == master_head
+
+
+def test_gate_signatures_have_no_caller_bypass_flag():
+    """Task #2706: there is NO flag left for a caller to disable the gate.
+
+    The whole class of bug (#362/#378 + the doc-only short-circuit) came
+    from the gate trusting caller-supplied ``review_blocks_merge`` /
+    ``expect_artifact`` signals. This test locks in their removal by
+    inspecting the public gate entrypoints' signatures directly, so a future
+    refactor cannot silently re-introduce a bypass parameter.
+    """
+    import inspect
+
+    from equipa import cli, dispatch
+
+    gated_params = set(
+        inspect.signature(dispatch._gated_merge_task).parameters
+    )
+    post_params = set(
+        inspect.signature(cli._gated_post_merge).parameters
+    )
+
+    forbidden = {"review_blocks_merge", "expect_artifact", "review_skipped_doc_only"}
+    assert forbidden.isdisjoint(gated_params), (
+        f"_gated_merge_task must not accept caller-trust flags; found "
+        f"{forbidden & gated_params}"
+    )
+    assert forbidden.isdisjoint(post_params), (
+        f"_gated_post_merge must not accept caller-trust flags; found "
+        f"{forbidden & post_params}"
+    )
 
 
 def test_non_doc_diff_blocks_when_artifact_missing(gated_repo, monkeypatch):

@@ -314,6 +314,7 @@ async def _gated_post_merge(
     branch: str,
     outcome: str,
     task_id: int | None = None,
+    security_review_enabled: bool = True,
     block_on_missing: bool = True,
 ) -> str:
     """Unified post-loop gated merge for single-task ``--dev-test`` mode.
@@ -330,8 +331,9 @@ async def _gated_post_merge(
     unified gate now computes a single ``GateDecision`` from ground truth
     (the real branch diff + the on-disk artifact) INSIDE
     ``_gated_merge_task``, so this adapter forwards ONLY the merge target,
-    the test ``outcome``, and the operator ``block_on_missing`` policy flag.
-    There is no longer any flag a caller can set to bypass the gate.
+    the test ``outcome``, and the two GLOBAL operator-policy flags
+    (``security_review_enabled`` / ``block_on_missing``). There is no longer
+    any per-task flag a caller can set to bypass the gate.
     """
     if task_id is None:
         try:
@@ -347,6 +349,7 @@ async def _gated_post_merge(
         branch=branch,
         outcome=outcome,
         task_id=task_id,
+        security_review_enabled=security_review_enabled,
         block_on_missing=block_on_missing,
     )
 
@@ -1645,6 +1648,7 @@ async def _run_security_review_and_gate(
             branch=merge_branch,
             outcome=outcome,
             task_id=task["id"],
+            security_review_enabled=is_security_review_enabled(args),
             block_on_missing=is_feature_enabled(
                 getattr(args, "dispatch_config", None) or {},
                 "security_review_block_on_missing_artifact",

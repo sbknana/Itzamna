@@ -73,12 +73,16 @@ def _run_gated_merge(
     branch: str,
     *,
     outcome: str,
-    review_blocks_merge: bool,
 ) -> str:
     """Invoke the gated merge step that cli.py run_mode_task should call.
 
     This wraps the post-loop gate-then-merge logic so the tests can exercise
     it independently of run_dev_test_loop's full async stack.
+
+    Task #2706: ``_gated_post_merge`` no longer accepts any per-task caller
+    trust flag — the unified gate computes its own GateDecision from the real
+    diff + on-disk artifact. A demoted ``outcome=security_review_blocked``
+    still blocks; a clean on-disk artifact with a code diff still merges.
     """
     import asyncio
 
@@ -89,7 +93,6 @@ def _run_gated_merge(
             repo=repo,
             branch=branch,
             outcome=outcome,
-            review_blocks_merge=review_blocks_merge,
         )
     )
 
@@ -98,7 +101,7 @@ def test_single_task_high_finding_branch_not_on_master(task_repo: tuple[Path, st
     """HIGH severity → gate blocks, branch must NOT be on master and must still exist."""
     repo, branch = task_repo
     result = _run_gated_merge(
-        repo, branch, outcome="security_review_blocked", review_blocks_merge=True
+        repo, branch, outcome="security_review_blocked"
     )
     assert result == "blocked"
     assert not _branch_commits_on_master(repo, branch), (
@@ -113,7 +116,7 @@ def test_single_task_critical_finding_branch_not_on_master(task_repo: tuple[Path
     """CRITICAL severity → gate blocks, same invariants as HIGH."""
     repo, branch = task_repo
     result = _run_gated_merge(
-        repo, branch, outcome="security_review_blocked", review_blocks_merge=True
+        repo, branch, outcome="security_review_blocked"
     )
     assert result == "blocked"
     assert not _branch_commits_on_master(repo, branch)
@@ -137,7 +140,7 @@ def test_single_task_clean_review_branch_merged(task_repo: tuple[Path, str]) -> 
         "CRITICAL: 0 | HIGH: 0 | MEDIUM: 0 | LOW: 0 | INFO: 0\n"
     )
     result = _run_gated_merge(
-        repo, branch, outcome="tests_passed", review_blocks_merge=False
+        repo, branch, outcome="tests_passed"
     )
     assert result == "merged"
     assert _branch_commits_on_master(repo, branch), (
@@ -148,10 +151,11 @@ def test_single_task_clean_review_branch_merged(task_repo: tuple[Path, str]) -> 
 def test_single_task_reviewer_crash_branch_not_on_master(task_repo: tuple[Path, str]) -> None:
     """Reviewer crash → fail-closed: outcome reflects block, branch not on master."""
     repo, branch = task_repo
-    # Reviewer crash is surfaced by the cli.py gate block as outcome=security_review_blocked
-    # with review_blocks_merge=True (fail-closed).
+    # Reviewer crash is surfaced by the cli.py gate block as
+    # outcome=security_review_blocked (fail-closed); the unified gate honours
+    # that demoted outcome as "blocked" (task #2706 — no caller flag needed).
     result = _run_gated_merge(
-        repo, branch, outcome="security_review_blocked", review_blocks_merge=True
+        repo, branch, outcome="security_review_blocked"
     )
     assert result == "blocked"
     assert not _branch_commits_on_master(repo, branch)

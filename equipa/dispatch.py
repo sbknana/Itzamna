@@ -1868,6 +1868,7 @@ async def _gated_merge_task(
     outcome: str,
     task_id: int,
     project_context: dict | None = None,
+    security_review_enabled: bool = True,
     block_on_missing: bool = True,
 ) -> str:
     """Unified, gated merge entry point used by BOTH dispatch modes.
@@ -1901,9 +1902,15 @@ async def _gated_merge_task(
     ``decision.doc_only`` (task #2451/#2488/#2493 provenance preserved): the
     invariant inside ``_merge_task_branch`` still re-reads the artifact and
     still raises ``SecurityGateBypassError`` on HIGH/CRITICAL/missing.
-    ``block_on_missing`` is the operator ``security_review_block_on_missing_
-    artifact`` feature-flag policy (defaults fail-closed), NOT a per-task
-    trust signal.
+    ``security_review_enabled`` and ``block_on_missing`` are GLOBAL operator
+    feature-flag policy (derived at the call sites from ``args`` /
+    ``dispatch_config``), NOT per-task caller trust signals — they are the
+    same operator-config trust boundary as today, threaded through so
+    unification does not silently change behaviour. ``security_review_
+    enabled=False`` is the operator's explicit opt-out (no artifact expected,
+    gate does not block); ``block_on_missing`` is the ``security_review_
+    block_on_missing_artifact`` fail-open escape hatch. Both default
+    fail-closed.
 
     Returns one of:
       * ``"skipped"``  — outcome is not merge-eligible (e.g. tests failed).
@@ -1950,6 +1957,7 @@ async def _gated_merge_task(
         security_review_blocks_merge=_security_review_blocks_merge,
         project_dir=project_dir,
         task_id=task_id,
+        security_review_enabled=security_review_enabled,
         block_on_missing=block_on_missing,
     )
     _gate_audit_log(
@@ -2438,10 +2446,14 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
     # loop that could miss a blocked task whose outcome was mutated
     # back to tests_passed.
     merged_tasks_seq: set[int] = set()
-    # Operator fail-open escape hatch — the ONLY policy input the gate takes
-    # from outside; it is a global feature flag (defaults fail-closed), not a
-    # per-task caller assertion (task #2706).
-    _merge_block_on_missing = is_feature_enabled(
+    # Global operator-policy inputs to the unified gate (task #2706): the
+    # review-enabled feature and the fail-open escape hatch. These are the
+    # SAME operator-config trust boundary as today — NOT per-task caller
+    # trust signals — so threading them keeps unification behaviour-identical
+    # while the per-task hole (review_blocks_merge / doc-only assertion) is
+    # gone. Computed once outside the loop.
+    _gate_security_review_enabled = is_security_review_enabled(args)
+    _gate_block_on_missing = is_feature_enabled(
         getattr(args, "dispatch_config", None) or {},
         "security_review_block_on_missing_artifact",
     )
@@ -2469,7 +2481,8 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
                     outcome=r["outcome"],
                     task_id=task_id,
                     project_context=project_context,
-                    block_on_missing=_merge_block_on_missing,
+                    security_review_enabled=_gate_security_review_enabled,
+                    block_on_missing=_gate_block_on_missing,
                 )
             except SecurityGateBypassError as exc:
                 # Phase K (F-04): narrow from `except Exception` so genuine
