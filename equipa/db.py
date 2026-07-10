@@ -46,6 +46,22 @@ def get_db_connection(write: bool = False) -> sqlite3.Connection:
         uri = f"file:{THEFORGE_DB}?mode=ro"
         conn = sqlite3.connect(uri, uri=True)
     conn.row_factory = sqlite3.Row
+
+    # Wait up to 5s for a competing lock to clear before raising
+    # sqlite3.OperationalError, matching heartbeat.py:_connect. EQUIPA runs N
+    # parallel agents writing telemetry to one shared SQLite file, so brief lock
+    # contention is expected; busy_timeout lets a blocked writer retry silently
+    # instead of failing the agent run on the first "database is locked". Applied
+    # to read-only handles too — it is a no-op write (connection-level setting),
+    # and it keeps a read that races a writer from erroring immediately.
+    #
+    # NOTE: journal_mode is deliberately left at SQLite's default (rollback
+    # journal). WAL is intentionally NOT enabled here: theforge.db is accessed
+    # cross-host over an SMB share (Windows Z: + Linux local path), and WAL
+    # relies on shared-memory / mmap coordination that is unsafe on network
+    # filesystems and can silently corrupt the DB across hosts. Any journal_mode
+    # change is out of scope for this connection layer — do not add one.
+    conn.execute("PRAGMA busy_timeout = 5000")
     return conn
 
 
@@ -64,6 +80,13 @@ def db_conn(write: bool = False) -> Iterator[sqlite3.Connection]:
 
     Read-only handles do not commit/rollback (the underlying connection is
     opened in URI ``mode=ro``), but they still get the guaranteed close.
+
+    The connection is obtained from :func:`get_db_connection`, so every handle
+    yielded here already has ``PRAGMA busy_timeout = 5000`` applied (read-only
+    and write alike) — a blocked writer waits up to 5s for a competing lock to
+    clear instead of failing immediately under EQUIPA's N-parallel-agent load.
+    See ``get_db_connection`` for why WAL journal_mode is deliberately NOT
+    enabled (SMB cross-host access makes WAL unsafe).
 
     Example:
         >>> with db_conn(write=True) as conn:
