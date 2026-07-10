@@ -1292,8 +1292,16 @@ async def run_mode_tasks(args: argparse.Namespace) -> None:
     await run_parallel_tasks(task_ids, args)
 
 
-async def run_mode_task(args: argparse.Namespace) -> None:
-    """Single-task or single-project mode (Phase 1 & 2)."""
+def _fetch_and_resolve_task(args: argparse.Namespace):
+    """Load the task, resolve its project directory and effective role, and
+    gather project context.
+
+    Extracted verbatim from ``run_mode_task`` (task 2705, pure refactor):
+    task fetch, dispatch-config auto-snapshot, project-dir resolution
+    (incl. scaffold bootstrap/clone), role resolution + validation, and the
+    task-info / checkpoint banner. Exits the process on any unrecoverable
+    error exactly as the inline code did. Returns
+    ``(task, project_dir, project_context)``."""
     # --- Fetch task ---
     if args.task:
         task = fetch_task(args.task)
@@ -1397,42 +1405,434 @@ async def run_mode_task(args: argparse.Namespace) -> None:
         print(f"Model: {role_model}")
         print(f"Budget: {role_budget}/{role_turns} turns (dynamic)")
         print(f"Max retries: {args.retries}")
+    return task, project_dir, project_context
+
+
+def _run_task_dry_run(task, project_context, project_dir, args):
+    """Dry-run branch: build a sample system prompt + CLI command and print
+    their sizes without dispatching. Behaviour identical to the inline
+    ``if args.dry_run`` block."""
+    # Build a sample prompt to show size
+    system_prompt = build_system_prompt(task, project_context, project_dir, role="developer",
+                                              dispatch_config=getattr(args, "dispatch_config", None))
+    dry_model = get_role_model("developer", args, task=task)
+    dry_turns = get_role_turns("developer", args, task=task)
+
+    # Use the contextmanager so the dry-run does NOT litter /tmp with
+    # leftover prompt files — the scanner reads the size while still
+    # inside the with-block, then the file is removed on exit.
+    with build_cli_command(
+        system_prompt, project_dir, dry_turns, dry_model, role="developer",
+    ) as cmd:
+        print("\n--- DRY RUN ---")
+        print(f"System prompt: {len(system_prompt)} chars, ~{estimate_tokens(system_prompt)} tokens")
+        print(f"Command ({len(cmd)} args):")
+        for i, part in enumerate(cmd):
+            if i > 0 and cmd[i - 1] == "--append-system-prompt":
+                print(f"  [system prompt: {len(part)} chars]")
+            elif i > 0 and cmd[i - 1] == "--append-system-prompt-file":
+                try:
+                    sz = os.path.getsize(part)
+                except OSError:
+                    sz = -1
+                print(f"  [system prompt file: {part} ({sz} bytes)]")
+            elif len(part) > 100:
+                print(f"  {part[:100]}...")
+            else:
+                print(f"  {part}")
+
+        if args.dev_test:
+            print(f"\nDev-Test loop would run up to {MAX_DEV_TEST_CYCLES} cycles.")
+            print("Each cycle: Developer agent -> Tester agent -> feedback loop.")
+
+        print("\n--- END DRY RUN ---")
+
+
+async def _run_dev_test_mode(task, project_dir, project_context, args):
+    """Dev+Tester iteration loop (Phase 2) with autoresearch retry.
+
+    Handles circuit-breaker demotion and the autoresearch retry/cleanup
+    loop. Returns ``(result, cycles, outcome)``."""
+    # Dev+Tester iteration loop (Phase 2) with autoresearch retry
+    print(f"\nStarting Dev+Test loop (max {MAX_DEV_TEST_CYCLES} cycles)...")
+
+    # Autoresearch config
+    dc = getattr(args, "dispatch_config", None) or {}
+    autoresearch_on = is_feature_enabled(dc, "autoresearch")
+    max_retries = dc.get("autoresearch_max_retries", 3) if autoresearch_on else 0
+    retry_count = 0
+    attempt_reflections: list[str] = []
+
+    while True:
+        try:
+            result, cycles, outcome = await run_dev_test_loop(
+                task, project_dir, project_context, args,
+            )
+        except CircuitOpenError as exc:
+            # S1 (2453, RT-02 follow-up): auto-routing fail-closed.
+            # Demote to ``circuit_breaker_blocked`` so the task can be
+            # re-tried after the breaker recovery window without
+            # silently escalating cost to opus via DEFAULT_ROLE_MODELS.
+            print(
+                f"  [GATE-AUDIT] task={task['id']} event=circuit-blocked "
+                f"role={exc.role} tier_attempted={exc.tier_attempted}"
+            )
+            # Task #2702: durably persist the gate event. This site emits
+            # via print() (stdout), not _gate_audit_log() (stderr), so we
+            # call the DB helper directly to avoid a duplicate stderr line.
+            # Best-effort fail-open — log_gate_audit swallows all DB errors.
+            log_gate_audit(
+                f"task={task['id']} event=circuit-blocked "
+                f"role={exc.role} tier_attempted={exc.tier_attempted}",
+                task["id"],
+                event="circuit-blocked",
+            )
+            print(
+                f"  [Routing] Task #{task['id']} blocked by circuit "
+                f"breaker ({exc}); deferring dispatch "
+                f"(outcome=circuit_breaker_blocked)."
+            )
+            result = {"cost": 0.0, "duration": 0.0}
+            cycles = 0
+            outcome = "circuit_breaker_blocked"
+            break
+
+        # Success - break out
+        if outcome in ("tests_passed", "no_tests", "early_completed_no_changes"):
+            break
+
+        # Capture reflection from the failed attempt for cross-attempt memory
+        attempt_reflections.append(
+            _build_dispatch_attempt_reflection(
+                retry_count + 1, outcome, cycles, result,
+            )
+        )
+
+        # Not retriable or exhausted
+        if not autoresearch_on or retry_count >= max_retries:
+            if retry_count > 0:
+                print(f"  [Autoresearch] Exhausted {retry_count}/{max_retries} retries "
+                      f"for task #{task['id']}. Final outcome: {outcome}")
+            break
+
+        retry_count += 1
+        print(f"  [Autoresearch] Task #{task['id']} failed ({outcome}). "
+              f"Retry {retry_count}/{max_retries}...")
+
+        # Clean up failed branch and reset task (with reflection memory)
+        await cleanup_failed_attempt(
+            task["id"], project_dir, attempt_reflections,
+        )
+    return result, cycles, outcome
+
+
+async def _run_security_review_and_gate(
+    task, project_dir, project_context, args, outcome,
+):
+    """Optional security review followed by the Bug #2450 unified gated
+    post-merge. May demote ``outcome`` to ``security_review_blocked``.
+    Returns the (possibly updated) ``outcome``."""
+    # Optional security review after successful dev-test. Must run
+    # BEFORE _post_task_telemetry so that CRITICAL/HIGH findings can
+    # demote the outcome to ``security_review_blocked`` and prevent
+    # the task from being marked done (parity with parallel-mode in
+    # equipa.dispatch.run_parallel_tasks). Bug 2448: single-task mode
+    # used to call run_security_review here and ignore the result,
+    # so the merge gate was silently bypassed in single-task mode
+    # (concretely task #2382 on 2026-05-19: 4 HIGH findings reported
+    # but the task was marked SUCCESS and merged to master).
+    review_blocks_merge = False
+    review_counts: dict | None = None
+    # Phase H (F-01): track whether the doc-only short-circuit fired,
+    # so the post-merge call can tell the defensive invariant inside
+    # _merge_task_branch NOT to demand an artifact that was never
+    # produced (doc-only diffs skip the reviewer per task #2358).
+    review_skipped_doc_only = False
+    if (
+        is_security_review_enabled(args)
+        and outcome in ("tests_passed", "no_tests")
+    ):
+        # Task 2360 defect 1: doc-only diffs (only .md/.txt/.rst etc.)
+        # cannot introduce code-level vulnerabilities, so the security
+        # gate must skip them rather than risk a prose-matching false
+        # positive blocking the merge. Concrete trigger: task 2358 — a
+        # CRYPTOTRADER-V3-ARCHITECTURE.md spec was blocked because the
+        # document used the word "HIGH" and discussed API-key auth.
+        # base_ref omitted → auto-detect default branch (task #2479).
+        changed_files = await get_changed_files_for_branch(
+            project_dir,
+        )
+        review_skipped_doc_only = is_doc_only_diff(changed_files)
+        review_crashed = False
+        if review_skipped_doc_only:
+            print(
+                f"  [Task #{task['id']}] SECURITY GATE: skipping "
+                f"review — doc-only change "
+                f"({len(changed_files)} file(s), all docs)."
+            )
+        else:
+            # Task 2341 S2 parity: if run_security_review raises, the
+            # artifact check alone is not enough — a stale review
+            # file from a prior run could exist and silently
+            # re-authorise. Treat a crashed reviewer as fail-closed
+            # regardless of artifact state.
+            try:
+                await run_security_review(
+                    task, project_dir, project_context, args,
+                )
+            except Exception:  # pragma: no cover - defensive
+                review_crashed = True
+                import logging
+                logging.getLogger(__name__).exception(
+                    "[Task #%s] security review crashed", task["id"],
+                )
+        if review_skipped_doc_only:
+            # Doc-only short-circuit: no artifact expected, do not
+            # let the missing-artifact fail-closed path block the
+            # merge here.
+            review_blocks_merge = False
+            review_counts = None
+        else:
+            _config_for_flag = (
+                getattr(args, "dispatch_config", None) or {}
+            )
+            _block_on_missing = is_feature_enabled(
+                _config_for_flag,
+                "security_review_block_on_missing_artifact",
+            )
+            review_blocks_merge, review_counts = (
+                _security_review_blocks_merge(
+                    project_dir, task["id"],
+                    block_on_missing=_block_on_missing,
+                )
+            )
+        if review_crashed:
+            review_blocks_merge = True
+            print(
+                f"  [Task #{task['id']}] SECURITY GATE: blocking "
+                f"merge — security review crashed; branch "
+                f"forge-task-{task['id']} left unmerged for "
+                f"operator review."
+            )
+            outcome = "security_review_blocked"
+        elif review_blocks_merge:
+            if review_counts is None:
+                print(
+                    f"  [Task #{task['id']}] SECURITY GATE: blocking "
+                    f"merge — .equipa-artifacts/SECURITY-REVIEW-"
+                    f"{task['id']}.md artifact is missing (fail-closed). Branch "
+                    f"forge-task-{task['id']} left unmerged for "
+                    f"operator review."
+                )
+            else:
+                print(
+                    f"  [Task #{task['id']}] SECURITY GATE: blocking "
+                    f"merge — {review_counts.get('CRITICAL', 0)} "
+                    f"CRITICAL, {review_counts.get('HIGH', 0)} "
+                    f"HIGH finding(s). Branch forge-task-"
+                    f"{task['id']} left unmerged for operator "
+                    f"review."
+                )
+            outcome = "security_review_blocked"
+
+    # Bug #2450: unified gated post-merge. Single-task ``--dev-test`` mode
+    # now performs the worktree-branch merge here, AFTER the security gate
+    # has run, via the same ``_merge_task_branch`` helper that parallel
+    # mode uses (equipa.dispatch.run_parallel_tasks). If the gate blocked
+    # (``review_blocks_merge`` truthy OR outcome demoted to
+    # ``security_review_blocked``), no merge is attempted and the branch
+    # is left intact for operator review. This couples the DB-gate and
+    # the git-merge that were previously decoupled (task 2449 proof:
+    # outcome=security_review_blocked but commits on master, branch gone).
+    if args.dev_test:
+        merge_branch = f"forge-task-{task['id']}"
+        merge_result = await _gated_post_merge(
+            repo=project_dir,
+            branch=merge_branch,
+            outcome=outcome,
+            review_blocks_merge=review_blocks_merge,
+            task_id=task["id"],
+            review_skipped_doc_only=review_skipped_doc_only,
+        )
+        if merge_result == "merged":
+            print(
+                f"  [Task #{task['id']}] MERGE: branch {merge_branch} "
+                f"merged to master via gated post-merge."
+            )
+        elif merge_result == "merge_failed":
+            print(
+                f"  [Task #{task['id']}] MERGE: gated post-merge failed "
+                f"for {merge_branch}; branch preserved for operator."
+            )
+        elif merge_result == "blocked":
+            print(
+                f"  [Task #{task['id']}] MERGE: skipped — security gate "
+                f"blocked merge of {merge_branch}."
+            )
+    return outcome
+
+
+async def _record_task_telemetry(task, result, outcome, cycles, args):
+    """Post-task telemetry for the dev+test path: DB update / ForgeSmith
+    recording, TheForge status verification, and the loop summary. Runs
+    after the security gate so a blocked outcome is what gets persisted."""
+    # Post-task telemetry (DB update, ForgeSmith recording, quality
+    # scoring, reflexion, MemRL). Runs AFTER the security gate so a
+    # ``security_review_blocked`` outcome is persisted to the task
+    # row (rather than ``tests_passed``).
+    task_role = task.get("role") or "developer"
+    # S1 (2453): telemetry must survive a CircuitOpenError-demoted
+    # outcome — no model was dispatched so log the sentinel
+    # ``circuit_blocked`` rather than re-raising through bookkeeping.
+    try:
+        telemetry_model = get_role_model(task_role, args, task=task)
+    except CircuitOpenError:
+        telemetry_model = "circuit_blocked"
+    await _post_task_telemetry(
+        task, result, outcome, role=task_role,
+        model=telemetry_model,
+        max_turns=get_role_turns(task_role, args, task=task),
+        cycle_number=cycles,
+        dispatch_config=getattr(args, "dispatch_config", None))
+
+    # Verify the task status in TheForge
+    verified, verify_msg = verify_task_updated(task["id"])
+
+    # Print loop summary
+    print_dev_test_summary(task, result, cycles, outcome, verified, verify_msg)
+
+
+async def _run_single_agent_mode(task, project_dir, project_context, args):
+    """Single-agent mode (Phase 1 — with model tiering): dynamic budget,
+    dispatch, outcome determination, the vacuous-pass / no-output guard
+    (task #2371), telemetry and summary."""
+    # Single-agent mode (Phase 1 — with model tiering)
+    from equipa.role_resolver import is_role_early_term_exempt
+    use_streaming = not is_role_early_term_exempt(args.role, project_dir)
+    role_turns_max = get_role_turns(args.role, args, task=task)
+    role_model = get_role_model(args.role, args, task=task)
+    # Dynamic budget for single-agent mode
+    role_turns_allocated, _ = calculate_dynamic_budget(role_turns_max)
+    system_prompt = build_system_prompt(
+        task, project_context, project_dir, role=args.role,
+        dispatch_config=getattr(args, "dispatch_config", None),
+        max_turns=role_turns_allocated,
+    )
+    print(f"Dynamic budget: {role_turns_allocated}/{role_turns_max} turns")
+    # Mark the wall-clock run start so the no-output guard's filesystem
+    # fallback can tell a fresh deliverable apart from pre-existing files
+    # (the only output signal in a non-git project dir).
+    from datetime import datetime as _dt
+    run_started_at = _dt.now()
+    with build_cli_command(
+        system_prompt, project_dir, role_turns_allocated, role_model, role=args.role,
+        streaming=use_streaming,
+    ) as cmd:
+        print(f"System prompt: {len(system_prompt)} chars, ~{estimate_tokens(system_prompt)} tokens")
+
+        print(f"\nStarting {args.role} agent...")
+        if use_streaming:
+            # Streaming mode with early termination — no retries (kill is intentional)
+            result = await run_agent_streaming(cmd, role=args.role)
+            attempts = 1
+        else:
+            result, attempts = await run_agent_with_retries(cmd, task, args.retries)
+
+    # Tag result with dynamic budget info for telemetry
+    result["turns_allocated"] = role_turns_allocated
+    result["turns_max"] = role_turns_max
+
+    # Determine outcome
+    if result.get("early_terminated"):
+        single_outcome = "early_terminated"
+    elif result["success"]:
+        single_outcome = "tests_passed"
+    else:
+        single_outcome = "developer_failed"
+
+    # Vacuous-pass / no-output guard (task #2371).
+    #
+    # Single-agent runs (NOT --dev-test) bypassed the Dev+Test loop
+    # vacuous-pass hook entirely, so a planner / code-reviewer run
+    # that wrote zero files was happily marked SUCCESS and the task
+    # row set to DONE (task #2361 on 2026-05-14 was the concrete
+    # repro). We now require role-specific on-disk evidence before
+    # accepting a single-agent run as ``tests_passed``.
+    if single_outcome == "tests_passed":
+        from equipa.single_agent_guard import (
+            evaluate_single_agent_outcome,
+            validate_tasks_created_claim,
+        )
+        outcome_check = evaluate_single_agent_outcome(
+            role=args.role,
+            task_id=task["id"],
+            run_result=result,
+            repo_path=Path(project_dir),
+            run_started_at=run_started_at,
+            project_dir=project_dir,
+        )
+        if outcome_check.is_blocked:
+            print(
+                f"  [no-output guard] Single-agent run produced no on-disk "
+                f"evidence — downgrading to BLOCKED.\n"
+                f"    role={args.role!r}, task=#{task['id']}\n"
+                f"    reason: {outcome_check.reason}"
+            )
+            single_outcome = "no_output"
+            result["no_output_reason"] = outcome_check.reason
+
+        # Reject hallucinated TASKS_CREATED lines even when files
+        # WERE written — the agent may still be lying about side-
+        # effects (e.g. task #2361's "TASKS_CREATED: 78,79,80,81,82"
+        # referenced unrelated pre-existing ForgeBridge tickets).
+        if single_outcome == "tests_passed":
+            try:
+                from equipa.db import get_db_connection
+                db_handle = _TasksCreatedDb(get_db_connection())
+            except Exception:  # pragma: no cover — defensive
+                db_handle = None
+            if db_handle is not None:
+                with db_handle:
+                    tc_check = validate_tasks_created_claim(
+                        stdout=result.get("stdout", "") or "",
+                        run_started_at=result.get("started_at"),
+                        expected_project_id=task.get("project_id"),
+                        db=db_handle,
+                    )
+                if not tc_check.is_valid:
+                    print(
+                        f"  [no-output guard] Rejected hallucinated "
+                        f"TASKS_CREATED claim: {tc_check.reason}"
+                    )
+                    single_outcome = "no_output"
+                    result["tasks_created_rejection"] = tc_check.reason
+
+    # Post-task telemetry
+    await _post_task_telemetry(
+        task, result, single_outcome, role=args.role,
+        model=role_model, max_turns=role_turns_max,
+        dispatch_config=getattr(args, "dispatch_config", None))
+
+    # Verify the task status in TheForge
+    verified, verify_msg = verify_task_updated(task["id"])
+
+    # Print summary
+    print_summary(task, result, verified, verify_msg)
+    if attempts > 1:
+        print(f"  Attempts: {attempts}/{args.retries}")
+
+
+async def run_mode_task(args: argparse.Namespace) -> None:
+    """Single-task or single-project mode (Phase 1 & 2).
+
+    Thin orchestrator over the extracted phase helpers (task 2705): resolve
+    the task, optionally dry-run, confirm, then dispatch to either the
+    dev+test loop (with security gate and telemetry) or the single-agent
+    path. Behaviour is identical to the pre-refactor monolith."""
+    task, project_dir, project_context = _fetch_and_resolve_task(args)
 
     if args.dry_run:
-        # Build a sample prompt to show size
-        system_prompt = build_system_prompt(task, project_context, project_dir, role="developer",
-                                                  dispatch_config=getattr(args, "dispatch_config", None))
-        dry_model = get_role_model("developer", args, task=task)
-        dry_turns = get_role_turns("developer", args, task=task)
-
-        # Use the contextmanager so the dry-run does NOT litter /tmp with
-        # leftover prompt files — the scanner reads the size while still
-        # inside the with-block, then the file is removed on exit.
-        with build_cli_command(
-            system_prompt, project_dir, dry_turns, dry_model, role="developer",
-        ) as cmd:
-            print("\n--- DRY RUN ---")
-            print(f"System prompt: {len(system_prompt)} chars, ~{estimate_tokens(system_prompt)} tokens")
-            print(f"Command ({len(cmd)} args):")
-            for i, part in enumerate(cmd):
-                if i > 0 and cmd[i - 1] == "--append-system-prompt":
-                    print(f"  [system prompt: {len(part)} chars]")
-                elif i > 0 and cmd[i - 1] == "--append-system-prompt-file":
-                    try:
-                        sz = os.path.getsize(part)
-                    except OSError:
-                        sz = -1
-                    print(f"  [system prompt file: {part} ({sz} bytes)]")
-                elif len(part) > 100:
-                    print(f"  {part[:100]}...")
-                else:
-                    print(f"  {part}")
-
-            if args.dev_test:
-                print(f"\nDev-Test loop would run up to {MAX_DEV_TEST_CYCLES} cycles.")
-                print("Each cycle: Developer agent -> Tester agent -> feedback loop.")
-
-            print("\n--- END DRY RUN ---")
+        _run_task_dry_run(task, project_context, project_dir, args)
         return
 
     # Confirm before running
@@ -1446,355 +1846,17 @@ async def run_mode_task(args: argparse.Namespace) -> None:
     # --- Execute ---
 
     if args.dev_test:
-        # Dev+Tester iteration loop (Phase 2) with autoresearch retry
-        print(f"\nStarting Dev+Test loop (max {MAX_DEV_TEST_CYCLES} cycles)...")
-
-        # Autoresearch config
-        dc = getattr(args, "dispatch_config", None) or {}
-        autoresearch_on = is_feature_enabled(dc, "autoresearch")
-        max_retries = dc.get("autoresearch_max_retries", 3) if autoresearch_on else 0
-        retry_count = 0
-        attempt_reflections: list[str] = []
-
-        while True:
-            try:
-                result, cycles, outcome = await run_dev_test_loop(
-                    task, project_dir, project_context, args,
-                )
-            except CircuitOpenError as exc:
-                # S1 (2453, RT-02 follow-up): auto-routing fail-closed.
-                # Demote to ``circuit_breaker_blocked`` so the task can be
-                # re-tried after the breaker recovery window without
-                # silently escalating cost to opus via DEFAULT_ROLE_MODELS.
-                print(
-                    f"  [GATE-AUDIT] task={task['id']} event=circuit-blocked "
-                    f"role={exc.role} tier_attempted={exc.tier_attempted}"
-                )
-                # Task #2702: durably persist the gate event. This site emits
-                # via print() (stdout), not _gate_audit_log() (stderr), so we
-                # call the DB helper directly to avoid a duplicate stderr line.
-                # Best-effort fail-open — log_gate_audit swallows all DB errors.
-                log_gate_audit(
-                    f"task={task['id']} event=circuit-blocked "
-                    f"role={exc.role} tier_attempted={exc.tier_attempted}",
-                    task["id"],
-                    event="circuit-blocked",
-                )
-                print(
-                    f"  [Routing] Task #{task['id']} blocked by circuit "
-                    f"breaker ({exc}); deferring dispatch "
-                    f"(outcome=circuit_breaker_blocked)."
-                )
-                result = {"cost": 0.0, "duration": 0.0}
-                cycles = 0
-                outcome = "circuit_breaker_blocked"
-                break
-
-            # Success - break out
-            if outcome in ("tests_passed", "no_tests", "early_completed_no_changes"):
-                break
-
-            # Capture reflection from the failed attempt for cross-attempt memory
-            attempt_reflections.append(
-                _build_dispatch_attempt_reflection(
-                    retry_count + 1, outcome, cycles, result,
-                )
-            )
-
-            # Not retriable or exhausted
-            if not autoresearch_on or retry_count >= max_retries:
-                if retry_count > 0:
-                    print(f"  [Autoresearch] Exhausted {retry_count}/{max_retries} retries "
-                          f"for task #{task['id']}. Final outcome: {outcome}")
-                break
-
-            retry_count += 1
-            print(f"  [Autoresearch] Task #{task['id']} failed ({outcome}). "
-                  f"Retry {retry_count}/{max_retries}...")
-
-            # Clean up failed branch and reset task (with reflection memory)
-            await cleanup_failed_attempt(
-                task["id"], project_dir, attempt_reflections,
-            )
-
-        # Optional security review after successful dev-test. Must run
-        # BEFORE _post_task_telemetry so that CRITICAL/HIGH findings can
-        # demote the outcome to ``security_review_blocked`` and prevent
-        # the task from being marked done (parity with parallel-mode in
-        # equipa.dispatch.run_parallel_tasks). Bug 2448: single-task mode
-        # used to call run_security_review here and ignore the result,
-        # so the merge gate was silently bypassed in single-task mode
-        # (concretely task #2382 on 2026-05-19: 4 HIGH findings reported
-        # but the task was marked SUCCESS and merged to master).
-        review_blocks_merge = False
-        review_counts: dict | None = None
-        # Phase H (F-01): track whether the doc-only short-circuit fired,
-        # so the post-merge call can tell the defensive invariant inside
-        # _merge_task_branch NOT to demand an artifact that was never
-        # produced (doc-only diffs skip the reviewer per task #2358).
-        review_skipped_doc_only = False
-        if (
-            is_security_review_enabled(args)
-            and outcome in ("tests_passed", "no_tests")
-        ):
-            # Task 2360 defect 1: doc-only diffs (only .md/.txt/.rst etc.)
-            # cannot introduce code-level vulnerabilities, so the security
-            # gate must skip them rather than risk a prose-matching false
-            # positive blocking the merge. Concrete trigger: task 2358 — a
-            # CRYPTOTRADER-V3-ARCHITECTURE.md spec was blocked because the
-            # document used the word "HIGH" and discussed API-key auth.
-            # base_ref omitted → auto-detect default branch (task #2479).
-            changed_files = await get_changed_files_for_branch(
-                project_dir,
-            )
-            review_skipped_doc_only = is_doc_only_diff(changed_files)
-            review_crashed = False
-            if review_skipped_doc_only:
-                print(
-                    f"  [Task #{task['id']}] SECURITY GATE: skipping "
-                    f"review — doc-only change "
-                    f"({len(changed_files)} file(s), all docs)."
-                )
-            else:
-                # Task 2341 S2 parity: if run_security_review raises, the
-                # artifact check alone is not enough — a stale review
-                # file from a prior run could exist and silently
-                # re-authorise. Treat a crashed reviewer as fail-closed
-                # regardless of artifact state.
-                try:
-                    await run_security_review(
-                        task, project_dir, project_context, args,
-                    )
-                except Exception:  # pragma: no cover - defensive
-                    review_crashed = True
-                    import logging
-                    logging.getLogger(__name__).exception(
-                        "[Task #%s] security review crashed", task["id"],
-                    )
-            if review_skipped_doc_only:
-                # Doc-only short-circuit: no artifact expected, do not
-                # let the missing-artifact fail-closed path block the
-                # merge here.
-                review_blocks_merge = False
-                review_counts = None
-            else:
-                _config_for_flag = (
-                    getattr(args, "dispatch_config", None) or {}
-                )
-                _block_on_missing = is_feature_enabled(
-                    _config_for_flag,
-                    "security_review_block_on_missing_artifact",
-                )
-                review_blocks_merge, review_counts = (
-                    _security_review_blocks_merge(
-                        project_dir, task["id"],
-                        block_on_missing=_block_on_missing,
-                    )
-                )
-            if review_crashed:
-                review_blocks_merge = True
-                print(
-                    f"  [Task #{task['id']}] SECURITY GATE: blocking "
-                    f"merge — security review crashed; branch "
-                    f"forge-task-{task['id']} left unmerged for "
-                    f"operator review."
-                )
-                outcome = "security_review_blocked"
-            elif review_blocks_merge:
-                if review_counts is None:
-                    print(
-                        f"  [Task #{task['id']}] SECURITY GATE: blocking "
-                        f"merge — .equipa-artifacts/SECURITY-REVIEW-"
-                        f"{task['id']}.md artifact is missing (fail-closed). Branch "
-                        f"forge-task-{task['id']} left unmerged for "
-                        f"operator review."
-                    )
-                else:
-                    print(
-                        f"  [Task #{task['id']}] SECURITY GATE: blocking "
-                        f"merge — {review_counts.get('CRITICAL', 0)} "
-                        f"CRITICAL, {review_counts.get('HIGH', 0)} "
-                        f"HIGH finding(s). Branch forge-task-"
-                        f"{task['id']} left unmerged for operator "
-                        f"review."
-                    )
-                outcome = "security_review_blocked"
-
-        # Bug #2450: unified gated post-merge. Single-task ``--dev-test`` mode
-        # now performs the worktree-branch merge here, AFTER the security gate
-        # has run, via the same ``_merge_task_branch`` helper that parallel
-        # mode uses (equipa.dispatch.run_parallel_tasks). If the gate blocked
-        # (``review_blocks_merge`` truthy OR outcome demoted to
-        # ``security_review_blocked``), no merge is attempted and the branch
-        # is left intact for operator review. This couples the DB-gate and
-        # the git-merge that were previously decoupled (task 2449 proof:
-        # outcome=security_review_blocked but commits on master, branch gone).
-        if args.dev_test:
-            merge_branch = f"forge-task-{task['id']}"
-            merge_result = await _gated_post_merge(
-                repo=project_dir,
-                branch=merge_branch,
-                outcome=outcome,
-                review_blocks_merge=review_blocks_merge,
-                task_id=task["id"],
-                review_skipped_doc_only=review_skipped_doc_only,
-            )
-            if merge_result == "merged":
-                print(
-                    f"  [Task #{task['id']}] MERGE: branch {merge_branch} "
-                    f"merged to master via gated post-merge."
-                )
-            elif merge_result == "merge_failed":
-                print(
-                    f"  [Task #{task['id']}] MERGE: gated post-merge failed "
-                    f"for {merge_branch}; branch preserved for operator."
-                )
-            elif merge_result == "blocked":
-                print(
-                    f"  [Task #{task['id']}] MERGE: skipped — security gate "
-                    f"blocked merge of {merge_branch}."
-                )
-
-        # Post-task telemetry (DB update, ForgeSmith recording, quality
-        # scoring, reflexion, MemRL). Runs AFTER the security gate so a
-        # ``security_review_blocked`` outcome is persisted to the task
-        # row (rather than ``tests_passed``).
-        task_role = task.get("role") or "developer"
-        # S1 (2453): telemetry must survive a CircuitOpenError-demoted
-        # outcome — no model was dispatched so log the sentinel
-        # ``circuit_blocked`` rather than re-raising through bookkeeping.
-        try:
-            telemetry_model = get_role_model(task_role, args, task=task)
-        except CircuitOpenError:
-            telemetry_model = "circuit_blocked"
-        await _post_task_telemetry(
-            task, result, outcome, role=task_role,
-            model=telemetry_model,
-            max_turns=get_role_turns(task_role, args, task=task),
-            cycle_number=cycles,
-            dispatch_config=getattr(args, "dispatch_config", None))
-
-        # Verify the task status in TheForge
-        verified, verify_msg = verify_task_updated(task["id"])
-
-        # Print loop summary
-        print_dev_test_summary(task, result, cycles, outcome, verified, verify_msg)
-
-    else:
-        # Single-agent mode (Phase 1 — with model tiering)
-        from equipa.role_resolver import is_role_early_term_exempt
-        use_streaming = not is_role_early_term_exempt(args.role, project_dir)
-        role_turns_max = get_role_turns(args.role, args, task=task)
-        role_model = get_role_model(args.role, args, task=task)
-        # Dynamic budget for single-agent mode
-        role_turns_allocated, _ = calculate_dynamic_budget(role_turns_max)
-        system_prompt = build_system_prompt(
-            task, project_context, project_dir, role=args.role,
-            dispatch_config=getattr(args, "dispatch_config", None),
-            max_turns=role_turns_allocated,
+        result, cycles, outcome = await _run_dev_test_mode(
+            task, project_dir, project_context, args,
         )
-        print(f"Dynamic budget: {role_turns_allocated}/{role_turns_max} turns")
-        # Mark the wall-clock run start so the no-output guard's filesystem
-        # fallback can tell a fresh deliverable apart from pre-existing files
-        # (the only output signal in a non-git project dir).
-        from datetime import datetime as _dt
-        run_started_at = _dt.now()
-        with build_cli_command(
-            system_prompt, project_dir, role_turns_allocated, role_model, role=args.role,
-            streaming=use_streaming,
-        ) as cmd:
-            print(f"System prompt: {len(system_prompt)} chars, ~{estimate_tokens(system_prompt)} tokens")
-
-            print(f"\nStarting {args.role} agent...")
-            if use_streaming:
-                # Streaming mode with early termination — no retries (kill is intentional)
-                result = await run_agent_streaming(cmd, role=args.role)
-                attempts = 1
-            else:
-                result, attempts = await run_agent_with_retries(cmd, task, args.retries)
-
-        # Tag result with dynamic budget info for telemetry
-        result["turns_allocated"] = role_turns_allocated
-        result["turns_max"] = role_turns_max
-
-        # Determine outcome
-        if result.get("early_terminated"):
-            single_outcome = "early_terminated"
-        elif result["success"]:
-            single_outcome = "tests_passed"
-        else:
-            single_outcome = "developer_failed"
-
-        # Vacuous-pass / no-output guard (task #2371).
-        #
-        # Single-agent runs (NOT --dev-test) bypassed the Dev+Test loop
-        # vacuous-pass hook entirely, so a planner / code-reviewer run
-        # that wrote zero files was happily marked SUCCESS and the task
-        # row set to DONE (task #2361 on 2026-05-14 was the concrete
-        # repro). We now require role-specific on-disk evidence before
-        # accepting a single-agent run as ``tests_passed``.
-        if single_outcome == "tests_passed":
-            from equipa.single_agent_guard import (
-                evaluate_single_agent_outcome,
-                validate_tasks_created_claim,
-            )
-            outcome_check = evaluate_single_agent_outcome(
-                role=args.role,
-                task_id=task["id"],
-                run_result=result,
-                repo_path=Path(project_dir),
-                run_started_at=run_started_at,
-                project_dir=project_dir,
-            )
-            if outcome_check.is_blocked:
-                print(
-                    f"  [no-output guard] Single-agent run produced no on-disk "
-                    f"evidence — downgrading to BLOCKED.\n"
-                    f"    role={args.role!r}, task=#{task['id']}\n"
-                    f"    reason: {outcome_check.reason}"
-                )
-                single_outcome = "no_output"
-                result["no_output_reason"] = outcome_check.reason
-
-            # Reject hallucinated TASKS_CREATED lines even when files
-            # WERE written — the agent may still be lying about side-
-            # effects (e.g. task #2361's "TASKS_CREATED: 78,79,80,81,82"
-            # referenced unrelated pre-existing ForgeBridge tickets).
-            if single_outcome == "tests_passed":
-                try:
-                    from equipa.db import get_db_connection
-                    db_handle = _TasksCreatedDb(get_db_connection())
-                except Exception:  # pragma: no cover — defensive
-                    db_handle = None
-                if db_handle is not None:
-                    with db_handle:
-                        tc_check = validate_tasks_created_claim(
-                            stdout=result.get("stdout", "") or "",
-                            run_started_at=result.get("started_at"),
-                            expected_project_id=task.get("project_id"),
-                            db=db_handle,
-                        )
-                    if not tc_check.is_valid:
-                        print(
-                            f"  [no-output guard] Rejected hallucinated "
-                            f"TASKS_CREATED claim: {tc_check.reason}"
-                        )
-                        single_outcome = "no_output"
-                        result["tasks_created_rejection"] = tc_check.reason
-
-        # Post-task telemetry
-        await _post_task_telemetry(
-            task, result, single_outcome, role=args.role,
-            model=role_model, max_turns=role_turns_max,
-            dispatch_config=getattr(args, "dispatch_config", None))
-
-        # Verify the task status in TheForge
-        verified, verify_msg = verify_task_updated(task["id"])
-
-        # Print summary
-        print_summary(task, result, verified, verify_msg)
-        if attempts > 1:
-            print(f"  Attempts: {attempts}/{args.retries}")
+        outcome = await _run_security_review_and_gate(
+            task, project_dir, project_context, args, outcome,
+        )
+        await _record_task_telemetry(task, result, outcome, cycles, args)
+    else:
+        await _run_single_agent_mode(
+            task, project_dir, project_context, args,
+        )
 
 
 # --- Mode Dispatcher ---
