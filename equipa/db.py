@@ -558,6 +558,77 @@ def log_agent_action(
         logger.exception("[Telemetry] Failed to log agent action")
 
 
+def log_gate_audit(
+    message: str,
+    task_id: int | None,
+    event: str | None = None,
+    counts: dict | None = None,
+) -> None:
+    """Best-effort persist of a security-gate audit event to ``agent_actions``.
+
+    Companion to the stderr ``[GATE-AUDIT]`` emit in
+    :func:`equipa.security_gate._gate_audit_log` (task #2702). The stderr line
+    remains the primary, synchronous record; this adds a durable row so a
+    post-hoc audit of "why did this branch merge or block" survives log
+    rotation / a lost nohup file.
+
+    FAIL-OPEN (task #2702): any DB error — locked file, missing table, bad
+    schema — is logged and swallowed. This function must NEVER raise into the
+    merge/gate path. The gate DECISION itself stays fail-closed in
+    ``dispatch._gated_merge_task``; only this audit persistence is
+    non-blocking.
+
+    ``agent_actions`` has no dedicated ``action_type``/``message`` column, so
+    the gate event is mapped onto the existing columns:
+
+      * ``tool_name``          = ``"gate-audit"``  (the action-type discriminator)
+      * ``tool_input_preview`` = the full audit ``message`` text
+      * ``role``               = ``"security-gate"``
+      * ``error_summary``      = ``event`` tag when supplied (queryable filter)
+      * ``cycle_number`` / ``turn_number`` = 0 (a gate event is not tied to a
+        dev-test cycle or agent turn)
+
+    When ``task_id`` is ``None`` (not supplied by the caller / not parseable)
+    the DB row is skipped, because ``agent_actions.task_id`` is ``NOT NULL``;
+    the stderr line already carries the event text in that case.
+
+    Args:
+        message: the full audit line text (stored verbatim for the audit trail).
+        task_id: the task the gate event belongs to; ``None`` skips the write.
+        event: short event tag (e.g. ``"merge-succeeded"``) stored as a
+            queryable filter in ``error_summary``. Optional.
+        counts: finding counts dict; currently informational only (the message
+            text already renders them). Accepted so callers can pass structured
+            data without stringifying it themselves.
+    """
+    if task_id is None:
+        return
+    try:
+        ensure_schema()
+        # error_summary is a first-200-chars column in the schema; keep the
+        # event tag well within that so we never rely on silent truncation.
+        event_tag = event[:200] if event else None
+        with db_conn(write=True) as conn:
+            conn.execute(
+                """INSERT INTO agent_actions
+                   (task_id, run_id, cycle_number, role, turn_number, tool_name,
+                    tool_input_preview, input_hash, output_length, success,
+                    error_type, error_summary, duration_ms)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (task_id, None, 0, "security-gate", 0, "gate-audit",
+                 message, None, None, 1,
+                 None, event_tag, None),
+            )
+    except Exception:
+        # AUDIT persistence is best-effort fail-open (task #2702): a locked DB,
+        # missing table, or schema error must never change gate behavior or
+        # raise into the merge path. Broad except is intentional; log so ops
+        # can grep [GATE-AUDIT] for swallowed persistence failures.
+        logger.exception(
+            "[GATE-AUDIT] Failed to persist gate audit for task %s", task_id
+        )
+
+
 def bulk_log_agent_actions(
     action_log: list[dict],
     task_id: int,

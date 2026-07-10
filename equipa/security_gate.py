@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -39,18 +40,82 @@ from equipa.git_ops import git_run_async
 logger = logging.getLogger(__name__)
 
 
-def _gate_audit_log(message: str) -> None:
-    """Emit a ``[GATE-AUDIT]`` line when EQUIPA_GATE_AUDIT_LOG=1 (default).
+def _gate_audit_log(
+    message: str,
+    *,
+    task_id: int | None = None,
+    event: str | None = None,
+    counts: dict | None = None,
+) -> None:
+    """Emit a ``[GATE-AUDIT]`` line and persist a durable audit row.
 
-    Task #2451 Phase G:
+    Task #2451 Phase G — stderr behaviour (UNCHANGED by task #2702):
       * Lives in the leaf ``security_gate`` module so both ``dispatch`` and
         ``cli`` can import it without a circular dependency (GATE-07).
       * Writes ONLY to ``sys.stderr`` — the prior implementation also called
         ``logger.info`` which double-emitted in CI capture (GATE-06).
+      * The ``EQUIPA_GATE_AUDIT_LOG`` env gate silences the stderr line
+        (default ``"1"`` = emit) so CI capture does not double-emit.
+
+    Task #2702 — durable persistence (NEW, additive):
+      * In addition to the stderr line, each gate event is persisted to the
+        ``agent_actions`` table so a post-hoc audit of "why did this branch
+        merge or block" survives a lost nohup log.
+      * Callers SUPPLY the structured ``task_id`` (and optional ``event`` /
+        ``counts``) rather than this function parsing its own message string.
+        As a compatibility net for callers that pre-date the kwargs, a narrow
+        ``task=<n>`` fallback is parsed from ``message`` — the structured
+        param always takes precedence.
+      * Persistence is INDEPENDENT of ``EQUIPA_GATE_AUDIT_LOG``: that env gate
+        only silences the stderr line (a CI double-emit concern); the audit
+        trail must remain durable even when stderr is muted.
+      * The DB write is best-effort FAIL-OPEN — any error is swallowed inside
+        :func:`equipa.db.log_gate_audit` and can never alter the gate
+        decision or raise into the merge path. ``equipa.db`` is imported
+        lazily here so the leaf ``security_gate`` module keeps a clean import
+        graph and an import failure cannot break the stderr path.
+
+    Args:
+        message: the human-readable audit line (emitted to stderr and stored
+            verbatim as the durable record).
+        task_id: task the event belongs to; enables the DB row. When ``None``
+            a ``task=<n>`` token in ``message`` is used as a fallback.
+        event: short event tag (e.g. ``"merge-succeeded"``) for queryable
+            filtering in the persisted row.
+        counts: finding counts dict, passed through to the persistence layer.
     """
-    if os.environ.get("EQUIPA_GATE_AUDIT_LOG", "1") == "0":
+    if os.environ.get("EQUIPA_GATE_AUDIT_LOG", "1") != "0":
+        print(f"[GATE-AUDIT] {message}", file=sys.stderr, flush=True)
+
+    resolved_task_id = task_id if task_id is not None else _parse_task_id(message)
+    if resolved_task_id is None:
         return
-    print(f"[GATE-AUDIT] {message}", file=sys.stderr, flush=True)
+    try:
+        from equipa.db import log_gate_audit
+
+        log_gate_audit(
+            message, resolved_task_id, event=event, counts=counts,
+        )
+    except Exception:
+        # Defence in depth: log_gate_audit is already fail-open, but even the
+        # lazy import must never raise into the gate/merge path (task #2702).
+        logger.exception("[GATE-AUDIT] audit persistence dispatch failed")
+
+
+# Matches the ``task=<n>`` token that every _gate_audit_log message embeds,
+# used only as a fallback when a caller does not pass the structured task_id.
+_TASK_ID_RE = re.compile(r"\btask[=# ](\d+)\b")
+
+
+def _parse_task_id(message: str) -> int | None:
+    """Best-effort extraction of the task id from an audit ``message``.
+
+    Fallback only — callers should pass ``task_id`` explicitly. Returns
+    ``None`` when no ``task=<n>`` token is present so persistence is skipped
+    rather than attributing the event to the wrong task.
+    """
+    match = _TASK_ID_RE.search(message or "")
+    return int(match.group(1)) if match else None
 
 
 def format_counts(counts: dict | None) -> str:

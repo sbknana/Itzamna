@@ -46,6 +46,7 @@ from equipa.constants import (
 from equipa.db import (
     db_conn,
     get_db_connection,
+    log_gate_audit,
     record_agent_run,
     update_task_status,
 )
@@ -536,6 +537,16 @@ async def run_dev_test_loop_with_autoresearch(
                 f"  [GATE-AUDIT] task={task_id} event=circuit-blocked "
                 f"role={exc.role} tier_attempted={exc.tier_attempted}",
                 output,
+            )
+            # Task #2702: durably persist the gate event too. This site emits
+            # via log() (operator stdout), not _gate_audit_log() (stderr), so
+            # we call the DB helper directly to avoid a duplicate stderr line.
+            # Best-effort fail-open — log_gate_audit swallows all DB errors.
+            log_gate_audit(
+                f"task={task_id} event=circuit-blocked "
+                f"role={exc.role} tier_attempted={exc.tier_attempted}",
+                task_id,
+                event="circuit-blocked",
             )
             log(
                 f"  [Routing] Task #{task_id} blocked by circuit breaker "
@@ -1495,7 +1506,9 @@ async def _merge_task_branch(
     if not expect_artifact:
         _gate_audit_log(
             f"task={task_id} event=defensive-invariant-skipped "
-            f"reason=doc-only-no-artifact-expected"
+            f"reason=doc-only-no-artifact-expected",
+            task_id=task_id,
+            event="defensive-invariant-skipped",
         )
     else:
         counts = _count_findings_in_review_file(review_path)
@@ -1504,7 +1517,9 @@ async def _merge_task_branch(
                 f"task={task_id} event=defensive-invariant-fired "
                 f"artifact={review_path.name} "
                 f"reason=artifact-unparseable-or-missing "
-                f"{format_counts(None)}"
+                f"{format_counts(None)}",
+                task_id=task_id,
+                event="defensive-invariant-fired",
             )
             raise SecurityGateBypassError(
                 f"Refusing to merge branch {branch_name!r}: "
@@ -1516,7 +1531,10 @@ async def _merge_task_branch(
         if counts.get("CRITICAL", 0) > 0 or counts.get("HIGH", 0) > 0:
             _gate_audit_log(
                 f"task={task_id} event=defensive-invariant-fired "
-                f"artifact={review_path.name} {format_counts(counts)}"
+                f"artifact={review_path.name} {format_counts(counts)}",
+                task_id=task_id,
+                event="defensive-invariant-fired",
+                counts=counts,
             )
             raise SecurityGateBypassError(
                 f"Refusing to merge branch {branch_name!r}: "
@@ -1807,7 +1825,10 @@ def _security_review_blocks_merge(
     _gate_audit_log(
         f"task={task_id} event=blocks-merge-eval "
         f"artifact_exists={review_path.exists()} "
-        f"{format_counts(counts)} block_on_missing={block_on_missing}"
+        f"{format_counts(counts)} block_on_missing={block_on_missing}",
+        task_id=task_id,
+        event="blocks-merge-eval",
+        counts=counts,
     )
     if counts is None:
         if block_on_missing:
@@ -1868,14 +1889,18 @@ async def _gated_merge_task(
     # operator-facing logs and for the audit trail.
     if review_blocks_merge is True:
         _gate_audit_log(
-            f"task={task_id} event=merge-skipped reason=caller-gate-blocked"
+            f"task={task_id} event=merge-skipped reason=caller-gate-blocked",
+            task_id=task_id,
+            event="merge-skipped",
         )
         return "blocked"
 
     if outcome not in ("tests_passed", "no_tests"):
         _gate_audit_log(
             f"task={task_id} event=merge-skipped reason=outcome-not-eligible "
-            f"outcome={outcome}"
+            f"outcome={outcome}",
+            task_id=task_id,
+            event="merge-skipped",
         )
         return "skipped"
 
@@ -1887,7 +1912,9 @@ async def _gated_merge_task(
         if not expect_artifact:
             _gate_audit_log(
                 f"task={task_id} event=artifact-recheck-skipped "
-                f"reason=doc-only-no-artifact-expected"
+                f"reason=doc-only-no-artifact-expected",
+                task_id=task_id,
+                event="artifact-recheck-skipped",
             )
         else:
             blocks, counts = _security_review_blocks_merge(
@@ -1896,13 +1923,18 @@ async def _gated_merge_task(
             if blocks:
                 _gate_audit_log(
                     f"task={task_id} event=merge-skipped "
-                    f"reason=security-review-blocked {format_counts(counts)}"
+                    f"reason=security-review-blocked {format_counts(counts)}",
+                    task_id=task_id,
+                    event="merge-skipped",
+                    counts=counts,
                 )
                 return "blocked"
 
     _gate_audit_log(
         f"task={task_id} event=merge-attempt branch={branch} "
-        f"caller_flag={review_blocks_merge!r}"
+        f"caller_flag={review_blocks_merge!r}",
+        task_id=task_id,
+        event="merge-attempt",
     )
     try:
         merged = await _merge_task_branch(
@@ -1911,13 +1943,23 @@ async def _gated_merge_task(
         )
     except SecurityGateBypassError as exc:
         _gate_audit_log(
-            f"task={task_id} event=defensive-invariant-blocked detail={exc}"
+            f"task={task_id} event=defensive-invariant-blocked detail={exc}",
+            task_id=task_id,
+            event="defensive-invariant-blocked",
         )
         return "blocked"
     if merged:
-        _gate_audit_log(f"task={task_id} event=merge-succeeded branch={branch}")
+        _gate_audit_log(
+            f"task={task_id} event=merge-succeeded branch={branch}",
+            task_id=task_id,
+            event="merge-succeeded",
+        )
         return "merged"
-    _gate_audit_log(f"task={task_id} event=merge-failed branch={branch}")
+    _gate_audit_log(
+        f"task={task_id} event=merge-failed branch={branch}",
+        task_id=task_id,
+        event="merge-failed",
+    )
     return "merge_failed"
 
 
@@ -2392,7 +2434,9 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
                 # the same way other unhandled errors are).
                 _gate_audit_log(
                     f"task={task_id} event=defensive-invariant-blocked "
-                    f"branch={branch_name} detail={exc}"
+                    f"branch={branch_name} detail={exc}",
+                    task_id=task_id,
+                    event="defensive-invariant-blocked",
                 )
                 continue
             if merge_status == "merged":
