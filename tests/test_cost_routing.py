@@ -171,7 +171,7 @@ def test_get_role_model_respects_all_5_overrides_when_auto_routing_on():
         "features": {"auto_model_routing": True},
         "model_trivial": "haiku",  # explicit override
     }
-    args = Mock(model="sonnet", dispatch_config=None)
+    args = Mock(model=None, dispatch_config=None)  # CLI un-set (task-2610 sentinel)
     result = get_role_model(role, args, config=config, task=task)
     assert result == "haiku", "Expected complexity override to win over auto-routing"
 
@@ -180,7 +180,7 @@ def test_get_role_model_respects_all_5_overrides_when_auto_routing_on():
         "features": {"auto_model_routing": True},
         "model_developer": "opus",  # role override
     }
-    args = Mock(model="sonnet", dispatch_config=None)
+    args = Mock(model=None, dispatch_config=None)  # CLI un-set (task-2610 sentinel)
     result = get_role_model(role, args, config=config, task=task)
     assert result == "opus", "Expected role override to win over auto-routing"
 
@@ -195,7 +195,7 @@ def test_get_role_model_respects_all_5_overrides_when_auto_routing_on():
         "features": {"auto_model_routing": True},
         "model": "opus",  # global override
     }
-    args = Mock(model="sonnet", dispatch_config=None)  # CLI is sonnet (default)
+    args = Mock(model=None, dispatch_config=None)  # CLI un-set (task-2610 sentinel)
     result = get_role_model(role, args, config=config, task=task)
     assert result == "opus", "Expected global config override to win over auto-routing"
 
@@ -205,7 +205,7 @@ def test_get_role_model_respects_all_5_overrides_when_auto_routing_on():
     # This test verifies DEFAULT_ROLE_MODELS is checked after CLI but BEFORE auto-routing
     # Use DEFAULT_MODEL (sonnet) for args.model to test DEFAULT_ROLE_MODELS activation
     config = {"features": {"auto_model_routing": True}}
-    args = Mock(model="sonnet", dispatch_config=None)  # CLI sonnet = DEFAULT_MODEL (not override)
+    args = Mock(model=None, dispatch_config=None)  # CLI un-set (task-2610 sentinel; not an override)
     # Developer has DEFAULT_ROLE_MODELS entry of "opus"
     # When CLI is default value, DEFAULT_ROLE_MODELS should activate
     result = get_role_model("developer", args, config=config, task=None)
@@ -233,7 +233,7 @@ def test_get_role_model_uses_auto_routing_when_no_overrides():
         "features": {"auto_model_routing": True},
         # No overrides
     }
-    args = Mock(model="sonnet", dispatch_config=None)  # CLI default
+    args = Mock(model=None, dispatch_config=None)  # CLI un-set (task-2610 sentinel)
     role = "developer"
 
     # Trivial task -> auto-route to haiku
@@ -256,7 +256,7 @@ def test_get_role_model_ignores_auto_routing_when_flag_off():
         "features": {"auto_model_routing": False},  # FLAG OFF
         "model": "haiku",  # global config
     }
-    args = Mock(model="sonnet", dispatch_config=None)  # CLI default
+    args = Mock(model=None, dispatch_config=None)  # CLI un-set (task-2610 sentinel)
     role = "developer"
 
     # Should use global config "haiku", NOT auto-route to opus
