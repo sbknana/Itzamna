@@ -89,7 +89,16 @@ def _load_check_bash_command() -> Callable[[str], Any]:
         )
         if spec is not None and spec.loader is not None:
             module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
+            # Register before exec: bash_security defines a @dataclass, and
+            # dataclasses resolves ``cls.__module__`` via ``sys.modules`` — an
+            # unregistered module makes that lookup return None and raise
+            # ``AttributeError: 'NoneType' object has no attribute '__dict__'``.
+            sys.modules[spec.name] = module
+            try:
+                spec.loader.exec_module(module)
+            except BaseException:
+                sys.modules.pop(spec.name, None)
+                raise
             check = getattr(module, "check_bash_command", None)
             if callable(check):
                 return check
