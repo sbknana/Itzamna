@@ -8,7 +8,7 @@
 
 ## Summary
 
-The `equipa/` package contains **52 Python modules** totaling **30,784 lines** of code across **11 dependency layers** (L0–L10). 27 module(s) use late (deferred) imports to break circular dependencies; there are no top-level circular imports.
+The `equipa/` package contains **52 Python modules** totaling **30,850 lines** of code across **11 dependency layers** (L0–L10). 27 module(s) use late (deferred) imports to break circular dependencies; there are no top-level circular imports.
 
 ## Module Dependency Table
 
@@ -32,8 +32,8 @@ The `equipa/` package contains **52 Python modules** totaling **30,784 lines** o
 | `single_agent_guard.py` | 576 | L0 | — | `role_resolver.py` | 5 |
 | `tool_result_storage.py` | 247 | L0 | — | — | 15 |
 | `checkpoints.py` | 308 | L1 | `constants.py` | — | 8 |
-| `config.py` | 170 | L1 | `constants.py` | — | 5 |
-| `db.py` | 709 | L1 | `constants.py` | `output.py`, `prompts.py`, `tasks.py` | 12 |
+| `config.py` | 177 | L1 | `constants.py` | — | 5 |
+| `db.py` | 768 | L1 | `constants.py` | `config.py`, `output.py`, `prompts.py`, `tasks.py` | 13 |
 | `git_ops.py` | 870 | L1 | `constants.py` | `tasks.py` | 15 |
 | `hooks/__init__.py` | 427 | L1 | `hooks/dispatcher.py` | — | 17 |
 | `output.py` | 292 | L1 | `constants.py` | `monitoring.py` | 7 |
@@ -67,7 +67,7 @@ The `equipa/` package contains **52 Python modules** totaling **30,784 lines** o
 | `__init__.py` | 58 | L10 | `cli.py`, `dispatch.py`, `loops.py`, `manager.py`, `mcp_server.py`, `monitoring.py`, `prompts.py` | — | 14 |
 | `__main__.py` | 16 | L10 | `cli.py` | — | 0 |
 
-**Total:** 30,784 lines | 560 public exports
+**Total:** 30,850 lines | 561 public exports
 
 ## Modules by Layer
 
@@ -93,7 +93,7 @@ Layer *N* is the longest chain of top-level (non-deferred) imports from a leaf m
 |---|---|
 | `agent_runner.py` | `cli.py`, `git_ops.py`, `rlm_decompose.py`, `role_resolver.py` |
 | `cli.py` | `config_versions.py`, `initiative_runner.py`, `role_resolver.py`, `scaffold.py`, `single_agent_guard.py` |
-| `db.py` | `output.py`, `prompts.py`, `tasks.py` |
+| `db.py` | `config.py`, `output.py`, `prompts.py`, `tasks.py` |
 | `dispatch.py` | `flows.py`, `initiative.py`, `scaffold.py` |
 | `embeddings.py` | `db.py`, `graph.py` |
 | `flows.py` | `sessions.py` |
@@ -136,7 +136,7 @@ How many other `equipa` modules each module imports.
 | `config.py` | 1 | 0 | **1** |
 | `config_versions.py` | 2 | 0 | **2** |
 | `constants.py` | 0 | 0 | **0** |
-| `db.py` | 1 | 3 | **4** |
+| `db.py` | 1 | 4 | **5** |
 | `dispatch.py` | 17 | 3 | **20** |
 | `embeddings.py` | 2 | 2 | **4** |
 | `env_loader.py` | 0 | 0 | **0** |
