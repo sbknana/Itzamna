@@ -17,6 +17,7 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 import check_docs_drift as drift  # noqa: E402  -- path tweak above
+import gen_module_report as gen_report  # noqa: E402  -- drift coverage tests
 
 
 @pytest.fixture
@@ -256,3 +257,139 @@ def test_genuine_repo_internal_missing_is_flagged(clean_fixture: Path) -> None:
     (clean_fixture / "docs" / "ghost.md").write_text("See `equipa/ghost.py`.", encoding="utf-8")
     drifts = drift.check_paths(clean_fixture, drift._discover_doc_files(clean_fixture))
     assert any("equipa/ghost.py" in d.message for d in drifts), [d.message for d in drifts]
+
+
+# --- module dependency report drift coverage (task 2708 part 2) ---
+#
+# These exercise check_docs_drift.check_module_report(), the new drift fence
+# that fails CI when equipa/MODULE_DEPENDENCY_REPORT.md is stale relative to a
+# fresh, deterministic generation. The generator's own --check flag is covered
+# in test_gen_module_report.py; here we prove the *docs-drift checker* wires it
+# in correctly (skips gracefully when inputs are absent, passes when in sync,
+# and FAILS when the committed report is hand-edited).
+
+
+def _make_report_repo(root: Path, modules: dict[str, str]) -> Path:
+    """Build a minimal repo: an ``equipa/`` package, a copy of the generator,
+    and a committed report produced by a fresh (in-sync) generation.
+
+    The report is generated with the real ``gen_module_report`` module so the
+    committed file starts byte-identical to what ``check_module_report`` will
+    regenerate -- i.e. deliberately in-sync until a test mutates it.
+    """
+
+    for rel, body in modules.items():
+        path = root / "equipa" / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body, encoding="utf-8")
+
+    scripts = root / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    shutil.copy(
+        SCRIPTS_DIR / "gen_module_report.py", scripts / "gen_module_report.py"
+    )
+
+    (root / "equipa" / "MODULE_DEPENDENCY_REPORT.md").write_text(
+        gen_report.generate_report(root), encoding="utf-8"
+    )
+    return root
+
+
+def test_module_report_in_sync_has_no_drift(tmp_path: Path) -> None:
+    """A committed report matching a fresh generation yields no drift."""
+
+    root = _make_report_repo(
+        tmp_path, {"__init__.py": "", "leaf.py": "value = 1\n"}
+    )
+    assert drift.check_module_report(root) == []
+
+
+def test_hand_edited_module_report_is_detected(tmp_path: Path) -> None:
+    """Hand-editing the committed report must be flagged as stale drift.
+
+    This is the task's headline acceptance criterion: check_docs_drift.py FAILS
+    if you hand-edit equipa/MODULE_DEPENDENCY_REPORT.md.
+    """
+
+    root = _make_report_repo(
+        tmp_path, {"__init__.py": "", "leaf.py": "value = 1\n"}
+    )
+    report = root / "equipa" / "MODULE_DEPENDENCY_REPORT.md"
+    report.write_text(
+        report.read_text(encoding="utf-8") + "\nHAND-EDITED LINE\n",
+        encoding="utf-8",
+    )
+
+    drifts = drift.check_module_report(root)
+    assert len(drifts) == 1, [d.message for d in drifts]
+    assert "stale" in drifts[0].message
+    assert "gen_module_report.py" in drifts[0].message
+
+
+def test_hand_edited_report_reports_first_diff_line(tmp_path: Path) -> None:
+    """The drift points at the first differing line (here: the header, line 1)."""
+
+    root = _make_report_repo(
+        tmp_path, {"__init__.py": "", "leaf.py": "value = 1\n"}
+    )
+    report = root / "equipa" / "MODULE_DEPENDENCY_REPORT.md"
+    corrupted = report.read_text(encoding="utf-8").replace(
+        "# EQUIPA Module Dependency Report", "# TAMPERED HEADER", 1
+    )
+    report.write_text(corrupted, encoding="utf-8")
+
+    drifts = drift.check_module_report(root)
+    assert len(drifts) == 1
+    assert drifts[0].line == 1
+
+
+def test_module_report_check_skipped_when_report_missing(tmp_path: Path) -> None:
+    """No committed report (only the generator) -> check is silently skipped."""
+
+    (tmp_path / "equipa").mkdir()
+    (tmp_path / "equipa" / "__init__.py").write_text("", encoding="utf-8")
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    shutil.copy(
+        SCRIPTS_DIR / "gen_module_report.py", scripts / "gen_module_report.py"
+    )
+
+    assert drift.check_module_report(tmp_path) == []
+
+
+def test_module_report_check_skipped_when_generator_missing(tmp_path: Path) -> None:
+    """A committed report but no generator -> check is silently skipped."""
+
+    root = _make_report_repo(
+        tmp_path, {"__init__.py": "", "leaf.py": "value = 1\n"}
+    )
+    (root / "scripts" / "gen_module_report.py").unlink()
+
+    assert drift.check_module_report(root) == []
+
+
+def test_committed_real_report_is_in_sync() -> None:
+    """The real repo's committed report must match a fresh generation.
+
+    Mirrors test_gen_module_report.test_committed_report_is_in_sync but through
+    the drift-checker's own entry point, proving the CI fence passes on a
+    freshly-regenerated tree.
+    """
+
+    assert drift.check_module_report(REPO_ROOT) == []
+
+
+def test_run_all_checks_surfaces_stale_report(tmp_path: Path) -> None:
+    """End-to-end: a stale report is surfaced by run_all_checks()."""
+
+    root = _make_report_repo(
+        tmp_path, {"__init__.py": "", "leaf.py": "value = 1\n"}
+    )
+    (root / "equipa" / "MODULE_DEPENDENCY_REPORT.md").write_text(
+        "totally stale contents\n", encoding="utf-8"
+    )
+
+    drifts = drift.run_all_checks(root, skip_pytest=True)
+    assert any(
+        "stale" in d.message and "report" in d.message.lower() for d in drifts
+    ), [d.message for d in drifts]

@@ -16,6 +16,9 @@ Checks performed:
      .py files under equipa/.
   5. README badge ``tests-<N>`` is within +/-25 of the count reported by
      ``pytest --collect-only -q``.
+  6. The committed ``equipa/MODULE_DEPENDENCY_REPORT.md`` matches a fresh,
+     deterministic generation from ``scripts/gen_module_report.py`` (byte
+     for byte -- the generator is timestamp-free and sorted).
 
 Escape hatches (paths inside these are ignored):
   * Any block between an HTML comment ``<!-- drift-ignore -->`` and the
@@ -439,6 +442,61 @@ def check_test_badge(
     return drifts
 
 
+def _first_diff_line(committed: str, fresh: str) -> int:
+    """1-based line number of the first difference (0 if only length differs)."""
+
+    committed_lines = committed.splitlines()
+    fresh_lines = fresh.splitlines()
+    for idx, (a, b) in enumerate(zip(committed_lines, fresh_lines), start=1):
+        if a != b:
+            return idx
+    # No differing line within the shared prefix -- one file is longer.
+    shared = min(len(committed_lines), len(fresh_lines))
+    return shared + 1 if committed_lines != fresh_lines else 0
+
+
+def check_module_report(repo_root: Path) -> list[Drift]:
+    """Fail when the committed module report differs from a fresh generation.
+
+    Imports ``scripts/gen_module_report.py`` and regenerates the report into an
+    in-memory buffer, then diffs it against the committed
+    ``equipa/MODULE_DEPENDENCY_REPORT.md``. Because the generator is
+    deterministic (no timestamps, fully sorted), a byte-for-byte match proves
+    the committed file is current. The check is skipped only when either the
+    report or the generator is absent (e.g. a minimal test fixture).
+    """
+
+    report = repo_root / "equipa" / "MODULE_DEPENDENCY_REPORT.md"
+    generator = repo_root / "scripts" / "gen_module_report.py"
+    if not report.is_file() or not generator.is_file():
+        return []
+
+    scripts_dir = str(generator.parent)
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    try:
+        import gen_module_report  # local import: only when a report exists
+    except Exception as err:  # noqa: BLE001 -- surfaced as a drift, not a crash
+        return [Drift(generator, 0, f"could not import module report generator: {err}")]
+
+    try:
+        fresh = gen_module_report.generate_report(repo_root)
+        committed = report.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as err:
+        return [Drift(report, 0, f"could not read module report: {err}")]
+
+    if committed == fresh:
+        return []
+    return [
+        Drift(
+            report,
+            _first_diff_line(committed, fresh),
+            "module dependency report is stale; regenerate with "
+            "`python scripts/gen_module_report.py`",
+        )
+    ]
+
+
 def _discover_doc_files(repo_root: Path) -> list[Path]:
     """Return README.md plus every docs/*.md found at the repo root."""
 
@@ -460,6 +518,7 @@ def run_all_checks(
     doc_files = _discover_doc_files(repo_root)
     drifts = check_paths(repo_root, doc_files)
     drifts.extend(check_module_count(repo_root))
+    drifts.extend(check_module_report(repo_root))
     if not skip_pytest:
         drifts.extend(check_test_badge(repo_root))
     return drifts
