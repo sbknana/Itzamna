@@ -1542,3 +1542,127 @@ class TestMultiLineCommitRegression:
     def test_redirect_after_commit_still_blocked(self) -> None:
         result = check_bash_command('git commit -m "msg" > /tmp/leak')
         assert not result.safe
+
+
+class TestQuotedOperatorPrePassRegression:
+    """Regression tests for task #2652 — tokenize quoted strings before
+    operator scanning.
+
+    Two false positives from one StockForge dispatch (tasks 2650/2651), both
+    from the same root cause: pattern-scanning checks looked at the raw
+    command string, so shell operators/constructs living *inside* quoted
+    string literals were mistaken for real shell tokens.
+
+    (1) check-10 "output redirection (>)" on a ``>`` inside a quoted grep
+        pattern (``grep -rn "SATS->ECHO"``) in a read-only sed;find|head;grep
+        chain.
+    (2) check-4 "ANSI-C quoting ($'...')" on a ``.venv/bin/python -c "..."``
+        module-import smoke test with no shell-level ``$'`` construct.
+
+    Sixth member of the check-4/7/9/10/12/19 quote-context family (see prior
+    fixes: task 2446 / commit 4096b71 per-segment validation, check-19
+    _MARKDOWN_BODY allowlist).
+    """
+
+    # --- (2) check-4: ANSI-C false positive ---------------------------------
+
+    @pytest.mark.parametrize("cmd", [
+        # Verbatim-shaped fragment from the task: module-import smoke test.
+        '.venv/bin/python -c "import schemas.v3, orchestrator.layers.macro, '
+        'orchestrator.layers.micro"',
+        # Confirmed reproduction of the raw-scan bug: a `$` immediately before
+        # a closing `'` inside a double-quoted python body makes the raw
+        # `\\$'[^']*'` regex match, even though `$'` is literal text here.
+        '.venv/bin/python -c "print(\'cost: $\', \'x\'); import schemas.v3"',
+        'python3 -c "print(\'a $\', \'b\')"',
+        # Mirror case for locale quoting: `$"` inside a single-quoted body.
+        'python3 -c \'print("x $"); import y\'',
+    ])
+    def test_dollar_quote_inside_string_literal_is_safe(self, cmd: str) -> None:
+        result = check_bash_command(cmd)
+        assert result.safe, (
+            f"quoted $'/$\" sequence should not trip check-4; "
+            f"got check_id={result.check_id} msg={result.message}"
+        )
+
+    def test_real_ansi_c_quoting_still_blocked(self) -> None:
+        # A genuine shell-level $'...' construct must still block.
+        result = check_bash_command("ls $'\\x2d\\x2dhelp'")
+        assert not result.safe
+        assert result.check_id == CheckID.OBFUSCATED_FLAGS
+
+    def test_real_locale_quoting_in_exec_context_still_blocked(self) -> None:
+        # Genuine shell-level $"..." handed to an exec primitive still blocks.
+        result = check_bash_command('python -c $"payload"')
+        assert not result.safe
+        assert result.check_id == CheckID.OBFUSCATED_FLAGS
+
+    def test_locale_quoting_allowlisted_base_still_safe(self) -> None:
+        # grep is in _LOCALE_QUOTING_SAFE_BASES — genuine $"..." stays allowed.
+        result = check_bash_command('grep -rn $"needle" src/')
+        assert result.safe
+
+    def test_escaped_dollar_before_quote_is_not_ansi_c(self) -> None:
+        # `\$'...'` is a literal `$` followed by a single-quoted string, NOT
+        # ANSI-C quoting — matches bash semantics.
+        result = check_bash_command("echo \\$'literal'")
+        assert result.safe
+
+    # --- (1) check-10: quoted redirection false positive --------------------
+
+    @pytest.mark.parametrize("cmd", [
+        # Verbatim-shaped fragment: quoted arrow in a grep pattern.
+        'grep -rn "SATS->ECHO" src/',
+        'grep -rn "SATS->ECHO"',
+        # Arrow followed by a non-word char so the safe-target strip cannot
+        # consume it — still must not fire because it is quoted.
+        'grep -rn "SATS->{ECHO}" src/',
+        'grep -rn "A->|B" src/',
+        # Full read-only sed;find|head;grep chain from the task.
+        'sed -n "1,50p" a.py ; find . -name "*.md" | head -20 ; '
+        'grep -rn "SATS->ECHO" src/',
+        # Input-redirection twin: quoted `<` must not trip check-9.
+        'grep -rn "a<-b" src/',
+    ])
+    def test_quoted_redirection_operator_is_safe(self, cmd: str) -> None:
+        result = check_bash_command(cmd)
+        assert result.safe, (
+            f"quoted </> should not trip check-9/10; "
+            f"got check_id={result.check_id} msg={result.message}"
+        )
+
+    def test_real_output_redirect_still_blocked(self) -> None:
+        result = check_bash_command("cat secret > /etc/passwd")
+        assert not result.safe
+        assert result.check_id == CheckID.OUTPUT_REDIRECTION
+
+    def test_real_input_redirect_still_blocked(self) -> None:
+        result = check_bash_command("cat < /home/user/.ssh/id_rsa")
+        assert not result.safe
+        assert result.check_id in (
+            CheckID.INPUT_REDIRECTION, CheckID.OUTPUT_REDIRECTION,
+        )
+
+    def test_benign_relative_redirect_still_allowed(self) -> None:
+        # Sanity: the pre-fix relative/tmp redirect allowlist is unaffected.
+        assert check_bash_command("echo hi > /tmp/out.log").safe
+        assert check_bash_command("pytest -q >> build.log").safe
+
+    # --- shared pre-pass unit coverage --------------------------------------
+
+    def test_scan_dollar_quotes_distinguishes_context(self) -> None:
+        from equipa.bash_security import _scan_shell_level_dollar_quotes
+        # Shell-level constructs detected.
+        assert _scan_shell_level_dollar_quotes("ls $'x'") == {"ansi-c"}
+        assert _scan_shell_level_dollar_quotes('x $"y"') == {"locale"}
+        # Inside a double-quoted literal — not a construct.
+        assert _scan_shell_level_dollar_quotes('python -c "a $\', b"') == set()
+        # Escaped dollar — not a construct.
+        assert _scan_shell_level_dollar_quotes("echo \\$'x'") == set()
+
+    def test_has_shell_level_char_ignores_quoted_operators(self) -> None:
+        from equipa.bash_security import _has_shell_level_char
+        assert _has_shell_level_char("cat a>b", "<>") is True
+        assert _has_shell_level_char('grep "a>b"', "<>") is False
+        assert _has_shell_level_char("echo '|pipe'", "|") is False
+        assert _has_shell_level_char("a | b", "|") is True
