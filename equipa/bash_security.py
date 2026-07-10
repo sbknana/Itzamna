@@ -2011,12 +2011,23 @@ def _benign_git_heredoc_sanitized(command: str) -> str | None:
     which repeatedly burned dev-agent turns (task 2468, observed during the
     2464 dispatch).
 
-    When the shape matches, the heredoc opener + body + closing delimiter are
-    stripped and the remaining pure-``git`` command line is returned so the
-    caller can re-validate it through the normal pipeline (catching any
-    injection in the git arguments themselves, e.g.
-    ``git commit -F - > ~/.bashrc``). Returns ``None`` when the command is not
-    this exact benign shape, in which case the normal checks apply unchanged.
+    When the shape matches AND nothing executable trails the opener on the
+    same physical line, ONLY the inert heredoc body + closing delimiter are
+    stripped and the pure ``git`` command line is returned so the caller can
+    re-validate the git arguments themselves (e.g. catching
+    ``git commit -F - > ~/.bashrc <<'EOF'``). Returns ``None`` when the command
+    is not this exact benign shape — including when ANY executable text
+    trails the opener line (``git commit -F - <<'EOF' ; rm -rf ~``) — in which
+    case the normal checks apply unchanged to the ORIGINAL command and the
+    newline-bearing heredoc is blocked by check 7.
+
+    NOTE (SR-2468 S1): the opener-line remainder is executable in bash, and
+    the normal pipeline permits bare ``;``/``&&``/``|``/``&`` sequencing after
+    ``git commit`` (check 12 only inspects the ``-m`` message form). So a
+    ``prefix + remainder`` reconstruction would NOT be re-blocked and would
+    wave the payload through. We therefore fail closed on any opener-line
+    remainder rather than reconstruct-and-revalidate: the relief is granted
+    strictly to the canonical shape with nothing after the opener.
 
     Safety constraints (all required):
       * The heredoc delimiter must be quoted or backslash-escaped (inert body).
@@ -2028,6 +2039,8 @@ def _benign_git_heredoc_sanitized(command: str) -> str | None:
         chaining of git commands is allowed).
       * Every ``&&``-separated segment before the heredoc must be a ``git``
         command, and the final one must be ``git commit``.
+      * The heredoc body must start on the next physical line; the region
+        trailing the opener on the SAME line is executable and is re-validated.
       * Nothing but whitespace may follow the closing delimiter line.
     """
     if "<<" not in command:
@@ -2035,6 +2048,15 @@ def _benign_git_heredoc_sanitized(command: str) -> str | None:
 
     opener = _GIT_HEREDOC_QUOTED_OPENER_RE.search(command)
     if opener is None:
+        return None
+
+    # [SR-2468 S5] The regex must fully account for the delimiter token. If the
+    # char immediately after the closing quote/escape continues the word
+    # (partial/adjacent quoting like <<'E'OF, <<"E"OF, <<E\OF), bash's real
+    # delimiter differs from what we captured — bail to the normal checks
+    # rather than proceed on a mismodelled delimiter.
+    nxt = command[opener.end(): opener.end() + 1]
+    if nxt and (nxt.isalnum() or nxt in "_'\"\\"):
         return None
 
     prefix = command[: opener.start()]
@@ -2059,21 +2081,46 @@ def _benign_git_heredoc_sanitized(command: str) -> str | None:
         return None
 
     delim = opener.group("sq") or opener.group("dq") or opener.group("bs")
-    # The closing delimiter must appear on its own line (optionally
-    # tab/space-indented for the `<<-` form).
+    is_dash = opener.group(0).startswith("<<-")
+
     tail = command[opener.end():]
-    close = re.search(
-        r"\n[ \t]*" + re.escape(delim) + r"[ \t]*(?:\n|$)", tail,
-    )
+
+    # [SR-2468 S1] The heredoc body begins on the NEXT physical line. Everything
+    # on the opener line AFTER the `<<'DELIM'` operator (up to that newline)
+    # still executes in bash (`git commit -F - <<'EOF' ; rm -rf ~`). That
+    # region is the ONLY reason these attacks pass the guard once the body is
+    # stripped. Since the normal pipeline does not re-block bare
+    # `;`/`&&`/`|`/`&` after `git commit`, we do NOT strip such a command:
+    # fail closed so the original newline-bearing heredoc stays subject to
+    # check 7 (newlines). If there is no newline at all, the framing is broken
+    # — also fail closed.
+    body_nl = tail.find("\n")
+    if body_nl == -1:
+        return None
+    opener_line_rest = tail[:body_nl]
+    if opener_line_rest.strip():
+        return None
+    body_and_after = tail[body_nl:]
+
+    # [SR-2468 S2] Bash-faithful close-delimiter detection: a plain heredoc
+    # requires the terminator alone on a line at column 0; the `<<-` form
+    # strips leading TABS only (never spaces). The terminator line must be
+    # exactly the delimiter — no leading spaces, no trailing whitespace.
+    if is_dash:
+        close_re = r"\n\t*" + re.escape(delim) + r"(?:\n|$)"
+    else:
+        close_re = r"\n" + re.escape(delim) + r"(?:\n|$)"
+    close = re.search(close_re, body_and_after)
     if close is None:
         return None
 
-    suffix = tail[close.end():]
+    suffix = body_and_after[close.end():]
     if suffix.strip():
         return None
 
-    # Rebuild with the inert heredoc removed; the remaining single-line git
-    # command is returned for normal re-validation by the caller.
+    # Canonical benign shape: nothing executable trails the opener, and the
+    # body + closing delimiter are inert. Return the pure git command line for
+    # normal re-validation of the git arguments themselves.
     return prefix.rstrip()
 
 

