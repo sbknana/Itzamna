@@ -62,7 +62,8 @@
         "rlm_decompose": false,
         "config_versioning": false,
         "session_persistence": false,
-        "project_templates": false
+        "project_templates": false,
+        "personal_pm_tables": true
     },
     "project_dirs": {},
     "provider": "claude",

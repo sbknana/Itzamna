@@ -95,6 +95,7 @@ class TestDefaultFeatureFlags(unittest.TestCase):
         "config_versioning": False,
         "session_persistence": False,
         "project_templates": False,
+        "personal_pm_tables": True,
     }
 
     def test_contains_all_expected_flags(self):
