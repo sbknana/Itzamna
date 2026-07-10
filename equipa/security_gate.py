@@ -33,11 +33,111 @@ import logging
 import os
 import re
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from equipa.git_ops import git_run_async
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class GateDecision:
+    """The single, ground-truth merge-gate decision (task #2706).
+
+    Prior to task #2706 the gated merge relied on three interacting
+    *caller-supplied* signals — a tri-state ``review_blocks_merge``, an
+    ``expect_artifact`` doc-only hint, and the ``outcome`` — whose correct
+    combination lived only in prose comments across ``dispatch``/``cli``.
+    The ``expect_artifact=False`` doc-only short-circuit skipped the
+    fail-closed invariant *entirely*, so a future caller passing it wrongly
+    would silently disable the last line of defence — exactly the
+    caller-trust hole the invariant was built to close.
+
+    A ``GateDecision`` is now computed by :func:`decide_merge_gate` from
+    GROUND TRUTH INSIDE ``dispatch._gated_merge_task``:
+
+      * ``changed_files`` — the ACTUAL branch diff (``git diff base...branch``),
+        never a caller flag.
+      * ``doc_only`` — re-derived by calling :func:`is_doc_only_diff` on that
+        real file list (which fails closed on an empty list).
+      * ``counts`` / ``blocks_merge`` — read from the on-disk
+        ``SECURITY-REVIEW-<task>.md`` artifact, fail-closed on missing.
+
+    The dataclass is frozen so a decision cannot be mutated after it is
+    computed. ``expect_artifact`` is derived (``not doc_only``) so the
+    defensive invariant in ``_merge_task_branch`` receives an internally
+    computed value, not a caller assertion.
+    """
+
+    blocks_merge: bool
+    doc_only: bool
+    counts: dict | None
+    reason: str
+    changed_files: list[str] = field(default_factory=list)
+
+    @property
+    def expect_artifact(self) -> bool:
+        """Whether the defensive invariant must demand a review artifact.
+
+        A provably doc-only diff cannot introduce a code-level finding, so
+        no ``SECURITY-REVIEW-<task>.md`` is expected. Every other diff
+        (including an empty/failed one, which :func:`is_doc_only_diff`
+        classifies as NOT doc-only) demands the artifact — fail closed.
+        """
+        return not self.doc_only
+
+
+def decide_merge_gate(
+    changed_files: list[str],
+    *,
+    security_review_blocks_merge,
+    project_dir: str,
+    task_id: int,
+    block_on_missing: bool = True,
+) -> GateDecision:
+    """Compute the single :class:`GateDecision` from ground truth.
+
+    This is the ONE place the gate policy is decided. It takes the real
+    branch diff (``changed_files``, produced by
+    :func:`get_changed_files_for_branch`) plus a callable that reads the
+    on-disk security-review artifact, and returns an immutable decision.
+
+    NO caller-supplied booleans participate:
+
+      * doc-only-ness is re-derived here via :func:`is_doc_only_diff` on the
+        real file list — a caller can no longer assert ``doc_only`` to
+        disable the gate (task #2706).
+      * when the diff is NOT doc-only, the artifact is (re-)read through the
+        injected ``security_review_blocks_merge`` callable, which fails
+        closed on a missing/unparseable artifact when ``block_on_missing``.
+
+    ``security_review_blocks_merge`` is injected (rather than imported) so
+    this leaf module stays free of a circular import on ``dispatch`` while
+    the decision logic remains unit-testable in isolation. It must have the
+    signature ``(project_dir, task_id, *, block_on_missing) ->
+    tuple[bool, dict | None]`` — i.e. ``dispatch._security_review_blocks_merge``.
+    """
+    doc_only = is_doc_only_diff(changed_files)
+    if doc_only:
+        return GateDecision(
+            blocks_merge=False,
+            doc_only=True,
+            counts=None,
+            reason="doc-only-diff",
+            changed_files=list(changed_files),
+        )
+    blocks, counts = security_review_blocks_merge(
+        project_dir, task_id, block_on_missing=block_on_missing,
+    )
+    reason = "security-review-blocked" if blocks else "clean"
+    return GateDecision(
+        blocks_merge=blocks,
+        doc_only=False,
+        counts=counts,
+        reason=reason,
+        changed_files=list(changed_files),
+    )
 
 
 def _gate_audit_log(
@@ -184,21 +284,31 @@ class SecurityGateBypassError(RuntimeError):
 async def get_changed_files_for_branch(
     project_dir: str,
     base_ref: str | None = None,
+    head_ref: str = "HEAD",
 ) -> list[str]:
-    """Return file paths changed on the current branch vs ``base_ref``.
+    """Return file paths changed on ``head_ref`` vs ``base_ref``.
 
-    Uses ``git diff --name-only base_ref...HEAD`` (three-dot syntax) so
+    Uses ``git diff --name-only base_ref...head_ref`` (three-dot syntax) so
     the comparison is against the merge base, not the literal tip of
     ``base_ref`` — this matches what the eventual ``git merge`` will
     actually examine.
+
+    ``head_ref`` defaults to ``HEAD`` (the caller's checked-out branch), but
+    the unified merge gate (task #2706) passes the explicit
+    ``forge-task-<id>`` branch name so it computes the SAME diff whether it
+    runs in single-task mode (main checkout sits on the task branch) or
+    parallel mode (main checkout sits on the default branch while the work
+    lives on a shared ``forge-task-<id>`` ref). Because git worktrees share
+    one object/ref store, the branch ref is visible from ``project_dir`` in
+    both modes.
 
     When ``base_ref`` is ``None`` (the default), the repository's default
     branch is auto-detected via :func:`equipa.git_ops.get_default_branch`
     so this helper works on both ``master``- and ``main``-defaulted repos
     (task #2479).
 
-    On any failure (timeout, missing git, base_ref unknown), returns an
-    empty list. Callers MUST treat an empty list as "could not determine
+    On any failure (timeout, missing git, ref unknown), returns an empty
+    list. Callers MUST treat an empty list as "could not determine
     doc-only-ness" — :func:`is_doc_only_diff` already returns False for
     an empty list precisely so a failed lookup never silently disables
     the gate.
@@ -208,7 +318,7 @@ async def get_changed_files_for_branch(
         base_ref = get_default_branch(project_dir)
     try:
         result = await git_run_async(
-            ["diff", "--name-only", f"{base_ref}...HEAD"],
+            ["diff", "--name-only", f"{base_ref}...{head_ref}"],
             project_dir,
             timeout=10,
         )
