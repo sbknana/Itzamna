@@ -1,0 +1,38 @@
+name: Tests
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Hermetic DB: point equipa.constants.THEFORGE_DB and the
+      # tests/conftest.py schema-apply at a throwaway path under the runner's
+      # temp dir so the suite never touches a real TheForge database.
+      THEFORGE_DB: ${{ runner.temp }}/theforge-test.db
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install pytest
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest
+      - name: Run pytest suite
+        # Mirrors the local invocation exactly (pytest -q --durations=15).
+        # Output is teed to a file for the failure artifact; the default
+        # GitHub Actions shell runs with `pipefail`, so a pytest failure
+        # still fails this step despite the pipe.
+        run: |
+          pytest -q --durations=15 | tee "$RUNNER_TEMP/pytest-output.txt"
+      - name: Upload pytest output on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-output
+          path: ${{ runner.temp }}/pytest-output.txt
+          if-no-files-found: warn
