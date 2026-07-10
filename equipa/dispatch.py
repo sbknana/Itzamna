@@ -76,8 +76,10 @@ from equipa.reflexion import maybe_run_reflexion
 from equipa.roles import get_role_model, get_role_turns
 from equipa.routing import CircuitOpenError
 from equipa.security_gate import (
+    GateDecision,
     SecurityGateBypassError,
     _gate_audit_log,
+    decide_merge_gate,
     format_counts,
     get_changed_files_for_branch,
     is_doc_only_diff,
@@ -1494,6 +1496,14 @@ async def _merge_task_branch(
     entirely; doc-only diffs cannot introduce code-level findings, so
     there is nothing to gate on.
 
+    Task #2706: ``expect_artifact`` is NO LONGER a caller-supplied signal.
+    The sole caller (``_gated_merge_task``) DERIVES it from the ground-truth
+    ``GateDecision.doc_only`` (re-computed from the real branch diff), so a
+    caller can no longer set it wrongly to disable this last line of
+    defence. It remains a parameter here (default ``True`` = fail-closed) so
+    the invariant stays independently unit-testable in the hermetic gate
+    tests.
+
     Uses ``git_run_async`` so the 6-12 git invocations per merge do not
     block the event loop.
     """
@@ -1858,21 +1868,42 @@ async def _gated_merge_task(
     outcome: str,
     task_id: int,
     project_context: dict | None = None,
-    review_blocks_merge: bool | None = None,
-    expect_artifact: bool = True,
+    block_on_missing: bool = True,
 ) -> str:
     """Unified, gated merge entry point used by BOTH dispatch modes.
 
     Task #2451: single-task ``--dev-test`` (``cli.run_mode_task``) and
-    parallel ``--tasks`` (``run_parallel_tasks``) both funnel through
-    this helper so the security gate cannot be bypassed by either path.
+    parallel ``--tasks`` (``run_parallel_tasks``) both funnel through this
+    helper so the security gate cannot be bypassed by either path.
 
-    ``review_blocks_merge`` lets the caller pass a pre-computed gate
-    decision (covering doc-only short-circuits, reviewer crashes, missing
-    artifacts under fail-closed) which the helper trusts. When None the
-    helper re-evaluates the artifact gate from disk. In BOTH paths the
-    defensive invariant inside ``_merge_task_branch`` still raises
-    ``SecurityGateBypassError`` if the artifact reports HIGH/CRITICAL.
+    Task #2706 — SINGLE GateDecision, no caller-trust hole. Previously this
+    helper trusted two caller-supplied signals — a tri-state
+    ``review_blocks_merge`` and an ``expect_artifact`` doc-only hint — whose
+    correct combination lived only in prose comments. The
+    ``expect_artifact=False`` short-circuit skipped the fail-closed
+    invariant entirely, so a caller passing it wrongly silently disabled the
+    last line of defence. Both parameters are now REMOVED. This helper
+    computes a single :class:`GateDecision` INSIDE itself from ground truth:
+
+      * the ACTUAL branch diff — ``get_changed_files_for_branch`` diffs the
+        ``forge-task-<id>`` ref against the default branch (same result in
+        single-task and parallel modes because worktrees share one ref
+        store), never a caller flag.
+      * doc-only-ness re-derived by calling the EXISTING
+        ``security_gate.is_doc_only_diff`` on that real file list (it fails
+        closed on an empty list — a failed/empty diff is treated as code,
+        never as doc-only).
+      * the on-disk ``SECURITY-REVIEW-<id>.md`` artifact via
+        ``_security_review_blocks_merge`` (fail-closed on missing when
+        ``block_on_missing``).
+
+    ``expect_artifact`` for the defensive invariant is derived from
+    ``decision.doc_only`` (task #2451/#2488/#2493 provenance preserved): the
+    invariant inside ``_merge_task_branch`` still re-reads the artifact and
+    still raises ``SecurityGateBypassError`` on HIGH/CRITICAL/missing.
+    ``block_on_missing`` is the operator ``security_review_block_on_missing_
+    artifact`` feature-flag policy (defaults fail-closed), NOT a per-task
+    trust signal.
 
     Returns one of:
       * ``"skipped"``  — outcome is not merge-eligible (e.g. tests failed).
@@ -1883,13 +1914,15 @@ async def _gated_merge_task(
     """
     project_dir = os.fspath(repo)
 
-    # Caller-asserted blocks fire FIRST so an outcome already demoted to
-    # ``security_review_blocked`` is reported as blocked (the gate fired),
-    # not skipped (outcome-not-eligible). The distinction matters for the
-    # operator-facing logs and for the audit trail.
-    if review_blocks_merge is True:
+    # An outcome already demoted to ``security_review_blocked`` upstream is
+    # honoured as blocked (the gate fired) — this is strictly stricter and
+    # keeps the operator-facing "blocked vs skipped" distinction. Note the
+    # ground-truth GateDecision below would ALSO block a HIGH artifact even
+    # if the outcome were (wrongly) left at tests_passed, so this branch is
+    # a convenience/audit refinement, not the trust anchor.
+    if outcome == "security_review_blocked":
         _gate_audit_log(
-            f"task={task_id} event=merge-skipped reason=caller-gate-blocked",
+            f"task={task_id} event=merge-skipped reason=outcome-security-blocked",
             task_id=task_id,
             event="merge-skipped",
         )
@@ -1904,42 +1937,53 @@ async def _gated_merge_task(
         )
         return "skipped"
 
-    if review_blocks_merge is None:
-        # Phase H (F-01): when the caller explicitly tells us no artifact
-        # is expected (doc-only short-circuit), the artifact-required gate
-        # must NOT fire fail-closed on its absence — that's exactly the
-        # regression Phase H removes from _merge_task_branch.
-        if not expect_artifact:
-            _gate_audit_log(
-                f"task={task_id} event=artifact-recheck-skipped "
-                f"reason=doc-only-no-artifact-expected",
-                task_id=task_id,
-                event="artifact-recheck-skipped",
-            )
-        else:
-            blocks, counts = _security_review_blocks_merge(
-                project_dir, task_id, block_on_missing=True,
-            )
-            if blocks:
-                _gate_audit_log(
-                    f"task={task_id} event=merge-skipped "
-                    f"reason=security-review-blocked {format_counts(counts)}",
-                    task_id=task_id,
-                    event="merge-skipped",
-                    counts=counts,
-                )
-                return "blocked"
+    # === Single GateDecision, computed from ground truth (task #2706) ===
+    # Diff the task BRANCH ref (not HEAD) so the file list is identical in
+    # single-task mode (main checkout on the task branch) and parallel mode
+    # (main checkout on the default branch, work on a shared branch ref).
+    # base_ref omitted -> auto-detect default branch (#2479).
+    changed_files = await get_changed_files_for_branch(
+        project_dir, head_ref=branch,
+    )
+    decision: GateDecision = decide_merge_gate(
+        changed_files,
+        security_review_blocks_merge=_security_review_blocks_merge,
+        project_dir=project_dir,
+        task_id=task_id,
+        block_on_missing=block_on_missing,
+    )
+    _gate_audit_log(
+        f"task={task_id} event=gate-decision reason={decision.reason} "
+        f"doc_only={decision.doc_only} blocks={decision.blocks_merge} "
+        f"files={len(decision.changed_files)} "
+        f"{format_counts(decision.counts)}",
+        task_id=task_id,
+        event="gate-decision",
+        counts=decision.counts,
+    )
+    if decision.blocks_merge:
+        _gate_audit_log(
+            f"task={task_id} event=merge-skipped "
+            f"reason={decision.reason} {format_counts(decision.counts)}",
+            task_id=task_id,
+            event="merge-skipped",
+            counts=decision.counts,
+        )
+        return "blocked"
 
     _gate_audit_log(
         f"task={task_id} event=merge-attempt branch={branch} "
-        f"caller_flag={review_blocks_merge!r}",
+        f"doc_only={decision.doc_only}",
         task_id=task_id,
         event="merge-attempt",
     )
     try:
+        # expect_artifact is DERIVED from the ground-truth decision, never a
+        # caller flag. Doc-only diffs (re-derived from the real diff) skip
+        # the artifact requirement; everything else demands it fail-closed.
         merged = await _merge_task_branch(
             project_dir, task_id, branch,
-            expect_artifact=expect_artifact,
+            expect_artifact=decision.expect_artifact,
         )
     except SecurityGateBypassError as exc:
         _gate_audit_log(
@@ -2394,6 +2438,13 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
     # loop that could miss a blocked task whose outcome was mutated
     # back to tests_passed.
     merged_tasks_seq: set[int] = set()
+    # Operator fail-open escape hatch — the ONLY policy input the gate takes
+    # from outside; it is a global feature flag (defaults fail-closed), not a
+    # per-task caller assertion (task #2706).
+    _merge_block_on_missing = is_feature_enabled(
+        getattr(args, "dispatch_config", None) or {},
+        "security_review_block_on_missing_artifact",
+    )
     if use_worktrees:
         for r in results:
             if isinstance(r, Exception):
@@ -2403,26 +2454,22 @@ async def run_parallel_tasks(task_ids: list[int], args) -> None:
                 continue
             branch_name = f"forge-task-{task_id}"
             try:
-                # GATE-02 (task #2451 Phase C): missing key MUST propagate
-                # as None so the unified gate re-reads the on-disk artifact
-                # instead of trusting an absent caller decision as False.
-                # An explicit False (e.g. doc-only short-circuit) IS still
-                # honoured because the producer site sets it deliberately.
-                #
-                # Phase H (F-01): the doc-only short-circuit also tells
-                # _merge_task_branch's defensive invariant NOT to demand
-                # a SECURITY-REVIEW-{task_id}.md file that the reviewer
-                # never wrote (because the diff was pure docs).
+                # Task #2706: the unified gate now computes its own single
+                # GateDecision from ground truth (the real branch diff +
+                # on-disk artifact) INSIDE _gated_merge_task. The parallel
+                # loop no longer forwards any per-task caller trust signal
+                # (the old review_blocks_merge / review_skipped_doc_only
+                # short-circuit that could disable the gate). doc-only-ness
+                # is re-derived from the diff; the defensive invariant in
+                # _merge_task_branch still re-reads SECURITY-REVIEW-<id>.md
+                # and fails closed (task #2451/#2488/#2493 preserved).
                 merge_status = await _gated_merge_task(
                     repo=project_dir,
                     branch=branch_name,
                     outcome=r["outcome"],
                     task_id=task_id,
                     project_context=project_context,
-                    review_blocks_merge=r.get("review_blocks_merge"),
-                    expect_artifact=not r.get(
-                        "review_skipped_doc_only", False,
-                    ),
+                    block_on_missing=_merge_block_on_missing,
                 )
             except SecurityGateBypassError as exc:
                 # Phase K (F-04): narrow from `except Exception` so genuine
