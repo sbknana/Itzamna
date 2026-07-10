@@ -258,3 +258,97 @@ def test_reapply_is_idempotent_and_preserves_data(tmp_path: Path) -> None:
         )
     finally:
         conn.close()
+
+
+# --- Default (flag-resolved) ensure_schema path --------------------------
+# The tests above force apply_personal explicitly. Production callers use the
+# default apply_personal=None path, which resolves the flag through
+# _should_apply_personal_schema(). These pin that real code path.
+
+
+def test_should_apply_personal_schema_resolves_flag(monkeypatch) -> None:
+    """The helper honours the resolved ``personal_pm_tables`` flag.
+
+    Uses the real ``is_feature_enabled`` resolution over a crafted config so an
+    explicit opt-out disables the personal schema while the default (empty
+    config, flag defaults TRUE) keeps it on. ``_should_apply_personal_schema``
+    imports ``load_dispatch_config`` lazily, so patching it on ``equipa.config``
+    is picked up at call time.
+    """
+    import equipa.config as equipa_config
+
+    monkeypatch.setattr(
+        equipa_config,
+        "load_dispatch_config",
+        lambda _path: {"features": {"personal_pm_tables": False}},
+    )
+    assert equipa_db._should_apply_personal_schema() is False
+
+    monkeypatch.setattr(equipa_config, "load_dispatch_config", lambda _path: {})
+    assert equipa_db._should_apply_personal_schema() is True
+
+
+def _run_ensure_schema_default(monkeypatch, tmp_path: Path, label: str) -> Path:
+    """Run ensure_schema() with the DEFAULT (flag-resolved) personal path."""
+    db_path = tmp_path / f"default_{label}.db"
+    monkeypatch.setattr(equipa_db, "THEFORGE_DB", db_path)
+    monkeypatch.setattr(equipa_db, "_SCHEMA_ENSURED", False)
+    equipa_db.ensure_schema()  # apply_personal=None → resolve the flag
+    return db_path
+
+
+def test_ensure_schema_default_flag_off_skips_personal(monkeypatch, tmp_path: Path) -> None:
+    """Default ensure_schema() with the flag resolved OFF omits personal tables."""
+    monkeypatch.setattr(equipa_db, "_should_apply_personal_schema", lambda: False)
+    db_path = _run_ensure_schema_default(monkeypatch, tmp_path, "off")
+    conn = sqlite3.connect(db_path)
+    try:
+        tables = _table_names(conn)
+    finally:
+        conn.close()
+    for core in CORE_TABLES:
+        assert core in tables, f"core table {core} missing on default install"
+    for personal in PERSONAL_TABLES:
+        assert personal not in tables, f"{personal} leaked with flag resolved off"
+
+
+def test_ensure_schema_default_flag_on_creates_personal(monkeypatch, tmp_path: Path) -> None:
+    """Default ensure_schema() with the flag resolved ON creates personal tables."""
+    monkeypatch.setattr(equipa_db, "_should_apply_personal_schema", lambda: True)
+    db_path = _run_ensure_schema_default(monkeypatch, tmp_path, "on")
+    conn = sqlite3.connect(db_path)
+    try:
+        tables = _table_names(conn)
+    finally:
+        conn.close()
+    for personal in PERSONAL_TABLES:
+        assert personal in tables, f"{personal} missing with flag resolved on"
+
+
+def test_ensure_schema_missing_personal_file_is_safe(monkeypatch, tmp_path: Path) -> None:
+    """Both halves of the guard hold: flag ON but file absent creates only core.
+
+    Simulates a public checkout that shipped without ``schema_personal.sql``
+    while the flag is still on — ensure_schema() must not raise and must not
+    conjure the personal tables (the guard is ``flag AND file exists``).
+    """
+    missing = tmp_path / "no_such_schema_personal.sql"
+    assert not missing.exists()
+    monkeypatch.setattr(equipa_db, "SCHEMA_PERSONAL_SQL_PATH", missing)
+
+    db_path = tmp_path / "missing_personal.db"
+    monkeypatch.setattr(equipa_db, "THEFORGE_DB", db_path)
+    monkeypatch.setattr(equipa_db, "_SCHEMA_ENSURED", False)
+    equipa_db.ensure_schema(apply_personal=True)  # flag on, but file is gone
+
+    conn = sqlite3.connect(db_path)
+    try:
+        tables = _table_names(conn)
+    finally:
+        conn.close()
+    for core in CORE_TABLES:
+        assert core in tables, f"core table {core} missing when personal file absent"
+    for personal in PERSONAL_TABLES:
+        assert personal not in tables, (
+            f"{personal} created despite schema_personal.sql being absent"
+        )
