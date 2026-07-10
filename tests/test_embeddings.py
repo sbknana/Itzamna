@@ -142,7 +142,9 @@ class TestEmbedAndStoreLesson:
             model="all-MiniLM-L6-v2",
             base_url="http://localhost:11434",
         )
-        mock_conn.execute.assert_called_once_with(
+        # db.py issues PRAGMA busy_timeout on connect (task 2700), so execute()
+        # is called more than once; assert the INSERT call specifically.
+        mock_conn.execute.assert_any_call(
             "UPDATE lessons_learned SET embedding = ? WHERE id = ?",
             (json.dumps([0.1, 0.2, 0.3]), 123),
         )
@@ -201,7 +203,9 @@ class TestEmbedAndStoreEpisode:
         result = embed_and_store_episode(456, "episode content")
 
         assert result is True
-        mock_conn.execute.assert_called_once_with(
+        # db.py issues PRAGMA busy_timeout on connect (task 2700), so execute()
+        # is called more than once; assert the INSERT call specifically.
+        mock_conn.execute.assert_any_call(
             "UPDATE agent_episodes SET embedding = ? WHERE id = ?",
             (json.dumps([0.4, 0.5, 0.6]), 456),
         )
