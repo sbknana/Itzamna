@@ -1,13 +1,35 @@
-"""EQUIPA bash_security — pre-execution security filter for bash commands.
+"""EQUIPA bash_security — dangerous-bash-command detector (23 exploit patterns).
 
-Ported from Claude Code's bashSecurity.ts (23 exploit patterns).
-This module detects dangerous bash command patterns *before* they are
-passed to subprocess, blocking prompt-injection attacks that trick agents
-into running shell exploits.
+Ported from Claude Code's bashSecurity.ts. :func:`check_bash_command`
+classifies a shell command as safe/unsafe against 23 exploit patterns
+(command substitution, IFS injection, heredoc smuggling, unicode homoglyphs,
+etc.). It is a pure classifier — it never runs anything itself.
+
+Where the classification is enforced depends on the call site, and the two
+enforcement modes have very different guarantees. Do NOT overclaim the first:
+
+* **Reactive (always on, the default).** The streaming loop in
+  ``equipa.agent_runner`` inspects each Bash tool call in the Claude CLI's
+  stream-JSON output and, on an unsafe verdict, terminates the agent run.
+  Crucially the CLI has ALREADY executed the tool call by the time the
+  observer sees it — this is post-hoc *detect-and-terminate*, NOT prevention.
+  It stops the agent from continuing, and it stops repeat offenses, but it
+  cannot un-run the command that tripped it.
+
+* **Pre-execution (opt-in, feature flag ``bash_security_pretooluse``,
+  DEFAULT OFF).** When enabled, ``agent_runner`` wires
+  ``hooks/pretooluse_bash_gate.py`` into the spawned CLI as a Claude Code
+  PreToolUse hook (via a generated ``--settings`` file). The hook calls this
+  module BEFORE the Bash tool runs and blocks an unsafe command (exit 2) so
+  it never executes. This is the only mode that delivers true
+  *before-subprocess* prevention. The reactive check stays on underneath it
+  as defense-in-depth.
 
 Pure Python stdlib — NO pip dependencies. Uses ``re`` for regex patterns.
 
-Layer 5: No EQUIPA imports (standalone utility module).
+Layer 5: No EQUIPA imports (standalone utility module) — this is what lets
+``hooks/pretooluse_bash_gate.py`` load it in isolation without dragging in
+the rest of the orchestrator.
 
 Copyright 2026 Forgeborn
 """

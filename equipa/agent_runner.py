@@ -16,11 +16,14 @@ import logging
 import math
 import os
 import random
+import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from collections.abc import Iterator
+from pathlib import Path
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, TypedDict
 
@@ -292,6 +295,43 @@ def is_retryable_error(stderr: str, stdout: str) -> bool:
     return any(marker in combined for marker in retryable_markers)
 
 
+# Path to the flag-gated PreToolUse Bash security gate hook. Resolved from
+# this module's location (equipa/agent_runner.py -> <repo_root>/hooks/...),
+# so it is correct regardless of the process cwd.
+PRETOOLUSE_HOOK_SCRIPT = (
+    Path(__file__).resolve().parent.parent / "hooks" / "pretooluse_bash_gate.py"
+)
+
+
+def _pretooluse_settings_payload(hook_script: str | Path, python_bin: str) -> dict:
+    """Build the Claude CLI ``--settings`` payload wiring the Bash gate hook.
+
+    Returns a dict matching the Claude Code settings schema: a single
+    ``PreToolUse`` hook whose matcher targets the ``Bash`` tool and whose
+    command runs :mod:`hooks.pretooluse_bash_gate`. That script exits 2 (with
+    the failing check + reason on stderr) to block an unsafe command BEFORE
+    the CLI executes it — the pre-execution half of the bash security story.
+
+    Args:
+        hook_script: Absolute path to ``pretooluse_bash_gate.py``.
+        python_bin: Interpreter used to run the hook (normally the same
+            interpreter running the orchestrator, ``sys.executable``).
+    """
+    command = f"{shlex.quote(str(python_bin))} {shlex.quote(str(hook_script))}"
+    return {
+        "hooks": {
+            "PreToolUse": [
+                {
+                    "matcher": "Bash",
+                    "hooks": [
+                        {"type": "command", "command": command},
+                    ],
+                }
+            ]
+        }
+    }
+
+
 @contextlib.contextmanager
 def build_cli_command(
     system_prompt: str | PromptResult,
@@ -301,6 +341,7 @@ def build_cli_command(
     role: str = "developer",
     streaming: bool = False,
     prompt_message: str | None = None,
+    dispatch_config: dict | None = None,
 ) -> Iterator[list[str]]:
     """Build the claude CLI command as a context manager that owns its tempfile.
 
@@ -342,6 +383,9 @@ def build_cli_command(
         mode="w", suffix=".md", prefix="equipa_prompt_",
         delete=False, encoding="utf-8",
     )
+    # Populated only when the pre-execution bash gate is enabled; cleaned up
+    # alongside the prompt file in the finally block.
+    settings_file_name: str | None = None
     try:
         prompt_file.write(prompt_str)
         prompt_file.close()
@@ -360,16 +404,60 @@ def build_cli_command(
             "--permission-mode", "bypassPermissions",
         ]
 
+        # Resolve dispatch config once: prefer the caller-supplied config
+        # (threaded from the dispatch layer, or injected by tests), otherwise
+        # load it from disk. Used both for the optional --effort flag and the
+        # flag-gated pre-execution bash security hook below.
+        _dc: dict = dispatch_config if isinstance(dispatch_config, dict) else {}
+        if not _dc:
+            try:
+                _dc = load_dispatch_config(None) or {}
+            except (ImportError, FileNotFoundError, OSError, KeyError, ValueError):
+                _dc = {}  # config missing/unloadable → defaults everywhere below
+
         # Load effort flag from dispatch_config — production-only config-driven setting.
         # When dispatch_config.json has 'effort' set (e.g. "high"/"xhigh"/"max"), pass
         # it to the Claude CLI for extended thinking. No-op when unset (CLI uses default).
-        try:
-            _dc = load_dispatch_config(None)
-            _effort = _dc.get('effort')
-            if _effort:
-                cmd.extend(["--effort", _effort])
-        except (ImportError, FileNotFoundError, OSError, KeyError, ValueError):
-            pass  # config missing/unloadable → CLI default effort
+        _effort = _dc.get("effort")
+        if _effort:
+            cmd.extend(["--effort", _effort])
+
+        # Flag-gated (features.bash_security_pretooluse, DEFAULT FALSE) TRUE
+        # pre-execution bash security gate. When enabled, generate a --settings
+        # file wiring a Claude Code PreToolUse hook on the Bash tool that runs
+        # equipa.bash_security.check_bash_command BEFORE the tool executes and
+        # blocks unsafe commands (hook exit 2). When disabled the cmd list is
+        # byte-for-byte identical to the pre-2703 behavior (zero change).
+        # The reactive stream check in the streaming loop stays on regardless
+        # (defense-in-depth / belt-and-braces).
+        if is_feature_enabled(_dc, "bash_security_pretooluse"):
+            if PRETOOLUSE_HOOK_SCRIPT.is_file():
+                settings_payload = _pretooluse_settings_payload(
+                    PRETOOLUSE_HOOK_SCRIPT, sys.executable or "python3"
+                )
+                settings_file = tempfile.NamedTemporaryFile(
+                    mode="w", suffix=".json", prefix="equipa_settings_",
+                    delete=False, encoding="utf-8",
+                )
+                try:
+                    json.dump(settings_payload, settings_file)
+                    settings_file.close()
+                    settings_file_name = settings_file.name
+                    cmd.extend(["--settings", settings_file_name])
+                except OSError:
+                    logger.warning(
+                        "Failed to write PreToolUse settings file; skipping "
+                        "pre-execution bash gate for this run", exc_info=True,
+                    )
+                    try:
+                        os.unlink(settings_file.name)
+                    except OSError:
+                        pass
+            else:
+                logger.warning(
+                    "bash_security_pretooluse enabled but hook script missing "
+                    "at %s; skipping pre-execution gate", PRETOOLUSE_HOOK_SCRIPT,
+                )
 
         # stream-json requires --verbose
         if streaming:
@@ -393,6 +481,17 @@ def build_cli_command(
                 "Failed to remove agent prompt tempfile: %s", prompt_file.name,
                 exc_info=True,
             )
+        # Remove the generated PreToolUse settings file, if one was written.
+        if settings_file_name is not None:
+            try:
+                os.unlink(settings_file_name)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logger.warning(
+                    "Failed to remove agent settings tempfile: %s",
+                    settings_file_name, exc_info=True,
+                )
 
 
 def _evaluate_paralysis_retry_read_gate(

@@ -233,7 +233,7 @@ equipa/                     # Core package (24 modules)
 ├── agent_runner.py         # Spawns Claude subprocesses, handles retries
 ├── prompts.py              # Prompt building with cache-split (PromptResult)
 ├── monitoring.py           # Loop detection, budget tracking, git diff detection
-├── bash_security.py        # 12+ regex checks on bash commands
+├── bash_security.py        # 20+ regex checks classifying bash commands (reactive + opt-in pre-exec gate)
 ├── abort_controller.py     # WeakRef-based subprocess hierarchy
 ├── checkpoints.py          # Soft checkpoint save/load for compaction recovery
 ├── tool_result_storage.py  # Persist large outputs (>50KB) to disk
@@ -323,7 +323,12 @@ Each agent works in its own git worktree on a dedicated branch. This means paral
 Every agent run gets recorded as an episode with a Q-value (quality score). Successful runs increase Q-values, failures decrease them. When building prompts for new tasks, high-Q episodes get injected as examples. The knowledge graph adds PageRank scoring on top — episodes that help many different tasks score higher. This is the core of the "self-improving" claim.
 
 ### Bash security filter
-Agents can run bash commands, which is powerful and dangerous. The security filter (`equipa/bash_security.py`) runs 12+ regex checks blocking command injection, IFS manipulation, process substitution, unicode homoglyph attacks, and more. It's ported from Claude Code's production security patterns. It's good, but it's regex — a sufficiently creative attacker could probably find gaps.
+Agents can run bash commands, which is powerful and dangerous. The classifier (`equipa/bash_security.py`) runs 20+ regex checks flagging command injection, IFS manipulation, process substitution, unicode homoglyph attacks, and more. It's ported from Claude Code's production security patterns. It's good, but it's regex — a sufficiently creative attacker could probably find gaps.
+
+Where that verdict is *enforced* matters, and there are two modes with very different guarantees — don't conflate them:
+
+- **Reactive (always on, the default).** The streaming loop in `equipa/agent_runner.py` inspects each Bash tool call in the Claude CLI's stream-JSON output and, on an unsafe verdict, terminates the agent run. The catch: the CLI has *already executed* the command by the time the observer sees it. This is post-hoc **detect-and-terminate**, not prevention — it stops the agent from continuing and stops repeat offenses, but it cannot un-run the command that tripped it.
+- **Pre-execution (opt-in, feature flag `bash_security_pretooluse`, default OFF).** When enabled, `agent_runner` wires `hooks/pretooluse_bash_gate.py` into the spawned CLI as a Claude Code PreToolUse hook (via a generated `--settings` file). The hook runs the classifier *before* the Bash tool executes and blocks an unsafe command (exit 2, reason on stderr) so it never runs. This is the only mode that delivers true before-subprocess prevention; the reactive check stays on underneath it as defense-in-depth. The flag ships OFF, so default behavior is unchanged.
 
 ### Cost controls that actually kill agents
 The cost router scores task complexity and picks the cheapest model that can handle it. There's a hard cost limit per task that scales with complexity. When an agent hits the limit, it gets killed — no "please wrap up" politeness, just terminated. The circuit breaker pattern also handles model outages: if a tier fails 5 times, traffic routes to a cheaper tier until the expensive one recovers.
