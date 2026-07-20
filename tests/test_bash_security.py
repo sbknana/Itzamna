@@ -11,6 +11,7 @@ from equipa.bash_security import (
     BashSecurityResult,
     CheckID,
     _git_substitution_is_read_only,
+    _go_substitution_is_read_only,
     _is_safe_substitution_inner,
     check_bash_command,
 )
@@ -1281,11 +1282,14 @@ class TestDeveloperLoosens:
 
     @pytest.mark.parametrize("cmd", [
         # Task #2308: argument-side $() with read-only inner commands.
-        # NOTE: `go env`/`gh ...` INSIDE $() are no longer allowed — SR-2722
-        # pruned go/gh from _SAFE_SUBSTITUTION_COMMANDS (general-purpose
-        # runners). `git rev-parse`/`mktemp` remain pure read-only emitters.
+        # NOTE: `gh ...` INSIDE $() is no longer allowed — SR-2722 pruned gh
+        # from _SAFE_SUBSTITUTION_COMMANDS. `go` is allowed only for the
+        # read-only `go env`/`go version`/`go list` value-emitters (gated by
+        # _go_substitution_is_read_only). `git rev-parse`/`mktemp` are pure.
+        'ls $(go env GOMODCACHE)',
         'cd $(git rev-parse --show-toplevel)',
         'gh pr create --body-file $(mktemp -d)/body.md',  # gh is OUTER, not in $()
+        'echo $(go env GOPATH)',
         'cat $(mktemp)',
     ])
     def test_argside_dollar_paren_readonly_allowed(self, cmd: str) -> None:
@@ -1428,6 +1432,50 @@ class TestDeveloperLoosens:
     def test_sr2722_git_readonly_policy(self, segment: str, expected: bool) -> None:
         """S1: git is allowed in $() only for read-only, non-RCE subcommands."""
         assert _git_substitution_is_read_only(segment) is expected
+
+    # ---- SR-2722 FP follow-up: go env/version/list value-emitters ---- #
+
+    @pytest.mark.parametrize("cmd", [
+        '$(go env GOMODCACHE)',
+        '$(go env GOPATH)',
+        'ls $(go env GOMODCACHE)',
+        '$(go version)',
+    ])
+    def test_sr2722_go_readonly_allowed(self, cmd: str) -> None:
+        """go env/version inside $() are pure value-emitters — safe."""
+        result = check_bash_command(cmd)
+        assert result.safe, f"expected safe: {cmd} -> {result.message}"
+
+    @pytest.mark.parametrize("cmd", [
+        '$(go run ./evil.go)',
+        '$(go generate ./...)',
+        '$(go build -o x)',
+        '$(go test ./...)',
+        '$(go env -w GOFLAGS=x)',   # -w MUTATES the persisted go env
+    ])
+    def test_sr2722_go_execute_blocked(self, cmd: str) -> None:
+        """go run/build/test/generate and `go env -w` inside $() are blocked."""
+        result = check_bash_command(cmd)
+        assert not result.safe, f"expected BLOCKED: {cmd}"
+
+    @pytest.mark.parametrize("segment,expected", [
+        ('go env GOMODCACHE', True),
+        ('go env GOPATH', True),
+        ('go version', True),
+        ('go list -m', True),
+        ('go env -w GOFLAGS=x', False),
+        ('go env -u GOFLAGS', False),
+        ('go run ./evil.go', False),
+        ('go build -o x', False),
+        ('go test ./...', False),
+        ('go generate ./...', False),
+        ('go install x', False),
+        ('go mod tidy', False),
+        ('go tool foo', False),
+    ])
+    def test_sr2722_go_readonly_policy(self, segment: str, expected: bool) -> None:
+        """go is allowed in $() only for env/version/list value-emitters."""
+        assert _go_substitution_is_read_only(segment) is expected
 
     # ---- Check 10: output redirection allowlist (extended) ---- #
 

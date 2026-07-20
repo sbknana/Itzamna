@@ -1075,6 +1075,10 @@ def _is_safe_substitution_inner(inner: str) -> bool:
         # necessary but NOT sufficient for git.
         if base == "git" and not _git_substitution_is_read_only(segment):
             return False
+        # SR-2722 FP follow-up: go is a general-purpose toolchain runner — allow
+        # it only for pure value-emitter subcommands (go env/version/list).
+        if base == "go" and not _go_substitution_is_read_only(segment):
+            return False
     return True
 
 
@@ -1846,13 +1850,14 @@ _LOCALE_QUOTING_SAFE_BASES: frozenset[str] = frozenset([
 # SR-2722 S1/S2: this set MUST contain ONLY pure value-emitters and
 # read-only filters that can NEITHER execute another command NOR write/delete
 # files. General-purpose interpreters/runners (sed, awk, find, fd, env,
-# command, tee, go, gh) were REMOVED — each is an RCE or arbitrary-file-write
+# command, tee, gh) were REMOVED — each is an RCE or arbitrary-file-write
 # vector inside $() (awk system(), sed `e`/`-i`/`w`, find `-exec`/`-delete`,
-# env/command run their argument, tee writes any path). `git` stays but is
-# gated by _git_substitution_is_read_only() in _is_safe_substitution_inner —
-# raw membership here is NOT sufficient for git.
+# env/command run their argument, tee writes any path). `git` and `go` stay
+# but are gated by _git_substitution_is_read_only() / _go_substitution_is_read_only()
+# in _is_safe_substitution_inner — raw membership here is NOT sufficient for them.
 _SAFE_SUBSTITUTION_COMMANDS: frozenset[str] = frozenset([
     "git",          # gated: read-only subcommands only (see helper)
+    "go",           # gated: `go env`/`go version`/`go list` only (see helper)
     "date",
     "basename", "dirname", "realpath", "readlink",
     "mktemp",       # path emitter; output is a fresh tmp path/dir
@@ -1963,6 +1968,60 @@ def _git_substitution_is_read_only(segment: str) -> bool:
     if subcommand == "remote":
         for a in sub_args:
             if not a.startswith("-") and a in _GIT_REMOTE_MUTATING:
+                return False
+        return True
+    return True
+
+
+# Read-only go subcommands allowed inside $() (SR-2722, task 2722 FP follow-up).
+# `go env`/`go version`/`go list` are pure value-emitters used by EQUIPA's Go
+# builds (docs/BASHSECURITY-WORKAROUNDS.md). Everything that compiles or runs
+# code (`go run`, `go build`, `go test`, `go generate`, `go install`, `go get`,
+# `go vet`, `go tool`, `go work`, `go mod ...`) stays blocked, as does the
+# `go env -w`/`-u` write form which MUTATES the persisted go environment.
+_GO_READONLY_SUBCOMMANDS: frozenset[str] = frozenset([
+    "env", "version", "list",
+])
+
+
+def _go_substitution_is_read_only(segment: str) -> bool:
+    """SR-2722: allow ``go`` inside ``$()`` ONLY for pure value-emitters.
+
+    Permits ``go env [VAR]``, ``go version`` and ``go list ...`` (all read-only
+    stdout emitters). Rejects every compile/execute subcommand and the
+    ``go env -w``/``go env -u`` write forms that mutate persisted go env.
+    Returns False on anything it cannot positively prove read-only.
+    """
+    try:
+        tokens = shlex.split(segment)
+    except ValueError:
+        return False
+    if not tokens or tokens[0] != "go":
+        return False
+    rest = tokens[1:]
+
+    # Defense-in-depth: no nested substitution smuggled into a token.
+    for tok in rest:
+        if "`" in tok or "$(" in tok:
+            return False
+
+    # First non-flag token = the subcommand.
+    subcommand = None
+    sub_idx = -1
+    for idx, tok in enumerate(rest):
+        if tok.startswith("-"):
+            continue
+        subcommand = tok
+        sub_idx = idx
+        break
+    if subcommand is None or subcommand not in _GO_READONLY_SUBCOMMANDS:
+        return False
+
+    sub_args = rest[sub_idx + 1:]
+    if subcommand == "env":
+        # `go env -w KEY=VAL` / `go env -u KEY` MUTATE the persisted go env.
+        for a in sub_args:
+            if a in ("-w", "-u") or a.startswith("-w") or a.startswith("-u"):
                 return False
         return True
     return True
