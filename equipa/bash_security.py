@@ -262,6 +262,19 @@ def _split_command_segments(command: str) -> list[str]:
             continue
 
         # Outside quotes / substitutions.
+        # SR-2722 S4: a backslash escapes the next character at the shell
+        # level, so an escaped separator (e.g. a backslash-semicolon in
+        # ``find . -exec id \;``) is literal data, not a segment boundary.
+        # Consume both chars together so the operator scan below never sees
+        # the escaped separator. Mirrors _has_shell_level_char's escape flag.
+        if ch == "\\":
+            buf.append(ch)
+            if nxt:
+                buf.append(nxt)
+                i += 2
+            else:
+                i += 1
+            continue
         if ch == "'":
             in_single = True
             buf.append(ch)
@@ -1044,12 +1057,23 @@ def _is_safe_substitution_inner(inner: str) -> bool:
     if not segments:
         return False
     for segment in segments:
+        # SR-2722 S3: reject a leading ``VAR=value`` environment-assignment
+        # prefix instead of stripping it — otherwise
+        # ``$(PATH=/tmp/evil grep x f)`` / ``$(LD_PRELOAD=/tmp/e.so cat f)``
+        # hijack the allowlisted base command via a poisoned environment.
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", segment):
+            return False
         base = _get_base_command(segment)
         if not base:
             return False
         if base in _DANGEROUS_SUBSTITUTION_COMMANDS:
             return False
         if base not in _SAFE_SUBSTITUTION_COMMANDS:
+            return False
+        # SR-2722 S1: git is a general-purpose runner - allow it only for
+        # read-only, non-RCE subcommands. Membership in the safe set above is
+        # necessary but NOT sufficient for git.
+        if base == "git" and not _git_substitution_is_read_only(segment):
             return False
     return True
 
@@ -1819,24 +1843,28 @@ _LOCALE_QUOTING_SAFE_BASES: frozenset[str] = frozenset([
 # (task #2308 — argument-side false-positives blocked common dev
 # patterns like ``ls $(go env GOMODCACHE)`` and ``gh pr create
 # --body-file $(mktemp -d)/body.md``).
+# SR-2722 S1/S2: this set MUST contain ONLY pure value-emitters and
+# read-only filters that can NEITHER execute another command NOR write/delete
+# files. General-purpose interpreters/runners (sed, awk, find, fd, env,
+# command, tee, go, gh) were REMOVED — each is an RCE or arbitrary-file-write
+# vector inside $() (awk system(), sed `e`/`-i`/`w`, find `-exec`/`-delete`,
+# env/command run their argument, tee writes any path). `git` stays but is
+# gated by _git_substitution_is_read_only() in _is_safe_substitution_inner —
+# raw membership here is NOT sufficient for git.
 _SAFE_SUBSTITUTION_COMMANDS: frozenset[str] = frozenset([
-    "git",          # rev-parse, log, diff, branch, etc. (all read-only forms)
-    "gh",           # GitHub CLI read-only subcommands (pr view, repo view, etc.)
-    "go",           # `go env GOMODCACHE`, `go env GOPATH`, etc.
+    "git",          # gated: read-only subcommands only (see helper)
     "date",
     "basename", "dirname", "realpath", "readlink",
     "mktemp",       # path emitter; output is a fresh tmp path/dir
     "pwd",
     "echo", "printf",
-    "cat",          # of project-relative files only — see check
+    "cat",          # pure filter; cannot write (no redirection operator here)
     "wc", "head", "tail", "sort", "uniq",
     "grep", "egrep", "fgrep", "rg", "ag",
-    "sed", "awk",
-    "ls", "find", "fd",
-    "tr", "cut", "tee",
+    "tr", "cut",    # pure text filters
+    "ls",
     "id", "whoami", "hostname", "uname",
-    "which", "type", "command",
-    "env",
+    "which", "type",
     "expr", "test", "[",   # `[` is the test builtin: `[ -x path ]`
     "true", "false",       # no-op status commands, common chain fallbacks
 ])
@@ -1858,6 +1886,86 @@ _DANGEROUS_SUBSTITUTION_COMMANDS: frozenset[str] = frozenset([
     "apt", "apt-get", "yum", "dnf", "pip", "pip3", "npm", "yarn",
     "docker", "podman", "kubectl",
 ])
+
+
+# Read-only git subcommands allowed inside $() (SR-2722 S1). A subcommand not
+# in this set — or any global RCE-bearing option (`-c`, `--exec-path`,
+# `--config-env`, `core.pager`, `alias.`, `!`) — makes the whole git segment
+# unsafe.
+_GIT_READONLY_SUBCOMMANDS: frozenset[str] = frozenset([
+    "rev-parse", "rev-list", "log", "diff", "branch", "describe",
+    "status", "show", "config", "symbolic-ref", "name-rev",
+    "merge-base", "cat-file", "ls-files", "ls-tree", "tag", "remote",
+])
+
+# `git remote <verb>` verbs that MUTATE state — bare `git remote`/`git remote -v`
+# is read-only, but these are not.
+_GIT_REMOTE_MUTATING: frozenset[str] = frozenset([
+    "add", "remove", "rm", "rename", "set-url", "set-head",
+    "set-branches", "prune", "update",
+])
+
+
+def _git_substitution_is_read_only(segment: str) -> bool:
+    """SR-2722 S1: allow ``git`` inside ``$()`` ONLY for read-only, non-RCE use.
+
+    ``git`` is a general-purpose runner: ``git -c alias.x='!cmd' x`` and
+    ``git -c core.pager='cmd' log`` execute arbitrary commands, and
+    ``--exec-path``/``--config-env`` relocate the executed program set. This
+    helper permits git in a substitution only when:
+
+    * the command carries NONE of ``-c`` / ``--exec-path`` / ``--config-env``
+      and no argument contains ``core.pager`` / ``alias.`` / ``!``; AND
+    * the first non-flag token is a known read-only subcommand
+      (``rev-parse``, ``log``, ``diff``, ...); AND
+    * ``config`` is limited to ``--get*``/``--list`` (never a write); and
+      ``remote`` carries no mutating verb.
+
+    Returns False (unsafe) on anything it cannot positively prove read-only.
+    """
+    try:
+        tokens = shlex.split(segment)
+    except ValueError:
+        return False
+    if not tokens or tokens[0] != "git":
+        return False
+    rest = tokens[1:]
+
+    # Global RCE-bearing options anywhere in the command -> reject outright.
+    for tok in rest:
+        if tok.startswith("-c"):            # -c, -c=, -cKEY=VAL (config inject)
+            return False
+        if tok.startswith("--exec-path"):   # relocate git's exec dir
+            return False
+        if tok.startswith("--config-env"):  # -c via env indirection
+            return False
+        if "core.pager" in tok or "alias." in tok or "!" in tok:
+            return False
+
+    # First non-flag token = the subcommand.
+    subcommand = None
+    sub_idx = -1
+    for idx, tok in enumerate(rest):
+        if tok.startswith("-"):
+            continue
+        subcommand = tok
+        sub_idx = idx
+        break
+    if subcommand is None or subcommand not in _GIT_READONLY_SUBCOMMANDS:
+        return False
+
+    sub_args = rest[sub_idx + 1:]
+    if subcommand == "config":
+        # Read-only config access only: must ask for a value, never set one.
+        if not any(a == "--list" or a.startswith("--get") for a in sub_args):
+            return False
+        return True
+    if subcommand == "remote":
+        for a in sub_args:
+            if not a.startswith("-") and a in _GIT_REMOTE_MUTATING:
+                return False
+        return True
+    return True
 
 
 # ---------------------------------------------------------------------------
