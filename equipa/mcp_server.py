@@ -6,7 +6,7 @@ Uses ONLY Python stdlib (json, sys, subprocess) — no external dependencies.
 Implements:
 - JSON-RPC 2.0 protocol over stdio
 - MCP initialization handshake
-- 7 tools: dispatch, task_status, task_create, lessons, agent_logs, project_context, session_notes
+- 8 tools: dispatch, task_status, task_create, lessons, agent_logs, project_context, session_notes, session_note_add
 
 Hardening (SECURITY-REVIEW-1728, task 2452):
 - MCP-01: equipa_dispatch requires EQUIPA_MCP_TOKEN auth, is rate-limited
@@ -14,6 +14,11 @@ Hardening (SECURITY-REVIEW-1728, task 2452):
 - MCP-02: equipa_task_create validates project existence + status, caps
   description size, is rate-limited, and honours EQUIPA_MCP_PROJECT_IDS allowlist.
 - MCP-03: All query handlers clamp caller-supplied ``limit`` to MAX_QUERY_LIMIT.
+- MCP-04: equipa_session_note_add requires auth, validates project existence +
+  status, is rate-limited, and sanitizes summary/next_steps/key_points through
+  lesson_sanitizer.sanitize_session_note (injection-strip + generous length
+  policy, no silent truncation) so session notes cannot be written unsanitized
+  through the semantic write path.
 
 Stderr is used for logging only. Stdout is reserved for JSON-RPC messages.
 
@@ -67,6 +72,8 @@ DISPATCH_RATE_CAPACITY = 10          # 10 dispatches
 DISPATCH_RATE_REFILL_SECONDS = 3600  # ...per hour per token
 TASK_CREATE_RATE_CAPACITY = 100
 TASK_CREATE_RATE_REFILL_SECONDS = 3600
+SESSION_NOTE_RATE_CAPACITY = 100
+SESSION_NOTE_RATE_REFILL_SECONDS = 3600
 
 # Project statuses allowed as task_create targets.
 ALLOWED_PROJECT_STATUSES = {"active", "planning"}
@@ -180,6 +187,7 @@ class _TokenBucket:
 
 _DISPATCH_BUCKET = _TokenBucket(DISPATCH_RATE_CAPACITY, DISPATCH_RATE_REFILL_SECONDS)
 _TASK_CREATE_BUCKET = _TokenBucket(TASK_CREATE_RATE_CAPACITY, TASK_CREATE_RATE_REFILL_SECONDS)
+_SESSION_NOTE_BUCKET = _TokenBucket(SESSION_NOTE_RATE_CAPACITY, SESSION_NOTE_RATE_REFILL_SECONDS)
 
 
 def _expected_token() -> str | None:
@@ -649,6 +657,100 @@ def _handle_equipa_session_notes(args: dict) -> dict:
         }
 
 
+def _handle_equipa_session_note_add(args: dict) -> dict:
+    """Write a session note to TheForge, sanitizing narrative fields.
+
+    The *write* counterpart to equipa_session_notes. It exists so a session note
+    can be persisted through the sanctioned MCP interface with the mandatory
+    sanitization applied *at the boundary*, rather than depending on the caller
+    (e.g. the forge-end skill) to remember to run lesson_sanitizer before a raw
+    write. summary/next_steps/key_points are passed through sanitize_session_note
+    (injection-strip + generous length policy, no silent truncation) before
+    insertion.
+
+    Args:
+        auth_token (str): Required. Must match EQUIPA_MCP_TOKEN env var.
+        project_id (int): Project ID — must exist and be {active, planning}.
+        summary (str): Required. What happened this session.
+        next_steps (str, optional): What to do next.
+        key_points (str, optional): Key points / highlights.
+
+    Returns:
+        dict: {"session_note_id": int, "status": "created", ...} or {"error": ...}.
+    """
+    ok, err = _check_auth(args)
+    if not ok:
+        return err
+
+    token = _expected_token() or "anonymous"
+    allowed, retry_after = _SESSION_NOTE_BUCKET.try_consume(token)
+    if not allowed:
+        return {
+            "error": "Rate limit exceeded for equipa_session_note_add",
+            "retry_after_seconds": round(retry_after, 2),
+            "limit": f"{SESSION_NOTE_RATE_CAPACITY}/{SESSION_NOTE_RATE_REFILL_SECONDS}s",
+        }
+
+    project_id = args.get("project_id")
+    if not isinstance(project_id, int) or project_id <= 0:
+        return {"error": "project_id must be a positive integer"}
+
+    allowlist = _project_id_allowlist()
+    if allowlist is not None and project_id not in allowlist:
+        return {
+            "error": f"project_id {project_id} not in EQUIPA_MCP_PROJECT_IDS allowlist",
+        }
+
+    # Sanitize narrative fields at the boundary. Imported lazily (repo-root
+    # module) so an import failure degrades to a length-capping fallback rather
+    # than taking the whole server down.
+    try:
+        from lesson_sanitizer import sanitize_session_note
+    except Exception:  # pragma: no cover - fallback if sanitizer unavailable
+        def sanitize_session_note(text: Any) -> str:
+            return ("" if not text else str(text))[:50_000]
+
+    summary = sanitize_session_note(args.get("summary", ""))
+    next_steps = sanitize_session_note(args.get("next_steps", ""))
+    key_points = sanitize_session_note(args.get("key_points", ""))
+
+    if not summary:
+        return {"error": "summary is required (non-empty after sanitization)"}
+
+    with _db_conn(write=True) as conn:
+        proj = conn.execute(
+            "SELECT id, status FROM projects WHERE id = ?",
+            (project_id,),
+        ).fetchone()
+        if proj is None:
+            return {"error": f"project_id {project_id} does not exist"}
+        status = (proj["status"] or "").lower()
+        if status not in ALLOWED_PROJECT_STATUSES:
+            return {
+                "error": (
+                    f"project_id {project_id} has status {status!r}; "
+                    f"expected one of {sorted(ALLOWED_PROJECT_STATUSES)}"
+                ),
+            }
+
+        cursor = conn.execute(
+            """
+            INSERT INTO session_notes
+                (project_id, summary, key_points, next_steps, session_date)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """,
+            (project_id, summary, key_points, next_steps),
+        )
+        note_id = cursor.lastrowid
+
+        return {
+            "session_note_id": note_id,
+            "status": "created",
+            "project_id": project_id,
+            "summary_chars": len(summary),
+        }
+
+
 # --- Tool Registry ---
 
 TOOLS = {
@@ -736,6 +838,21 @@ TOOLS = {
             },
         },
         "handler": _handle_equipa_session_notes,
+    },
+    "equipa_session_note_add": {
+        "description": "Write a session note to TheForge with mandatory sanitization (requires auth_token)",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "auth_token": {"type": "string", "description": "Server token (matches EQUIPA_MCP_TOKEN)"},
+                "project_id": {"type": "integer", "description": "Project ID (must exist, status active/planning)"},
+                "summary": {"type": "string", "description": "What happened this session (sanitized; up to ~50k chars)"},
+                "next_steps": {"type": "string", "description": "What to do next (sanitized)"},
+                "key_points": {"type": "string", "description": "Key points / highlights (sanitized)"},
+            },
+            "required": ["auth_token", "project_id", "summary"],
+        },
+        "handler": _handle_equipa_session_note_add,
     },
 }
 
