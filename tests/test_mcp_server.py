@@ -228,7 +228,7 @@ def test_initialized_notification(mcp_server):
 
 
 def test_tools_list(mcp_server):
-    """Test tools/list returns all 8 tools."""
+    """Test tools/list returns all 9 tools."""
     response = _send_request(mcp_server, "tools/list", {})
 
     assert response["jsonrpc"] == "2.0"
@@ -247,6 +247,7 @@ def test_tools_list(mcp_server):
         "equipa_project_context",
         "equipa_session_notes",
         "equipa_session_note_add",
+        "equipa_lesson_add",
     }
 
     assert tool_names == expected
