@@ -61,7 +61,6 @@ from equipa.loops import (
     run_security_review,
 )
 from equipa.manager import run_manager_loop
-from equipa.mcp_server import run_server
 from equipa.monitoring import calculate_dynamic_budget
 from equipa.output import (
     log,
@@ -681,7 +680,16 @@ def _auto_snapshot_dispatch(
 
 
 async def run_mode_mcp_server(args: argparse.Namespace) -> None:
-    """Run as MCP server (JSON-RPC over stdio)."""
+    """Run as MCP server (JSON-RPC over stdio).
+
+    The import is function-local rather than module-level so that importing
+    ``equipa`` (which imports this module) does not pull in ``equipa.mcp_server``.
+    That import made ``python -m equipa.mcp_server`` load the module twice —
+    once as ``equipa.mcp_server`` via the package, then again as ``__main__``
+    via runpy — which emitted a RuntimeWarning on every server start.
+    """
+    from equipa.mcp_server import run_server
+
     run_server()
 
 
