@@ -172,6 +172,40 @@ def sanitize_session_note(text):
                                    label="session note")
 
 
+def sanitize_decision(text):
+    """Sanitize a decision's short fields (topic / rationale / alternatives).
+
+    Uses MAX_DECISION_LENGTH, which is sized for exactly these fields — the
+    constant's own comment reads "decision rationales". Measured against a
+    636-row decisions table the longest rationale was 4,355 chars and the
+    longest alternatives_considered 1,062, so the 8,000 cap has ample headroom
+    and will not truncate real records.
+
+    For the narrative ``decision`` body itself use sanitize_decision_body();
+    this cap *would* truncate it.
+    """
+    return sanitize_lesson_content(text, max_len=MAX_DECISION_LENGTH,
+                                   label="decision field")
+
+
+def sanitize_decision_body(text):
+    """Sanitize the narrative ``decision`` body without silent loss.
+
+    Decision bodies are narrative and *accrete* — amendments, corrections and
+    superseding notes are appended to an existing record rather than replacing
+    it — so they grow well past the rationale cap. Measured against a 636-row
+    decisions table, 12 rows (1.9%) already exceed MAX_DECISION_LENGTH and the
+    longest ran 32,344 chars. Capping the body at MAX_DECISION_LENGTH would
+    therefore destroy real content, which is the same failure mode the 500-char
+    lesson cap caused for session notes (Equipa task #100027).
+
+    Uses MAX_SESSION_NOTE_LENGTH: the body is narrative content of the same
+    class as a session-note summary.
+    """
+    return sanitize_lesson_content(text, max_len=MAX_SESSION_NOTE_LENGTH,
+                                   label="decision body")
+
+
 def sanitize_error_signature(sig):
     """Sanitize an error signature before using it in lesson generation.
 

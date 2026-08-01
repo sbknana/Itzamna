@@ -6,7 +6,7 @@ Uses ONLY Python stdlib (json, sys, subprocess) — no external dependencies.
 Implements:
 - JSON-RPC 2.0 protocol over stdio
 - MCP initialization handshake
-- 9 tools: dispatch, task_status, task_create, lessons, agent_logs, project_context, session_notes, session_note_add, lesson_add
+- 10 tools: dispatch, task_status, task_create, lessons, agent_logs, project_context, session_notes, session_note_add, lesson_add, decision_add
 
 Hardening (SECURITY-REVIEW-1728, task 2452):
 - MCP-01: equipa_dispatch requires EQUIPA_MCP_TOKEN auth, is rate-limited
@@ -24,6 +24,12 @@ Hardening (SECURITY-REVIEW-1728, task 2452):
   body through lesson_sanitizer.sanitize_lesson_content and the short metadata
   fields through sanitize_error_signature, closing the identical advisory-only
   gap for the lessons_learned table.
+- MCP-06: equipa_decision_add closes the same gap for the decisions table —
+  auth + rate-limit + project validation, plus decision_type/status vocabulary
+  checks (the table carries no CHECK constraints). Field caps are asymmetric by
+  measurement: topic/rationale/alternatives use sanitize_decision, while the
+  narrative decision body uses sanitize_decision_body, because decision bodies
+  accrete amendments and the rationale cap would silently destroy them.
 
 Stderr is used for logging only. Stdout is reserved for JSON-RPC messages.
 
@@ -81,9 +87,30 @@ SESSION_NOTE_RATE_CAPACITY = 100
 SESSION_NOTE_RATE_REFILL_SECONDS = 3600
 LESSON_ADD_RATE_CAPACITY = 100
 LESSON_ADD_RATE_REFILL_SECONDS = 3600
+DECISION_ADD_RATE_CAPACITY = 100
+DECISION_ADD_RATE_REFILL_SECONDS = 3600
 
 # Project statuses allowed as task_create targets.
 ALLOWED_PROJECT_STATUSES = {"active", "planning"}
+
+# decision_type / status vocabularies accepted by equipa_decision_add.
+#
+# The decisions table carries NO CHECK constraints, so these columns have drifted
+# in practice. Each set below is the UNION of the documented vocabulary and every
+# value already present in the table — deliberately permissive, because a stricter
+# allowlist would start rejecting values the system has been writing for months.
+# Note for maintainers: "architectural" and "architecture" are both in use and are
+# almost certainly the same category; deduplicating them is a data-hygiene change,
+# not a change this write-path should make silently.
+ALLOWED_DECISION_TYPES = {
+    "architectural", "architecture", "design", "docs-architecture", "general",
+    "ip_finding", "packaging", "regulatory_finding", "resolution",
+    "security_finding", "strategy", "technical", "trade_off",
+}
+ALLOWED_DECISION_STATUSES = {
+    "accepted", "active", "decided", "failed_resolution", "open", "resolved",
+    "superseded", "wont_fix",
+}
 
 # Role + model allowlists for equipa_dispatch. Built from orchestrator constants
 # where possible; the fallbacks ensure the MCP server still refuses unknown
@@ -196,6 +223,7 @@ _DISPATCH_BUCKET = _TokenBucket(DISPATCH_RATE_CAPACITY, DISPATCH_RATE_REFILL_SEC
 _TASK_CREATE_BUCKET = _TokenBucket(TASK_CREATE_RATE_CAPACITY, TASK_CREATE_RATE_REFILL_SECONDS)
 _SESSION_NOTE_BUCKET = _TokenBucket(SESSION_NOTE_RATE_CAPACITY, SESSION_NOTE_RATE_REFILL_SECONDS)
 _LESSON_ADD_BUCKET = _TokenBucket(LESSON_ADD_RATE_CAPACITY, LESSON_ADD_RATE_REFILL_SECONDS)
+_DECISION_ADD_BUCKET = _TokenBucket(DECISION_ADD_RATE_CAPACITY, DECISION_ADD_RATE_REFILL_SECONDS)
 
 
 def _expected_token() -> str | None:
@@ -863,6 +891,141 @@ def _handle_equipa_lesson_add(args: dict) -> dict:
         }
 
 
+def _handle_equipa_decision_add(args: dict) -> dict:
+    """Write an architectural/product decision to TheForge, sanitizing all text.
+
+    The *write* counterpart to the decisions half of equipa_project_context, and
+    the third sanitizing write-tool alongside equipa_session_note_add and
+    equipa_lesson_add. It closes the same advisory-only gap for the decisions
+    table: without it, decisions can only be written by raw SQL through a generic
+    database adapter, with no auth, no rate limit, no project validation and no
+    sanitization at the boundary.
+
+    Field caps are asymmetric by design and by measurement. topic / rationale /
+    alternatives_considered use sanitize_decision (MAX_DECISION_LENGTH — the
+    constant's own comment reads "decision rationales"), while the narrative
+    ``decision`` body uses sanitize_decision_body (MAX_SESSION_NOTE_LENGTH),
+    because decision bodies accrete amendments over time and the rationale cap
+    would silently destroy them. See lesson_sanitizer for the measurements.
+
+    Args:
+        auth_token (str): Required. Must match EQUIPA_MCP_TOKEN env var.
+        project_id (int): Required. Must exist and be {active, planning}.
+        topic (str): Required. What the decision is about.
+        decision (str): Required. What was decided.
+        rationale (str, optional): Why.
+        alternatives_considered (str, optional): What else was weighed.
+        decision_type (str, optional): Category (default "general").
+        status (str, optional): Lifecycle state (default "open").
+
+    Returns:
+        dict: {"decision_id": int, "status": "created", ...} or {"error": ...}.
+    """
+    ok, err = _check_auth(args)
+    if not ok:
+        return err
+
+    token = _expected_token() or "anonymous"
+    allowed, retry_after = _DECISION_ADD_BUCKET.try_consume(token)
+    if not allowed:
+        return {
+            "error": "Rate limit exceeded for equipa_decision_add",
+            "retry_after_seconds": round(retry_after, 2),
+            "limit": f"{DECISION_ADD_RATE_CAPACITY}/{DECISION_ADD_RATE_REFILL_SECONDS}s",
+        }
+
+    project_id = args.get("project_id")
+    if not isinstance(project_id, int) or project_id <= 0:
+        return {"error": "project_id must be a positive integer"}
+
+    allowlist = _project_id_allowlist()
+    if allowlist is not None and project_id not in allowlist:
+        return {
+            "error": f"project_id {project_id} not in EQUIPA_MCP_PROJECT_IDS allowlist",
+        }
+
+    # Sanitize at the boundary. Imported lazily (repo-root module) so an import
+    # failure degrades to a length-capping fallback rather than downing the server.
+    try:
+        from lesson_sanitizer import sanitize_decision, sanitize_decision_body
+    except Exception:  # pragma: no cover - fallback if sanitizer unavailable
+        def sanitize_decision(text: Any) -> str:
+            return ("" if not text else str(text))[:8_000]
+
+        def sanitize_decision_body(text: Any) -> str:
+            return ("" if not text else str(text))[:50_000]
+
+    topic = sanitize_decision(args.get("topic", ""))
+    decision = sanitize_decision_body(args.get("decision", ""))
+    rationale = sanitize_decision(args.get("rationale", "")) or None
+    alternatives = sanitize_decision(args.get("alternatives_considered", "")) or None
+
+    if not topic:
+        return {"error": "topic is required (non-empty after sanitization)"}
+    if not decision:
+        return {"error": "decision is required (non-empty after sanitization)"}
+
+    decision_type = (args.get("decision_type") or "general").strip().lower()
+    if decision_type not in ALLOWED_DECISION_TYPES:
+        return {
+            "error": (
+                f"decision_type {decision_type!r} not recognised; "
+                f"expected one of {sorted(ALLOWED_DECISION_TYPES)}"
+            ),
+        }
+
+    status = (args.get("status") or "open").strip().lower()
+    if status not in ALLOWED_DECISION_STATUSES:
+        return {
+            "error": (
+                f"status {status!r} not recognised; "
+                f"expected one of {sorted(ALLOWED_DECISION_STATUSES)}"
+            ),
+        }
+
+    with _db_conn(write=True) as conn:
+        proj = conn.execute(
+            "SELECT id, status FROM projects WHERE id = ?",
+            (project_id,),
+        ).fetchone()
+        if proj is None:
+            return {"error": f"project_id {project_id} does not exist"}
+        proj_status = (proj["status"] or "").lower()
+        if proj_status not in ALLOWED_PROJECT_STATUSES:
+            return {
+                "error": (
+                    f"project_id {project_id} has status {proj_status!r}; "
+                    f"expected one of {sorted(ALLOWED_PROJECT_STATUSES)}"
+                ),
+            }
+
+        # The timestamp column is deliberately omitted so its DEFAULT
+        # CURRENT_TIMESTAMP applies. Production names it ``decided_at``; the test
+        # fixture in tests/test_mcp_server.py names it ``created_at``. Letting the
+        # default fire keeps this INSERT portable across both rather than binding
+        # the write path to one schema's column name.
+        cursor = conn.execute(
+            """
+            INSERT INTO decisions
+                (project_id, topic, decision, rationale, alternatives_considered,
+                 decision_type, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (project_id, topic, decision, rationale, alternatives,
+             decision_type, status),
+        )
+        decision_id = cursor.lastrowid
+
+        return {
+            "decision_id": decision_id,
+            "status": "created",
+            "project_id": project_id,
+            "decision_type": decision_type,
+            "decision_status": status,
+            "decision_chars": len(decision),
+        }
+
+
 # --- Tool Registry ---
 
 TOOLS = {
@@ -982,6 +1145,24 @@ TOOLS = {
             "required": ["auth_token", "lesson"],
         },
         "handler": _handle_equipa_lesson_add,
+    },
+    "equipa_decision_add": {
+        "description": "Write a decision to TheForge with mandatory sanitization (requires auth_token)",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "auth_token": {"type": "string", "description": "Server token (matches EQUIPA_MCP_TOKEN)"},
+                "project_id": {"type": "integer", "description": "Project ID (must exist, status active/planning)"},
+                "topic": {"type": "string", "description": "What the decision is about (sanitized)"},
+                "decision": {"type": "string", "description": "What was decided (sanitized; narrative, up to ~50k chars)"},
+                "rationale": {"type": "string", "description": "Why (sanitized)"},
+                "alternatives_considered": {"type": "string", "description": "What else was weighed (sanitized)"},
+                "decision_type": {"type": "string", "description": f"Category (default 'general'); one of {sorted(ALLOWED_DECISION_TYPES)}", "default": "general"},
+                "status": {"type": "string", "description": f"Lifecycle state (default 'open'); one of {sorted(ALLOWED_DECISION_STATUSES)}", "default": "open"},
+            },
+            "required": ["auth_token", "project_id", "topic", "decision"],
+        },
+        "handler": _handle_equipa_decision_add,
     },
 }
 
