@@ -228,7 +228,7 @@ def test_initialized_notification(mcp_server):
 
 
 def test_tools_list(mcp_server):
-    """Test tools/list returns all 7 tools."""
+    """Test tools/list returns all 9 tools."""
     response = _send_request(mcp_server, "tools/list", {})
 
     assert response["jsonrpc"] == "2.0"
@@ -246,6 +246,9 @@ def test_tools_list(mcp_server):
         "equipa_agent_logs",
         "equipa_project_context",
         "equipa_session_notes",
+        "equipa_session_note_add",
+        "equipa_lesson_add",
+        "equipa_decision_add",
     }
 
     assert tool_names == expected
@@ -787,3 +790,135 @@ def test_cli_mcp_server_flag():
     import equipa.mcp_server
     assert hasattr(equipa.mcp_server, "run_server")
     assert callable(equipa.mcp_server.run_server)
+
+
+# --- equipa_decision_add (MCP-06) ---
+
+def _decision_add(server, **overrides) -> dict:
+    """Call equipa_decision_add with sane defaults, returning the parsed payload."""
+    args = {
+        "auth_token": TEST_TOKEN,
+        "project_id": 23,
+        "topic": "Adopt the Hooper reverser",
+        "decision": "Prototype both reversal mechanisms on one circuit.",
+    }
+    args.update(overrides)
+    response = _send_request(server, "tools/call", {
+        "name": "equipa_decision_add",
+        "arguments": args,
+    })
+    return json.loads(response["result"]["content"][0]["text"])
+
+
+def test_decision_add_happy_path(mcp_server, isolated_db):
+    """A well-formed call persists a decision and reports its id."""
+    content = _decision_add(
+        mcp_server,
+        rationale="Comparative data beats proving one approach.",
+        alternatives_considered="Bench rig only.",
+        decision_type="architectural",
+        status="decided",
+    )
+
+    assert "error" not in content, content
+    assert content["status"] == "created"
+    assert content["project_id"] == 23
+    assert content["decision_type"] == "architectural"
+    assert content["decision_status"] == "decided"
+    assert isinstance(content["decision_id"], int)
+
+    conn = sqlite3.connect(str(isolated_db))
+    try:
+        row = conn.execute(
+            "SELECT project_id, topic, decision, rationale, decision_type, status "
+            "FROM decisions WHERE id = ?",
+            (content["decision_id"],),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert row is not None
+    assert row[0] == 23
+    assert row[1] == "Adopt the Hooper reverser"
+    assert row[4] == "architectural"
+    assert row[5] == "decided"
+
+
+def test_decision_add_defaults(mcp_server):
+    """decision_type and status default to general/open when omitted."""
+    content = _decision_add(mcp_server)
+
+    assert "error" not in content, content
+    assert content["decision_type"] == "general"
+    assert content["decision_status"] == "open"
+
+
+def test_decision_add_requires_auth(isolated_db):
+    """Without a matching token the write is refused."""
+    proc = _spawn_server(isolated_db)
+    try:
+        content = _decision_add(proc, auth_token="wrong-token")
+        assert "error" in content
+    finally:
+        _stop_server(proc)
+
+
+def test_decision_add_rejects_unknown_vocabulary(mcp_server):
+    """decision_type and status are checked against the accepted vocabularies."""
+    bad_type = _decision_add(mcp_server, decision_type="not-a-category")
+    assert "error" in bad_type
+    assert "decision_type" in bad_type["error"]
+
+    bad_status = _decision_add(mcp_server, status="not-a-status")
+    assert "error" in bad_status
+    assert "status" in bad_status["error"]
+
+
+def test_decision_add_validates_project(mcp_server):
+    """A nonexistent project_id is rejected before any insert."""
+    content = _decision_add(mcp_server, project_id=999999)
+    assert "error" in content
+    assert "does not exist" in content["error"]
+
+
+def test_decision_add_requires_topic_and_decision(mcp_server):
+    """Empty topic or decision is rejected after sanitization."""
+    assert "error" in _decision_add(mcp_server, topic="")
+    assert "error" in _decision_add(mcp_server, decision="")
+
+
+def test_decision_body_cap_exceeds_rationale_cap():
+    """The narrative body must not be capped at the rationale limit.
+
+    Decision bodies accrete amendments; measured against a 636-row production
+    table 1.9% already exceed MAX_DECISION_LENGTH, the longest at 32,344 chars.
+    Capping the body there would silently destroy real records — the failure
+    mode behind Equipa task #100027.
+    """
+    from lesson_sanitizer import (
+        MAX_DECISION_LENGTH,
+        sanitize_decision,
+        sanitize_decision_body,
+    )
+
+    # Prose, not filler. A long unbroken alphanumeric run would be removed
+    # wholesale by the base64-blob injection pattern ([A-Za-z0-9+/]{80,}), which
+    # is correct behaviour but makes "x" * N useless as a length fixture.
+    sentence = "The reverser rotates the car body through the frog. "
+    long_body = sentence * 400  # ~20.8k chars, comfortably over the 8k cap
+
+    assert len(sanitize_decision_body(long_body)) > MAX_DECISION_LENGTH
+    assert len(sanitize_decision(long_body)) == MAX_DECISION_LENGTH
+
+
+def test_sanitize_strips_base64_blobs():
+    """Long unbroken alphanumeric runs are stripped as suspected encoded payloads.
+
+    Documented because it is easy to mistake for data loss: the injection pattern
+    [A-Za-z0-9+/]{80,} removes base64-shaped blobs wholesale, and unlike the
+    length caps this removal is not logged. Ordinary prose is unaffected.
+    """
+    from lesson_sanitizer import sanitize_decision_body
+
+    assert sanitize_decision_body("A" * 200) == ""
+    assert "reverser" in sanitize_decision_body("The reverser turns the car.")

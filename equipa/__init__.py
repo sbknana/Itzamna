@@ -31,7 +31,6 @@ from equipa.loops import (
     run_security_review,
 )
 from equipa.manager import run_manager_loop
-from equipa.mcp_server import run_server
 from equipa.monitoring import LoopDetector
 from equipa.prompts import PromptResult
 
@@ -56,3 +55,24 @@ __all__ = [
     "PromptResult",
     "LoopDetector",
 ]
+
+
+def __getattr__(name: str):
+    """Resolve ``run_server`` lazily (PEP 562).
+
+    ``equipa.mcp_server`` is both a submodule and an entry point executed as
+    ``python -m equipa.mcp_server``. Importing it eagerly here meant runpy loaded
+    it twice — once as ``equipa.mcp_server`` while importing this package, then
+    again as ``__main__`` — which emitted a RuntimeWarning on every server start
+    and left two copies of the module's state (including the rate-limit buckets)
+    in memory.
+
+    Deferring the import removes the duplication while keeping ``run_server`` in
+    ``__all__`` and importable as ``from equipa import run_server``, so the
+    public surface is unchanged.
+    """
+    if name == "run_server":
+        from equipa.mcp_server import run_server
+
+        return run_server
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
