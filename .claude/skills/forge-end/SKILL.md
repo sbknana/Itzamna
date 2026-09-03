@@ -44,38 +44,50 @@ Ask: "Which tasks should I update? (e.g., 'task 42 done, task 43 in_progress')"
 
 ### Step 3: Update tasks
 
-For each task update:
+For each task update (note: `tasks` has no `updated_at` column — dormancy is
+measured per-project for exactly this reason):
 ```sql
-UPDATE tasks SET status = '{new_status}', updated_at = CURRENT_TIMESTAMP WHERE id = {task_id};
+UPDATE tasks SET status = '{new_status}' WHERE id = {task_id};
+-- for completed tasks, stamp completion:
+UPDATE tasks SET status = 'done', completed_at = CURRENT_TIMESTAMP WHERE id = {task_id};
 ```
 
 ### Step 4: Log decisions (if any)
 
 Ask: "Did you make any decisions this session that should be recorded?"
 
-If yes:
+If yes, prefer the sanitizing MCP tool when the `equipa` server is up:
+`equipa_decision_add` (requires auth_token, project_id, topic, decision).
+SQL fallback — `topic` is NOT NULL, never omit it:
 ```sql
-INSERT INTO decisions (project_id, decision, rationale, alternatives_considered, decision_type, status)
-VALUES (?, '{decision}', '{rationale}', '{alternatives}', 'general', 'open');
+INSERT INTO decisions (project_id, topic, decision, rationale, alternatives_considered, decision_type, status)
+VALUES (?, '{topic}', '{decision}', '{rationale}', '{alternatives}', 'general', 'open');
 ```
-Valid decision_type: general, security_finding, architectural, trade_off, resolution.
-Valid status: open, resolved, superseded, wont_fix, failed_resolution.
+Valid decision_type (per the equipa MCP server): architectural, architecture,
+design, docs-architecture, general, ip_finding, packaging, regulatory_finding,
+resolution, security_finding, strategy, technical, trade_off.
+Valid status: accepted, active, decided, failed_resolution, open, resolved,
+superseded, wont_fix.
 
 ### Step 5: Record blockers/questions (if any)
 
 Ask: "Any blockers or open questions to record?"
 
-If yes:
+If yes (the timestamp column is `asked_at`, and it defaults):
 ```sql
-INSERT INTO open_questions (project_id, question, context, created_at)
-VALUES (?, '{question}', '{context}', CURRENT_TIMESTAMP);
+INSERT INTO open_questions (project_id, question, context, priority, resolved)
+VALUES (?, '{question}', '{context}', 'medium', 0);
 ```
 
 ### Step 6: Create session summary
 
 Ask: "Brief summary of what was accomplished?"
 
-**CRITICAL: Sanitize summary and next_steps through lesson_sanitizer.py before DB write.**
+Prefer the sanitizing MCP tool when the `equipa` server is up:
+`equipa_session_note_add` (sanitizes server-side; requires auth_token,
+project_id, summary). SQL fallback below.
+
+**CRITICAL (SQL path): Sanitize summary and next_steps through lesson_sanitizer.py before DB write.**
 Use `sanitize_session_note()` — NOT `sanitize_lesson_content()`. Session notes are
 narrative records; the 500-char lesson cap would silently gut them (Equipa task #100027).
 `sanitize_session_note()` applies the generous `MAX_SESSION_NOTE_LENGTH` cap and logs
