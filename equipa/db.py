@@ -181,6 +181,8 @@ def ensure_schema() -> None:
         conn.commit()
         _ensure_additive_columns(conn)
         conn.commit()
+        _ensure_current_views(conn)
+        conn.commit()
     except sqlite3.Error as e:
         logger.exception("[Schema] Failed to apply schema.sql: %s", e)
         raise SchemaNotInitialised(
@@ -206,32 +208,55 @@ def _ensure_additive_columns(conn) -> None:
     additive = {
         # tasks.role lets a task carry its dispatch role so autonomous/scan
         # modes (and --task without --role) fan out to specialist/project roles.
-        "tasks": [("role", "TEXT")],
+        # tasks.updated_at (v13) is the per-task movement signal. It MUST be
+        # here as well as in migrate_v12_to_v13: this safety net applies
+        # schema.sql (which stamps user_version=13) with CREATE TABLE IF NOT
+        # EXISTS, a no-op on an existing tasks table, so the column never
+        # lands that way — and the stamp then makes db_migrate early-return.
+        # Worse, schema.sql also creates update_task_timestamp, whose body
+        # references updated_at; without the column every UPDATE on tasks
+        # fails "no such column". Adding it here closes both holes.
+        "tasks": [("role", "TEXT"), ("updated_at", "DATETIME")],
     }
     for table, cols in additive.items():
         existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
         for name, decl in cols:
             if name not in existing:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+                if table == "tasks" and name == "updated_at" and {
+                    "completed_at", "created_at"
+                } <= (existing | {name}):
+                    # Backfill so movement-based staleness has a baseline, and
+                    # yield to the trigger's own stamping on future updates.
+                    conn.execute(
+                        "UPDATE tasks SET updated_at = COALESCE(completed_at, created_at) "
+                        "WHERE updated_at IS NULL"
+                    )
 
 
-# --- Record Functions ---
+def _ensure_current_views(conn) -> None:
+    """Reconcile views whose definition changed after they were first created.
 
-# Match the FILES_CHANGED footer the developer/code-reviewer/security-reviewer
-# emit. Tolerant of leading whitespace and the trailing colon variants observed
-# in production agent output. Anchored to a line start so prose mid-paragraph
-# doesn't false-match (the "FILES_CHANGED is REQUIRED" instruction line in the
-# developer prompt template, for example).
-_FILES_CHANGED_BLOCK_RE = re.compile(
-    r"^[ \t]*FILES[_ ]CHANGED[ \t]*:[ \t]*(.*?)(?=^[ \t]*[A-Z][A-Z_ ]{2,}[ \t]*:|\Z)",
-    re.MULTILINE | re.DOTALL | re.IGNORECASE,
-)
+    ``ensure_schema`` applies schema.sql with CREATE VIEW IF NOT EXISTS, so an
+    existing view is never redefined — the v13 move of ``v_stale_tasks`` onto
+    ``updated_at`` (movement, not age) would never reach a database that
+    already had the old view. Views are cheap to drop and recreate and hold no
+    data, so this force-refreshes the ones that have moved. Idempotent.
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+    if "updated_at" not in cols:
+        return                          # additive step will add it first
+    conn.executescript("""
+        DROP VIEW IF EXISTS v_stale_tasks;
+        CREATE VIEW v_stale_tasks AS
+        SELECT t.*, p.codename as project_name,
+               julianday('now') - julianday(COALESCE(t.updated_at, t.created_at)) as days_stale
+        FROM tasks t
+        JOIN projects p ON t.project_id = p.id
+        WHERE t.status = 'in_progress'
+          AND julianday('now') - julianday(COALESCE(t.updated_at, t.created_at)) > 3;
+    """)
 
-# Lines we should ignore inside a FILES_CHANGED block. The developer template
-# explicitly says "If you changed no files, write `FILES_CHANGED: none`" — that
-# sentinel must NOT count as a real file. Bullets / dashes are valid list
-# markers; we strip them before checking the sentinel.
-_FILES_CHANGED_NONE_SENTINELS = {"none", "n/a", "(none)", "-", ""}
 
 
 def _parse_files_changed_block(result_text: str) -> list[str]:

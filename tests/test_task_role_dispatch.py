@@ -61,3 +61,68 @@ def test_audit_type_includes_early_term_exempt_project_role(tmp_path):
     assert _is_audit_type_task({"task_type": "feature"}, "security-reviewer") is True
     # Legacy behaviour preserved: audit task_type is audit-type.
     assert _is_audit_type_task({"task_type": "audit"}, "developer", str(proj)) is True
+
+
+def test_ensure_additive_columns_adds_tasks_updated_at_and_backfills(tmp_path):
+    """v13: the safety net must add tasks.updated_at (schema.sql's IF NOT
+    EXISTS never does) and backfill it, or update_task_timestamp breaks
+    every task UPDATE with 'no such column: updated_at'."""
+    db = tmp_path / "t.db"
+    conn = sqlite3.connect(str(db))
+    conn.executescript(
+        "CREATE TABLE tasks (id INTEGER PRIMARY KEY, title TEXT, "
+        "created_at TEXT, completed_at TEXT);"
+        "INSERT INTO tasks (id, title, created_at, completed_at) "
+        "VALUES (1, 'open', '2026-08-01 00:00:00', NULL), "
+        "(2, 'done', '2026-08-01 00:00:00', '2026-08-05 00:00:00');"
+    )
+    conn.commit()
+
+    assert "updated_at" not in _cols(conn, "tasks")
+    _ensure_additive_columns(conn)
+    conn.commit()
+    assert "updated_at" in _cols(conn, "tasks")
+    rows = dict(conn.execute("SELECT id, updated_at FROM tasks"))
+    assert rows[1] == "2026-08-01 00:00:00"     # created_at
+    assert rows[2] == "2026-08-05 00:00:00"     # completed_at wins
+
+    # Idempotent.
+    _ensure_additive_columns(conn)
+    conn.commit()
+    assert [r[1] for r in conn.execute("PRAGMA table_info(tasks)")].count("updated_at") == 1
+    conn.close()
+
+
+def test_ensure_current_views_rebases_stale_on_movement(tmp_path):
+    """v13: _ensure_current_views must redefine v_stale_tasks onto
+    COALESCE(updated_at, created_at) even when the old (created_at) view
+    already exists, since CREATE VIEW IF NOT EXISTS would leave it."""
+    from equipa.db import _ensure_current_views
+
+    db = tmp_path / "t.db"
+    conn = sqlite3.connect(str(db))
+    conn.executescript(
+        "CREATE TABLE projects (id INTEGER PRIMARY KEY, codename TEXT);"
+        "CREATE TABLE tasks (id INTEGER PRIMARY KEY, project_id INTEGER, "
+        "title TEXT, status TEXT, created_at TEXT, updated_at TEXT);"
+        "CREATE VIEW v_stale_tasks AS "
+        "SELECT t.*, p.codename as project_name, "
+        "julianday('now') - julianday(t.created_at) as days_stale "
+        "FROM tasks t JOIN projects p ON t.project_id = p.id "
+        "WHERE t.status='in_progress' "
+        "AND julianday('now') - julianday(t.created_at) > 3;"
+        "INSERT INTO projects VALUES (1, 'ticker');"
+        "INSERT INTO tasks VALUES (1, 1, 'old but touched', 'in_progress', "
+        "'2026-01-01 00:00:00', datetime('now'));"
+    )
+    conn.commit()
+
+    # Old view: created long ago, so it is stale.
+    assert {r[0] for r in conn.execute("SELECT id FROM v_stale_tasks")} == {1}
+    _ensure_current_views(conn)
+    conn.commit()
+    # New view: touched just now, so it is not.
+    assert {r[0] for r in conn.execute("SELECT id FROM v_stale_tasks")} == set()
+    assert "COALESCE" in conn.execute(
+        "SELECT sql FROM sqlite_master WHERE name='v_stale_tasks'").fetchone()[0]
+    conn.close()

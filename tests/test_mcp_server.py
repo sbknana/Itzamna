@@ -228,7 +228,7 @@ def test_initialized_notification(mcp_server):
 
 
 def test_tools_list(mcp_server):
-    """Test tools/list returns all 9 tools."""
+    """Test tools/list returns all 10 tools."""
     response = _send_request(mcp_server, "tools/list", {})
 
     assert response["jsonrpc"] == "2.0"
@@ -922,3 +922,5 @@ def test_sanitize_strips_base64_blobs():
 
     assert sanitize_decision_body("A" * 200) == ""
     assert "reverser" in sanitize_decision_body("The reverser turns the car.")
+
+
