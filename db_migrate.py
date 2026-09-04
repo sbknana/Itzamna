@@ -30,7 +30,7 @@ from datetime import datetime
 from pathlib import Path
 
 # The schema version that matches the current schema.sql
-CURRENT_VERSION = 11
+CURRENT_VERSION = 13
 
 
 # ============================================================
@@ -844,6 +844,82 @@ def migrate_v10_to_v11(conn):
     conn.commit()
 
 
+def migrate_v11_to_v12(conn):
+    """Worktree isolation tracking (v11 -> v12).
+
+    The ``worktrees`` table that the per-task git worktree isolation helpers
+    (task 2488) already create on demand, stamped as a schema version so a
+    fresh install and an upgraded one agree. Idempotent: CREATE IF NOT
+    EXISTS matches the DDL the helpers wrote.
+    """
+    cursor = conn.cursor()
+    cursor.executescript("""
+        CREATE TABLE IF NOT EXISTS worktrees (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id INTEGER NOT NULL,
+            project_id INTEGER NOT NULL,
+            path TEXT NOT NULL,
+            branch TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            ended_at DATETIME,
+            FOREIGN KEY (task_id) REFERENCES tasks(id),
+            FOREIGN KEY (project_id) REFERENCES projects(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_worktrees_status ON worktrees(status);
+        CREATE INDEX IF NOT EXISTS idx_worktrees_task ON worktrees(task_id);
+        CREATE INDEX IF NOT EXISTS idx_worktrees_project ON worktrees(project_id);
+    """)
+    conn.commit()
+
+
+def migrate_v12_to_v13(conn):
+    """Task movement: tasks.updated_at (v12 -> v13).
+
+    * ``tasks.updated_at`` - the per-task movement signal the schema never
+      had. Backfilled from completed_at, else created_at, and kept current by
+      a trigger that yields to an explicit value set in the same UPDATE.
+    * ``v_stale_tasks`` - re-based on updated_at so it measures movement,
+      not age since creation (which fired on every long-lived task).
+
+    (An earlier draft of v13 also added a ``conditions`` checklist table;
+    that was withdrawn - conditions are TICKER's concept and live in TICKER's
+    own store, not in TheForge - so this migration is updated_at only.)
+    """
+    cursor = conn.cursor()
+    cols = {row[1] for row in cursor.execute("PRAGMA table_info(tasks)").fetchall()}
+    if "updated_at" not in cols:
+        cursor.execute("ALTER TABLE tasks ADD COLUMN updated_at DATETIME")
+        # Backfill from whatever timestamps the table actually has. Minimal
+        # tasks tables (some migration-chain fixtures) carry neither, so an
+        # unconditional COALESCE(completed_at, created_at) would raise "no
+        # such column"; a real production tasks table has both.
+        have = [c for c in ("completed_at", "created_at") if c in cols]
+        if have:
+            expr = f"COALESCE({', '.join(have)})" if len(have) > 1 else have[0]
+            cursor.execute(
+                f"UPDATE tasks SET updated_at = {expr} WHERE updated_at IS NULL"
+            )
+    cursor.executescript("""
+        CREATE TRIGGER IF NOT EXISTS update_task_timestamp
+        AFTER UPDATE ON tasks
+        WHEN NEW.updated_at IS OLD.updated_at
+        BEGIN
+            UPDATE tasks SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
+        END;
+
+        DROP VIEW IF EXISTS v_stale_tasks;
+        CREATE VIEW v_stale_tasks AS
+        SELECT t.*, p.codename as project_name,
+               julianday('now') - julianday(COALESCE(t.updated_at, t.created_at)) as days_stale
+        FROM tasks t
+        JOIN projects p ON t.project_id = p.id
+        WHERE t.status = 'in_progress'
+          AND julianday('now') - julianday(COALESCE(t.updated_at, t.created_at)) > 3;
+    """)
+    conn.commit()
+
+
 # Migration registry: version -> (description, function)
 MIGRATIONS = {
     1: ("Baseline schema stamp (v0 -> v1)", migrate_v0_to_v1),
@@ -857,6 +933,8 @@ MIGRATIONS = {
     9: ("Task Flow tables (v8 -> v9)", migrate_v8_to_v9),
     10: ("Paperclip config version tables (v9 -> v10)", migrate_v9_to_v10),
     11: ("Paperclip agent_sessions table (v10 -> v11)", migrate_v10_to_v11),
+    12: ("Worktree isolation tracking (v11 -> v12)", migrate_v11_to_v12),
+    13: ("Task updated_at movement signal (v12 -> v13)", migrate_v12_to_v13),
 }
 
 

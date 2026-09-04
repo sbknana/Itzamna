@@ -43,6 +43,7 @@ CREATE TABLE tasks (
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     task_type TEXT DEFAULT 'feature',
     role TEXT,
+    updated_at DATETIME,
     FOREIGN KEY (project_id) REFERENCES projects(id)
 );
 
@@ -373,6 +374,15 @@ BEGIN
     UPDATE projects SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
 END;
 
+-- v13: per-task movement. Yields to an explicit updated_at in the same UPDATE
+-- (WHEN it did not change), so a deliberate backdate stands.
+CREATE TRIGGER update_task_timestamp
+AFTER UPDATE ON tasks
+WHEN NEW.updated_at IS OLD.updated_at
+BEGIN
+    UPDATE tasks SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
+END;
+
 -- ============================================================
 -- VIEWS
 -- ============================================================
@@ -390,13 +400,15 @@ SELECT
 FROM projects p
 WHERE p.status = 'active';
 
+-- Movement, not age: a task in progress that nothing has touched for three
+-- days (v13; created_at fired on every long-lived task).
 CREATE VIEW v_stale_tasks AS
 SELECT t.*, p.codename as project_name,
-       julianday('now') - julianday(t.created_at) as days_stale
+       julianday('now') - julianday(COALESCE(t.updated_at, t.created_at)) as days_stale
 FROM tasks t
 JOIN projects p ON t.project_id = p.id
 WHERE t.status = 'in_progress'
-  AND julianday('now') - julianday(t.created_at) > 3;
+  AND julianday('now') - julianday(COALESCE(t.updated_at, t.created_at)) > 3;
 
 CREATE VIEW v_stale_questions AS
 SELECT q.*, p.codename as project_name,
@@ -654,8 +666,32 @@ CREATE INDEX IF NOT EXISTS idx_agent_sessions_expires
     ON agent_sessions(expires_at);
 
 -- ============================================================
+-- WORKTREE ISOLATION (v12)
+-- ============================================================
+-- One row per task worktree the orchestrator checks out (task 2488).
+CREATE TABLE IF NOT EXISTS worktrees (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER NOT NULL,
+    project_id INTEGER NOT NULL,
+    path TEXT NOT NULL,
+    branch TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    ended_at DATETIME,
+    FOREIGN KEY (task_id) REFERENCES tasks(id),
+    FOREIGN KEY (project_id) REFERENCES projects(id)
+);
+CREATE INDEX IF NOT EXISTS idx_worktrees_status ON worktrees(status);
+CREATE INDEX IF NOT EXISTS idx_worktrees_task ON worktrees(task_id);
+CREATE INDEX IF NOT EXISTS idx_worktrees_project ON worktrees(project_id);
+
+-- (v13 also drafted a `conditions` checklist table; it was withdrawn -
+-- conditions are TICKER's concept and live in TICKER's own store, not in
+-- TheForge. v13 is `tasks.updated_at` and the movement-based v_stale_tasks.)
+
+-- ============================================================
 -- VERSION STAMP
 -- ============================================================
--- Marks fresh installs as v11. Migrations handle upgrades from older versions.
-PRAGMA user_version = 11;
+-- Marks fresh installs as v13. Migrations handle upgrades from older versions.
+PRAGMA user_version = 13;
 

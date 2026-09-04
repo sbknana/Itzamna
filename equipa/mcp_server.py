@@ -6,7 +6,7 @@ Uses ONLY Python stdlib (json, sys, subprocess) — no external dependencies.
 Implements:
 - JSON-RPC 2.0 protocol over stdio
 - MCP initialization handshake
-- 7 tools: dispatch, task_status, task_create, lessons, agent_logs, project_context, session_notes
+- 10 tools: dispatch, task_status, task_create, lessons, agent_logs, project_context, session_notes, session_note_add, lesson_add, decision_add
 
 Hardening (SECURITY-REVIEW-1728, task 2452):
 - MCP-01: equipa_dispatch requires EQUIPA_MCP_TOKEN auth, is rate-limited
@@ -14,6 +14,22 @@ Hardening (SECURITY-REVIEW-1728, task 2452):
 - MCP-02: equipa_task_create validates project existence + status, caps
   description size, is rate-limited, and honours EQUIPA_MCP_PROJECT_IDS allowlist.
 - MCP-03: All query handlers clamp caller-supplied ``limit`` to MAX_QUERY_LIMIT.
+- MCP-04: equipa_session_note_add requires auth, validates project existence +
+  status, is rate-limited, and sanitizes summary/next_steps/key_points through
+  lesson_sanitizer.sanitize_session_note (injection-strip + generous length
+  policy, no silent truncation) so session notes cannot be written unsanitized
+  through the semantic write path.
+- MCP-05: equipa_lesson_add is the write counterpart to equipa_lessons — same
+  auth + rate-limit + (optional) project validation, and sanitizes the lesson
+  body through lesson_sanitizer.sanitize_lesson_content and the short metadata
+  fields through sanitize_error_signature, closing the identical advisory-only
+  gap for the lessons_learned table.
+- MCP-06: equipa_decision_add closes the same gap for the decisions table —
+  auth + rate-limit + project validation, plus decision_type/status vocabulary
+  checks (the table carries no CHECK constraints). Field caps are asymmetric by
+  measurement: topic/rationale/alternatives use sanitize_decision, while the
+  narrative decision body uses sanitize_decision_body, because decision bodies
+  accrete amendments and the rationale cap would silently destroy them.
 
 Stderr is used for logging only. Stdout is reserved for JSON-RPC messages.
 
@@ -67,9 +83,34 @@ DISPATCH_RATE_CAPACITY = 10          # 10 dispatches
 DISPATCH_RATE_REFILL_SECONDS = 3600  # ...per hour per token
 TASK_CREATE_RATE_CAPACITY = 100
 TASK_CREATE_RATE_REFILL_SECONDS = 3600
+SESSION_NOTE_RATE_CAPACITY = 100
+SESSION_NOTE_RATE_REFILL_SECONDS = 3600
+LESSON_ADD_RATE_CAPACITY = 100
+LESSON_ADD_RATE_REFILL_SECONDS = 3600
+DECISION_ADD_RATE_CAPACITY = 100
+DECISION_ADD_RATE_REFILL_SECONDS = 3600
 
 # Project statuses allowed as task_create targets.
 ALLOWED_PROJECT_STATUSES = {"active", "planning"}
+
+# decision_type / status vocabularies accepted by equipa_decision_add.
+#
+# The decisions table carries NO CHECK constraints, so these columns have drifted
+# in practice. Each set below is the UNION of the documented vocabulary and every
+# value already present in the table — deliberately permissive, because a stricter
+# allowlist would start rejecting values the system has been writing for months.
+# Note for maintainers: "architectural" and "architecture" are both in use and are
+# almost certainly the same category; deduplicating them is a data-hygiene change,
+# not a change this write-path should make silently.
+ALLOWED_DECISION_TYPES = {
+    "architectural", "architecture", "design", "docs-architecture", "general",
+    "ip_finding", "packaging", "regulatory_finding", "resolution",
+    "security_finding", "strategy", "technical", "trade_off",
+}
+ALLOWED_DECISION_STATUSES = {
+    "accepted", "active", "decided", "failed_resolution", "open", "resolved",
+    "superseded", "wont_fix",
+}
 
 # Role + model allowlists for equipa_dispatch. Built from orchestrator constants
 # where possible; the fallbacks ensure the MCP server still refuses unknown
@@ -180,6 +221,9 @@ class _TokenBucket:
 
 _DISPATCH_BUCKET = _TokenBucket(DISPATCH_RATE_CAPACITY, DISPATCH_RATE_REFILL_SECONDS)
 _TASK_CREATE_BUCKET = _TokenBucket(TASK_CREATE_RATE_CAPACITY, TASK_CREATE_RATE_REFILL_SECONDS)
+_SESSION_NOTE_BUCKET = _TokenBucket(SESSION_NOTE_RATE_CAPACITY, SESSION_NOTE_RATE_REFILL_SECONDS)
+_LESSON_ADD_BUCKET = _TokenBucket(LESSON_ADD_RATE_CAPACITY, LESSON_ADD_RATE_REFILL_SECONDS)
+_DECISION_ADD_BUCKET = _TokenBucket(DECISION_ADD_RATE_CAPACITY, DECISION_ADD_RATE_REFILL_SECONDS)
 
 
 def _expected_token() -> str | None:
@@ -649,6 +693,341 @@ def _handle_equipa_session_notes(args: dict) -> dict:
         }
 
 
+def _handle_equipa_session_note_add(args: dict) -> dict:
+    """Write a session note to TheForge, sanitizing narrative fields.
+
+    The *write* counterpart to equipa_session_notes. It exists so a session note
+    can be persisted through the sanctioned MCP interface with the mandatory
+    sanitization applied *at the boundary*, rather than depending on the caller
+    (e.g. the forge-end skill) to remember to run lesson_sanitizer before a raw
+    write. summary/next_steps/key_points are passed through sanitize_session_note
+    (injection-strip + generous length policy, no silent truncation) before
+    insertion.
+
+    Args:
+        auth_token (str): Required. Must match EQUIPA_MCP_TOKEN env var.
+        project_id (int): Project ID — must exist and be {active, planning}.
+        summary (str): Required. What happened this session.
+        next_steps (str, optional): What to do next.
+        key_points (str, optional): Key points / highlights.
+
+    Returns:
+        dict: {"session_note_id": int, "status": "created", ...} or {"error": ...}.
+    """
+    ok, err = _check_auth(args)
+    if not ok:
+        return err
+
+    token = _expected_token() or "anonymous"
+    allowed, retry_after = _SESSION_NOTE_BUCKET.try_consume(token)
+    if not allowed:
+        return {
+            "error": "Rate limit exceeded for equipa_session_note_add",
+            "retry_after_seconds": round(retry_after, 2),
+            "limit": f"{SESSION_NOTE_RATE_CAPACITY}/{SESSION_NOTE_RATE_REFILL_SECONDS}s",
+        }
+
+    project_id = args.get("project_id")
+    if not isinstance(project_id, int) or project_id <= 0:
+        return {"error": "project_id must be a positive integer"}
+
+    allowlist = _project_id_allowlist()
+    if allowlist is not None and project_id not in allowlist:
+        return {
+            "error": f"project_id {project_id} not in EQUIPA_MCP_PROJECT_IDS allowlist",
+        }
+
+    # Sanitize narrative fields at the boundary. Imported lazily (repo-root
+    # module) so an import failure degrades to a length-capping fallback rather
+    # than taking the whole server down.
+    try:
+        from lesson_sanitizer import sanitize_session_note
+    except Exception:  # pragma: no cover - fallback if sanitizer unavailable
+        def sanitize_session_note(text: Any) -> str:
+            return ("" if not text else str(text))[:50_000]
+
+    summary = sanitize_session_note(args.get("summary", ""))
+    next_steps = sanitize_session_note(args.get("next_steps", ""))
+    key_points = sanitize_session_note(args.get("key_points", ""))
+
+    if not summary:
+        return {"error": "summary is required (non-empty after sanitization)"}
+
+    with _db_conn(write=True) as conn:
+        proj = conn.execute(
+            "SELECT id, status FROM projects WHERE id = ?",
+            (project_id,),
+        ).fetchone()
+        if proj is None:
+            return {"error": f"project_id {project_id} does not exist"}
+        status = (proj["status"] or "").lower()
+        if status not in ALLOWED_PROJECT_STATUSES:
+            return {
+                "error": (
+                    f"project_id {project_id} has status {status!r}; "
+                    f"expected one of {sorted(ALLOWED_PROJECT_STATUSES)}"
+                ),
+            }
+
+        cursor = conn.execute(
+            """
+            INSERT INTO session_notes
+                (project_id, summary, key_points, next_steps, session_date)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """,
+            (project_id, summary, key_points, next_steps),
+        )
+        note_id = cursor.lastrowid
+
+        return {
+            "session_note_id": note_id,
+            "status": "created",
+            "project_id": project_id,
+            "summary_chars": len(summary),
+        }
+
+
+def _handle_equipa_lesson_add(args: dict) -> dict:
+    """Write a lesson to lessons_learned, sanitizing all text fields.
+
+    The *write* counterpart to equipa_lessons. Like equipa_session_note_add it
+    exists so a lesson can be persisted through the sanctioned MCP interface with
+    sanitization applied *at the boundary*, rather than relying on the caller to
+    run lesson_sanitizer first. The lesson body is passed through
+    sanitize_lesson_content (500-char lesson cap, injection-strip, loud on
+    truncation) and the short metadata fields through sanitize_error_signature.
+
+    Args:
+        auth_token (str): Required. Must match EQUIPA_MCP_TOKEN env var.
+        lesson (str): Required. The lesson text (sanitized; capped at the lesson
+            length limit).
+        project_id (int, optional): Scope to a project — must exist and be
+            {active, planning}. Omit for a global lesson (project_id NULL).
+        role (str, optional): Agent role the lesson applies to.
+        error_type (str, optional): Error category.
+        error_signature (str, optional): Short error signature.
+        source (str, optional): Provenance tag (default "manual-mcp").
+
+    Returns:
+        dict: {"lesson_id": int, "status": "created", ...} or {"error": ...}.
+    """
+    ok, err = _check_auth(args)
+    if not ok:
+        return err
+
+    token = _expected_token() or "anonymous"
+    allowed, retry_after = _LESSON_ADD_BUCKET.try_consume(token)
+    if not allowed:
+        return {
+            "error": "Rate limit exceeded for equipa_lesson_add",
+            "retry_after_seconds": round(retry_after, 2),
+            "limit": f"{LESSON_ADD_RATE_CAPACITY}/{LESSON_ADD_RATE_REFILL_SECONDS}s",
+        }
+
+    # project_id is optional (lessons may be global). When present it is validated
+    # exactly like the other write tools; when absent the lesson is stored global.
+    project_id = args.get("project_id")
+    if project_id is not None:
+        if not isinstance(project_id, int) or project_id <= 0:
+            return {"error": "project_id must be a positive integer when provided"}
+        allowlist = _project_id_allowlist()
+        if allowlist is not None and project_id not in allowlist:
+            return {
+                "error": f"project_id {project_id} not in EQUIPA_MCP_PROJECT_IDS allowlist",
+            }
+
+    # Sanitize at the boundary. Imported lazily (repo-root module) so an import
+    # failure degrades to a length-capping fallback rather than downing the server.
+    try:
+        from lesson_sanitizer import sanitize_lesson_content, sanitize_error_signature
+    except Exception:  # pragma: no cover - fallback if sanitizer unavailable
+        def sanitize_lesson_content(text: Any, *a: Any, **k: Any) -> str:
+            return ("" if not text else str(text))[:500]
+
+        def sanitize_error_signature(text: Any) -> str:
+            return ("" if not text else str(text))[:200]
+
+    lesson = sanitize_lesson_content(args.get("lesson", ""))
+    if not lesson:
+        return {"error": "lesson is required (non-empty after sanitization)"}
+
+    role = sanitize_error_signature(args.get("role", "")) or None
+    error_type = sanitize_error_signature(args.get("error_type", "")) or None
+    error_signature = sanitize_error_signature(args.get("error_signature", "")) or None
+    source = sanitize_error_signature(args.get("source", "")) or "manual-mcp"
+
+    with _db_conn(write=True) as conn:
+        if project_id is not None:
+            proj = conn.execute(
+                "SELECT id, status FROM projects WHERE id = ?",
+                (project_id,),
+            ).fetchone()
+            if proj is None:
+                return {"error": f"project_id {project_id} does not exist"}
+            status = (proj["status"] or "").lower()
+            if status not in ALLOWED_PROJECT_STATUSES:
+                return {
+                    "error": (
+                        f"project_id {project_id} has status {status!r}; "
+                        f"expected one of {sorted(ALLOWED_PROJECT_STATUSES)}"
+                    ),
+                }
+
+        cursor = conn.execute(
+            """
+            INSERT INTO lessons_learned
+                (project_id, role, error_type, error_signature, lesson, source)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (project_id, role, error_type, error_signature, lesson, source),
+        )
+        lesson_id = cursor.lastrowid
+
+        return {
+            "lesson_id": lesson_id,
+            "status": "created",
+            "project_id": project_id,
+            "lesson_chars": len(lesson),
+        }
+
+
+def _handle_equipa_decision_add(args: dict) -> dict:
+    """Write an architectural/product decision to TheForge, sanitizing all text.
+
+    The *write* counterpart to the decisions half of equipa_project_context, and
+    the third sanitizing write-tool alongside equipa_session_note_add and
+    equipa_lesson_add. It closes the same advisory-only gap for the decisions
+    table: without it, decisions can only be written by raw SQL through a generic
+    database adapter, with no auth, no rate limit, no project validation and no
+    sanitization at the boundary.
+
+    Field caps are asymmetric by design and by measurement. topic / rationale /
+    alternatives_considered use sanitize_decision (MAX_DECISION_LENGTH — the
+    constant's own comment reads "decision rationales"), while the narrative
+    ``decision`` body uses sanitize_decision_body (MAX_SESSION_NOTE_LENGTH),
+    because decision bodies accrete amendments over time and the rationale cap
+    would silently destroy them. See lesson_sanitizer for the measurements.
+
+    Args:
+        auth_token (str): Required. Must match EQUIPA_MCP_TOKEN env var.
+        project_id (int): Required. Must exist and be {active, planning}.
+        topic (str): Required. What the decision is about.
+        decision (str): Required. What was decided.
+        rationale (str, optional): Why.
+        alternatives_considered (str, optional): What else was weighed.
+        decision_type (str, optional): Category (default "general").
+        status (str, optional): Lifecycle state (default "open").
+
+    Returns:
+        dict: {"decision_id": int, "status": "created", ...} or {"error": ...}.
+    """
+    ok, err = _check_auth(args)
+    if not ok:
+        return err
+
+    token = _expected_token() or "anonymous"
+    allowed, retry_after = _DECISION_ADD_BUCKET.try_consume(token)
+    if not allowed:
+        return {
+            "error": "Rate limit exceeded for equipa_decision_add",
+            "retry_after_seconds": round(retry_after, 2),
+            "limit": f"{DECISION_ADD_RATE_CAPACITY}/{DECISION_ADD_RATE_REFILL_SECONDS}s",
+        }
+
+    project_id = args.get("project_id")
+    if not isinstance(project_id, int) or project_id <= 0:
+        return {"error": "project_id must be a positive integer"}
+
+    allowlist = _project_id_allowlist()
+    if allowlist is not None and project_id not in allowlist:
+        return {
+            "error": f"project_id {project_id} not in EQUIPA_MCP_PROJECT_IDS allowlist",
+        }
+
+    # Sanitize at the boundary. Imported lazily (repo-root module) so an import
+    # failure degrades to a length-capping fallback rather than downing the server.
+    try:
+        from lesson_sanitizer import sanitize_decision, sanitize_decision_body
+    except Exception:  # pragma: no cover - fallback if sanitizer unavailable
+        def sanitize_decision(text: Any) -> str:
+            return ("" if not text else str(text))[:8_000]
+
+        def sanitize_decision_body(text: Any) -> str:
+            return ("" if not text else str(text))[:50_000]
+
+    topic = sanitize_decision(args.get("topic", ""))
+    decision = sanitize_decision_body(args.get("decision", ""))
+    rationale = sanitize_decision(args.get("rationale", "")) or None
+    alternatives = sanitize_decision(args.get("alternatives_considered", "")) or None
+
+    if not topic:
+        return {"error": "topic is required (non-empty after sanitization)"}
+    if not decision:
+        return {"error": "decision is required (non-empty after sanitization)"}
+
+    decision_type = (args.get("decision_type") or "general").strip().lower()
+    if decision_type not in ALLOWED_DECISION_TYPES:
+        return {
+            "error": (
+                f"decision_type {decision_type!r} not recognised; "
+                f"expected one of {sorted(ALLOWED_DECISION_TYPES)}"
+            ),
+        }
+
+    status = (args.get("status") or "open").strip().lower()
+    if status not in ALLOWED_DECISION_STATUSES:
+        return {
+            "error": (
+                f"status {status!r} not recognised; "
+                f"expected one of {sorted(ALLOWED_DECISION_STATUSES)}"
+            ),
+        }
+
+    with _db_conn(write=True) as conn:
+        proj = conn.execute(
+            "SELECT id, status FROM projects WHERE id = ?",
+            (project_id,),
+        ).fetchone()
+        if proj is None:
+            return {"error": f"project_id {project_id} does not exist"}
+        proj_status = (proj["status"] or "").lower()
+        if proj_status not in ALLOWED_PROJECT_STATUSES:
+            return {
+                "error": (
+                    f"project_id {project_id} has status {proj_status!r}; "
+                    f"expected one of {sorted(ALLOWED_PROJECT_STATUSES)}"
+                ),
+            }
+
+        # The timestamp column is deliberately omitted so its DEFAULT
+        # CURRENT_TIMESTAMP applies. Production names it ``decided_at``; the test
+        # fixture in tests/test_mcp_server.py names it ``created_at``. Letting the
+        # default fire keeps this INSERT portable across both rather than binding
+        # the write path to one schema's column name.
+        cursor = conn.execute(
+            """
+            INSERT INTO decisions
+                (project_id, topic, decision, rationale, alternatives_considered,
+                 decision_type, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (project_id, topic, decision, rationale, alternatives,
+             decision_type, status),
+        )
+        decision_id = cursor.lastrowid
+
+        return {
+            "decision_id": decision_id,
+            "status": "created",
+            "project_id": project_id,
+            "decision_type": decision_type,
+            "decision_status": status,
+            "decision_chars": len(decision),
+        }
+
+
+
+
 # --- Tool Registry ---
 
 TOOLS = {
@@ -736,6 +1115,56 @@ TOOLS = {
             },
         },
         "handler": _handle_equipa_session_notes,
+    },
+    "equipa_session_note_add": {
+        "description": "Write a session note to TheForge with mandatory sanitization (requires auth_token)",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "auth_token": {"type": "string", "description": "Server token (matches EQUIPA_MCP_TOKEN)"},
+                "project_id": {"type": "integer", "description": "Project ID (must exist, status active/planning)"},
+                "summary": {"type": "string", "description": "What happened this session (sanitized; up to ~50k chars)"},
+                "next_steps": {"type": "string", "description": "What to do next (sanitized)"},
+                "key_points": {"type": "string", "description": "Key points / highlights (sanitized)"},
+            },
+            "required": ["auth_token", "project_id", "summary"],
+        },
+        "handler": _handle_equipa_session_note_add,
+    },
+    "equipa_lesson_add": {
+        "description": "Write a lesson to lessons_learned with mandatory sanitization (requires auth_token)",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "auth_token": {"type": "string", "description": "Server token (matches EQUIPA_MCP_TOKEN)"},
+                "lesson": {"type": "string", "description": "Lesson text (sanitized; capped at the lesson length limit)"},
+                "project_id": {"type": "integer", "description": "Optional project scope (must exist, status active/planning); omit for a global lesson"},
+                "role": {"type": "string", "description": "Agent role the lesson applies to (sanitized)"},
+                "error_type": {"type": "string", "description": "Error category (sanitized)"},
+                "error_signature": {"type": "string", "description": "Short error signature (sanitized)"},
+                "source": {"type": "string", "description": "Provenance tag (default 'manual-mcp')"},
+            },
+            "required": ["auth_token", "lesson"],
+        },
+        "handler": _handle_equipa_lesson_add,
+    },
+    "equipa_decision_add": {
+        "description": "Write a decision to TheForge with mandatory sanitization (requires auth_token)",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "auth_token": {"type": "string", "description": "Server token (matches EQUIPA_MCP_TOKEN)"},
+                "project_id": {"type": "integer", "description": "Project ID (must exist, status active/planning)"},
+                "topic": {"type": "string", "description": "What the decision is about (sanitized)"},
+                "decision": {"type": "string", "description": "What was decided (sanitized; narrative, up to ~50k chars)"},
+                "rationale": {"type": "string", "description": "Why (sanitized)"},
+                "alternatives_considered": {"type": "string", "description": "What else was weighed (sanitized)"},
+                "decision_type": {"type": "string", "description": f"Category (default 'general'); one of {sorted(ALLOWED_DECISION_TYPES)}", "default": "general"},
+                "status": {"type": "string", "description": f"Lifecycle state (default 'open'); one of {sorted(ALLOWED_DECISION_STATUSES)}", "default": "open"},
+            },
+            "required": ["auth_token", "project_id", "topic", "decision"],
+        },
+        "handler": _handle_equipa_decision_add,
     },
 }
 
