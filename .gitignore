@@ -9,6 +9,12 @@ mcp_config.json
 *.db-journal
 *.db-wal
 *.db-shm
+# DB backups — the *.db rule above does not match these suffixes
+*.db.bak*
+*.db.backup*
+
+# Audio analysis artifacts
+*.wav
 
 # Secrets
 .env
